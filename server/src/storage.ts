@@ -30,6 +30,13 @@ import {
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { env } from './env.js'
 import type { ProjectFileReference } from './project-files/model.js'
+import {
+  normalizeStorageKey,
+  storageKeyFromPublicUrl as storageKeyFromPublicUrlForBase,
+  messageAttachmentStorageKey as messageAttachmentStorageKeyForBase,
+} from './storage-keys.js'
+
+export { normalizeStorageKey }
 
 /** Keys under these prefixes get HMAC-signed URLs when a signing secret is
  *  configured. Other prefixes (e.g. `avatars/`) are served unsigned — they
@@ -39,49 +46,17 @@ function needsSignature(key: string): boolean {
   return SIGNED_PREFIXES.some((p) => key.startsWith(p))
 }
 
-const STORAGE_KEY_PREFIXES = ['attachments/', 'email-attachments/', 'avatars/']
 function validateAttachmentReadKey(key: string): void {
-  if (!/^attachments\/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,16}$/u.test(key)) throw new Error('Only stored chat attachments can be copied into projects.')
-}
-function isStorageKey(key: string): boolean {
-  return STORAGE_KEY_PREFIXES.some((p) => key.startsWith(p))
-}
-
-function stripQueryAndHash(path: string): string {
-  return path.split('?')[0].split('#')[0]
-}
-
-export function normalizeStorageKey(raw: string): string | null {
-  try {
-    const key = decodeURIComponent(stripQueryAndHash(raw.trim()).replace(/^\/+/, ''))
-    return isStorageKey(key) ? key : null
-  } catch {
-    return null
+  if (normalizeStorageKey(key) !== key || !/^attachments\/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,16}$/u.test(key)) {
+    throw new Error('Only stored chat attachments can be copied into projects.')
   }
 }
-
 export function storageKeyFromPublicUrl(raw: string): string | null {
-  const value = raw.trim()
-  if (!value) return null
+  return storageKeyFromPublicUrlForBase(raw, env.R2_PUBLIC_BASE)
+}
 
-  if (value.startsWith('/uploads/')) {
-    return normalizeStorageKey(value.slice('/uploads/'.length))
-  }
-
-  if (!env.R2_PUBLIC_BASE) return null
-  try {
-    const url = new URL(value)
-    const base = new URL(env.R2_PUBLIC_BASE)
-    const basePath = base.pathname.replace(/\/+$/, '')
-    if (url.origin !== base.origin) return null
-    if (basePath && !url.pathname.startsWith(`${basePath}/`)) return null
-    const rawKey = basePath
-      ? url.pathname.slice(basePath.length + 1)
-      : url.pathname.replace(/^\/+/, '')
-    return normalizeStorageKey(rawKey)
-  } catch {
-    return null
-  }
+export function messageAttachmentStorageKey(input: { key?: unknown; url?: unknown }): string | null {
+  return messageAttachmentStorageKeyForBase(input, env.R2_PUBLIC_BASE)
 }
 
 export function signedUrlExpiresSoon(raw: string, leewaySeconds = 300): boolean {
