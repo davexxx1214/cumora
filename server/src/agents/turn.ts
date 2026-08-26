@@ -20,6 +20,7 @@
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
 import { redis } from '../redis.js'
+import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
@@ -718,18 +719,9 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
   let buf: Buffer | null = null
   if (source.mode === 'local') {
     // Local-mode file — read straight from disk to avoid a needless HTTP hop.
-    try {
-      const { readFile } = await import('node:fs/promises')
-      const { resolve, sep } = await import('node:path')
-      const { UPLOAD_DIR } = await import('../storage.js')
-      const root = resolve(UPLOAD_DIR)
-      const path = resolve(root, source.key)
-      if (!path.startsWith(`${root}${sep}`)) return null
-      const data = await readFile(path)
-      buf = Buffer.from(data)
-    } catch {
-      return null
-    }
+    // The helper resolves physical paths so an in-root symlink cannot escape.
+    const { UPLOAD_DIR } = await import('../storage.js')
+    buf = await readLocalMessageAttachment(UPLOAD_DIR, source.key)
   } else {
     // R2 URL was minted from the validated key above. Reject redirects so a
     // compromised/misconfigured storage edge cannot pivot to a private host.
