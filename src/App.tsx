@@ -20,7 +20,7 @@ import { isNotificationWindow, isWebAppHost } from '@/lib/runtime'
 import { WebShell } from '@/web/WebShell'
 import {
   InviteAcceptScreen, consumeInviteFromUrl,
-  getPendingInvite, clearPendingInvite,
+  getPendingInvite, clearPendingInvite, stashPendingInvite,
 } from '@/components/InviteAcceptScreen'
 import { UpdateBanner, UpdaterDialog } from '@/components/UpdaterDialog'
 import { AdminApp } from '@/admin/AdminApp'
@@ -47,21 +47,38 @@ function AuthedApp() {
   // exists. The gate clears automatically when a non-cloud computer comes
   // online (WS computers.status → store → re-render). Wait for the computers
   // list to load before deciding, to avoid a flash of onboarding.
+  const companies = useAuth((s) => s.companies)
   const activeTier = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.tier)
+  const activeRole = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.role)
   const computersLoaded = useComputers((s) => s.loaded)
   const hasOwnComputer = useComputers((s) => Object.values(s.byId).some((c) => c.kind !== 'cloud'))
   const ownComputerCount = useComputers((s) => Object.values(s.byId).filter((c) => c.kind !== 'cloud').length)
   // Free tier is BYOA-only: gate the app into onboarding whenever a free
-  // workspace has no paired (non-cloud) computer — pairing a machine is how a
-  // free user activates their agents. We previously ALSO required
-  // agentCount === 0, to avoid disrupting "grandfathered" free users who ran on
-  // Cumora Cloud with no paired machine. That state has been eliminated (free
-  // agents no longer run on managed cloud), so the guard is removed: any unpaired
-  // free workspace — even one with existing (now-dormant) agents — is sent to
-  // pair. `hasOwnComputer` checks existence not online status, so a
-  // paired-but-asleep machine never re-triggers onboarding.
-  const needsOnboarding = activeTier === 'free'
+  // workspace *owner* has no paired (non-cloud) computer — pairing a machine
+  // is how a free user activates their agents. Invited humans (members/admins)
+  // skip this gate and land in the group to chat; they must not be forced to
+  // pair a computer. Computers are per-user, so the invitee would not see the
+  // owner's machine anyway. We previously ALSO required agentCount === 0, to
+  // avoid disrupting "grandfathered" free users who ran on Cumora Cloud with
+  // no paired machine. That state has been eliminated (free agents no longer
+  // run on managed cloud), so the guard is removed: any unpaired free
+  // workspace the user owns — even one with existing (now-dormant) agents —
+  // is sent to pair. `hasOwnComputer` checks existence not online status, so
+  // a paired-but-asleep machine never re-triggers onboarding.
+  //
+  // If the user also belongs to a workspace they do not own (invitee /
+  // admin), never pin them on computer onboarding — switch them into that
+  // company instead. A stray personal workspace from a failed invite parse
+  // must not trap them on 设置计算机.
+  const invitedCompany = companies.find((c) => c.role !== 'owner')
+  const wouldOnboard = activeTier === 'free'
+    && activeRole === 'owner'
     && computersLoaded && !hasOwnComputer
+  const needsOnboarding = wouldOnboard && !invitedCompany
+  useEffect(() => {
+    if (!wouldOnboard || !invitedCompany) return
+    useAuth.getState().setActiveCompany(invitedCompany.id)
+  }, [wouldOnboard, invitedCompany])
   const hasDockUnread = useConversations((s) =>
     s.list.some((c) => !isMuted(c) && (c.unread ?? 0) > 0),
   )
@@ -204,8 +221,9 @@ export function App() {
   const [inviteToken, setInviteToken] = useState<string | null>(() => {
     const fromUrl = consumeInviteFromUrl()
     if (fromUrl) {
-      // Scrub the URL immediately so a refresh doesn't re-fire the same
-      // flow; the token stays in component state.
+      // Stash before scrubbing so React StrictMode remounts (dev) still
+      // see the token via getPendingInvite() after the URL is cleared.
+      stashPendingInvite(fromUrl.token)
       fromUrl.clear()
       return fromUrl.token
     }

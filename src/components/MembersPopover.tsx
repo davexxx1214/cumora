@@ -1,13 +1,17 @@
 /**
  * Floating popover that lists every member of a conversation. Anchored to a
  * trigger element via DOMRect; closes on outside click / Esc. Click any row
- * to pin that person's profile in the InfoPane.
+ * to pin that person's profile in the InfoPane. Workspace owner/admin can
+ * kick others from group conversations (not DMs) without being a member.
  */
-import { useEffect, useRef, type RefObject } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 import { Avatar } from './Avatar'
 import { HumanBadge } from './HumanBadge'
+import { ITrash } from './icons'
+import { api } from '@/api/client'
 import { useApp } from '@/stores/app'
-import { useMe } from '@/stores/auth'
+import { useAuth, useMe } from '@/stores/auth'
+import { useConversations } from '@/stores/conversations'
 import { useT } from '@/lib/i18n'
 import type { Participant } from '@/types'
 
@@ -20,6 +24,8 @@ const STATUS_COLOR: Record<string, string> = {
 
 interface Props {
   members: Participant[]
+  conversationId: string
+  kind?: string
   /** anchor rect (e.g. from getBoundingClientRect of the trigger) */
   anchor: DOMRect
   /** trigger element that should not count as an outside click */
@@ -27,11 +33,15 @@ interface Props {
   onClose: () => void
 }
 
-export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) {
+export function MembersPopover({ members, conversationId, kind, anchor, triggerRef, onClose }: Props) {
   const t = useT()
   const ref = useRef<HTMLDivElement>(null)
   const openInfo = useApp((s) => s.openAgentInfo)
   const meId = useMe()
+  const companyRole = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.role)
+  const canKick = (companyRole === 'owner' || companyRole === 'admin') && kind === 'group'
+  const [kickingId, setKickingId] = useState<string | null>(null)
+  const [kickError, setKickError] = useState<string | null>(null)
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -72,6 +82,21 @@ export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) 
     return a.name.localeCompare(b.name)
   })
 
+  const kick = async (p: Participant) => {
+    if (!canKick || p.id === meId || kickingId) return
+    setKickError(null)
+    setKickingId(p.id)
+    try {
+      await api.kickMember(conversationId, p.id)
+      await useConversations.getState().reload()
+      onClose()
+    } catch (err) {
+      setKickError(err instanceof Error ? err.message : t('members.kickFailed'))
+    } finally {
+      setKickingId(null)
+    }
+  }
+
   return (
     <div
       ref={ref}
@@ -90,36 +115,61 @@ export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) 
       <div className="max-h-[400px] overflow-y-auto py-0.5">
         {sorted.map((p) => {
           const isYou = p.id === meId
+          const showKick = canKick && !isYou
           return (
-            <button
+            <div
               key={p.id}
-              onClick={() => {
-                if (!isYou) openInfo(p.id)
-                onClose()
-              }}
-              disabled={isYou}
-              className="w-full text-left flex items-center gap-2.5 py-2 px-3 transition hover:bg-sky2-50 disabled:cursor-default disabled:hover:bg-transparent"
+              className="w-full flex items-center gap-0.5 py-2 pl-3 pr-1.5 transition hover:bg-sky2-50"
             >
-              <Avatar p={p} size={32} ringColor="var(--cloud)" showStatus={false} />
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[13px] font-semibold text-ink-900 truncate">{p.name}</span>
-                  {isYou && <span className="text-[9.5px] font-bold py-px px-1.5 rounded uppercase tracking-wider bg-sky2-100 text-skype-deep">{t('members.youBadge')}</span>}
-                  {!isYou && p.kind === 'human' && <HumanBadge />}
+              <button
+                onClick={() => {
+                  if (!isYou) openInfo(p.id)
+                  onClose()
+                }}
+                disabled={isYou}
+                className="flex-1 min-w-0 text-left flex items-center gap-2.5 disabled:cursor-default"
+              >
+                <Avatar p={p} size={32} ringColor="var(--cloud)" showStatus={false} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[13px] font-semibold text-ink-900 truncate">{p.name}</span>
+                    {isYou && <span className="text-[9.5px] font-bold py-px px-1.5 rounded uppercase tracking-wider bg-sky2-100 text-skype-deep">{t('members.youBadge')}</span>}
+                    {!isYou && p.kind === 'human' && <HumanBadge />}
+                  </div>
+                  <div className="text-[11.5px] text-ink-500 truncate flex items-center gap-1.5">
+                    <span
+                      className="inline-block w-1.5 h-1.5 rounded-full"
+                      style={{ background: STATUS_COLOR[p.status] ?? 'var(--resting)' }}
+                    />
+                    {STATUS_LABEL[p.status] ?? 'idle'}
+                    {p.role && <><span className="text-ink-300">·</span><em className="not-italic font-display italic">{p.role}</em></>}
+                  </div>
                 </div>
-                <div className="text-[11.5px] text-ink-500 truncate flex items-center gap-1.5">
-                  <span
-                    className="inline-block w-1.5 h-1.5 rounded-full"
-                    style={{ background: STATUS_COLOR[p.status] ?? 'var(--resting)' }}
-                  />
-                  {STATUS_LABEL[p.status] ?? 'idle'}
-                  {p.role && <><span className="text-ink-300">·</span><em className="not-italic font-display italic">{p.role}</em></>}
-                </div>
-              </div>
-            </button>
+              </button>
+              {showKick && (
+                <button
+                  type="button"
+                  title={t('members.kickNamed', { name: p.name })}
+                  aria-label={t('members.kickNamed', { name: p.name })}
+                  disabled={kickingId !== null}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    void kick(p)
+                  }}
+                  className="shrink-0 w-7 h-7 grid place-items-center rounded-[8px] text-ink-300 hover:text-coral hover:bg-coral-soft/70 transition disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  <ITrash className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
           )
         })}
       </div>
+      {kickError && (
+        <div className="px-3 pt-0.5 pb-1.5 text-[11px] text-coral-deep leading-snug">
+          {kickError}
+        </div>
+      )}
     </div>
   )
 }

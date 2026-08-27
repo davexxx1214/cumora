@@ -494,7 +494,7 @@ export function AgentEditor({ agent, onClose }: Props) {
           <div className="flex-1" />
           <button
             onClick={submit}
-            disabled={busy || !name.trim() || !systemPrompt.trim()}
+            disabled={busy || !name.trim() || (!editing && !systemPrompt.trim())}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
             style={{
               background: 'var(--skype)',

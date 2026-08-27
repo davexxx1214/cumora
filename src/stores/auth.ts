@@ -73,9 +73,19 @@ export const useAuth = create<AuthState>((set) => ({
     // to the server-default one, defeating the manual switcher.
     const stored = localStorage.getItem(COMPANY_KEY)
     const memberIds = new Set(companies.map((c) => c.id))
-    const resolved = stored && memberIds.has(stored)
-      ? stored
-      : (activeCompanyId && memberIds.has(activeCompanyId) ? activeCompanyId : (companies[0]?.id ?? null))
+    const invited = companies.find((c) => c.role !== 'owner')
+    const storedCompany = stored ? companies.find((c) => c.id === stored) : undefined
+    // Invitees who signed up on a double-slash invite URL can end up with a
+    // stray owned personal workspace in localStorage. Prefer the workspace
+    // they were invited into so they skip computer onboarding.
+    let resolved: string | null
+    if (storedCompany?.role === 'owner' && invited) {
+      resolved = invited.id
+    } else if (stored && memberIds.has(stored)) {
+      resolved = stored
+    } else {
+      resolved = activeCompanyId && memberIds.has(activeCompanyId) ? activeCompanyId : (companies[0]?.id ?? null)
+    }
     if (resolved) localStorage.setItem(COMPANY_KEY, resolved)
     set((s) => ({
       user,

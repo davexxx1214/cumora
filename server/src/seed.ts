@@ -1,28 +1,135 @@
 import { pool } from './db/pool.js'
+import { hashPassword } from './password.js'
+
+/** Seeded local-dev owner. Login-capable (email + password). DEV ONLY. */
+export const DEV_USER_ID = 'davexxx1214'
+export const DEV_EMAIL = 'davexxx1214@dev.local'
+export const DEV_DISPLAY_NAME = 'davexxx1214'
+/** DEV ONLY — documented in README / CONTRIBUTING / .env.example. */
+export const DEV_PASSWORD = 'cumora-dev'
+
+const LEGACY_PLACEHOLDER_ID = 'yetone'
 
 /**
- * Ensure the placeholder 'yetone' user row exists so FK references from
- * seeded participants / conversations stay valid on a fresh DB. The row
- * has NO password and NO linked OAuth identity, so no one can log in as
- * it — it's purely a referential anchor for the demo data. On first
- * OAuth login, a separate `u-<uuid>` user is created with the real email.
+ * Ensure the seeded human exists so FK references from participants /
+ * conversations stay valid, AND so a self-hosted instance can sign in
+ * without OAuth. Password is hashed at seed time (never stored plaintext).
+ *
+ * Also migrates a leftover `yetone` placeholder (password_hash NULL) onto
+ * this account so already-seeded local DBs keep working.
  */
 async function ensureDevUser(): Promise<void> {
-  const DEV_USER_ID = 'yetone'
-  const DEV_EMAIL = 'yetone@dev.local'
-  const { rows } = await pool.query(`SELECT 1 FROM users WHERE id = $1 LIMIT 1`, [DEV_USER_ID])
-  if (rows[0]) return
-  await pool.query(
-    `INSERT INTO users (id, email, display_name, password_hash) VALUES ($1, $2, $3, NULL)
-     ON CONFLICT (id) DO NOTHING`,
-    [DEV_USER_ID, DEV_EMAIL, 'Yetone'],
+  const passwordHash = await hashPassword(DEV_PASSWORD)
+
+  const { rows: existing } = await pool.query<{ id: string }>(
+    `SELECT id FROM users WHERE id = $1 LIMIT 1`, [DEV_USER_ID],
   )
+  if (!existing[0]) {
+    const { rows: legacy } = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE id = $1 LIMIT 1`, [LEGACY_PLACEHOLDER_ID],
+    )
+    if (legacy[0]) {
+      await reassignPlaceholderUser(LEGACY_PLACEHOLDER_ID, DEV_USER_ID, DEV_EMAIL, DEV_DISPLAY_NAME, passwordHash)
+      console.log(`[seed] migrated placeholder '${LEGACY_PLACEHOLDER_ID}' → '${DEV_USER_ID}' (login-capable)`)
+    } else {
+      await pool.query(
+        `INSERT INTO users (id, email, display_name, password_hash, email_verified_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (id) DO NOTHING`,
+        [DEV_USER_ID, DEV_EMAIL, DEV_DISPLAY_NAME, passwordHash],
+      )
+      console.log(`[seed] created '${DEV_USER_ID}' (email ${DEV_EMAIL}; password DEV ONLY)`)
+    }
+  } else {
+    // Refresh hash / identity so a re-seed of a running local DB still
+    // has a working login even if the row was created as a no-password
+    // placeholder under this id.
+    await pool.query(
+      `UPDATE users
+          SET email = $2,
+              display_name = $3,
+              password_hash = $4,
+              email_verified_at = COALESCE(email_verified_at, NOW())
+        WHERE id = $1`,
+      [DEV_USER_ID, DEV_EMAIL, DEV_DISPLAY_NAME, passwordHash],
+    )
+  }
+
   await pool.query(
     `INSERT INTO company_members (company_id, user_id, role) VALUES ('personal', $1, 'owner')
      ON CONFLICT DO NOTHING`,
     [DEV_USER_ID],
   )
-  console.log(`[seed] placeholder 'yetone' user created (FK anchor for demo data; no login)`)
+  await pool.query(
+    `UPDATE companies SET owner_user_id = $1
+      WHERE id = 'personal' AND (owner_user_id IS NULL OR owner_user_id = $2)`,
+    [DEV_USER_ID, LEGACY_PLACEHOLDER_ID],
+  )
+}
+
+/** Move leftover seed FKs off the old placeholder user onto the new id. */
+async function reassignPlaceholderUser(
+  fromId: string,
+  toId: string,
+  email: string,
+  displayName: string,
+  passwordHash: string,
+): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `INSERT INTO users (id, email, display_name, password_hash, email_verified_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (id) DO NOTHING`,
+      [toId, email, displayName, passwordHash],
+    )
+    await client.query(
+      `UPDATE sessions SET user_id = $2 WHERE user_id = $1`,
+      [fromId, toId],
+    )
+    await client.query(
+      `UPDATE ws_tickets SET user_id = $2 WHERE user_id = $1`,
+      [fromId, toId],
+    )
+    await client.query(
+      `INSERT INTO company_members (company_id, user_id, role, joined_at)
+       SELECT company_id, $2, role, joined_at FROM company_members WHERE user_id = $1
+       ON CONFLICT DO NOTHING`,
+      [fromId, toId],
+    )
+    await client.query(`DELETE FROM company_members WHERE user_id = $1`, [fromId])
+    await client.query(
+      `UPDATE companies SET owner_user_id = $2 WHERE owner_user_id = $1`,
+      [fromId, toId],
+    )
+    await client.query(
+      `UPDATE participants SET id = $2, name = $3 WHERE id = $1 AND kind = 'human'`,
+      [fromId, toId, displayName],
+    )
+    await client.query(
+      `UPDATE conversations
+          SET members = (
+            SELECT COALESCE(jsonb_agg(
+              CASE WHEN elem = to_jsonb($1::text) THEN to_jsonb($2::text) ELSE elem END
+            ), '[]'::jsonb)
+              FROM jsonb_array_elements(COALESCE(members, '[]'::jsonb)) AS elem
+          )
+        WHERE members @> to_jsonb($1::text)`,
+      [fromId, toId],
+    )
+    await client.query(
+      `UPDATE messages SET author_id = $2 WHERE author_id = $1`,
+      [fromId, toId],
+    )
+    await client.query(`DELETE FROM users WHERE id = $1`, [fromId])
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
 }
 
 interface SeedParticipant {
@@ -38,7 +145,7 @@ interface SeedParticipant {
 }
 
 const SEED_PARTICIPANTS: SeedParticipant[] = [
-  { id: 'yetone', kind: 'human', name: 'Yetone', initial: 'Y', avatarBg: 'linear-gradient(135deg, #FF7A6B, #F4B740)', status: 'avail' },
+  { id: DEV_USER_ID, kind: 'human', name: DEV_DISPLAY_NAME, initial: 'D', avatarBg: 'linear-gradient(135deg, #FF7A6B, #F4B740)', status: 'avail' },
   { id: 'atlas', kind: 'agent', name: 'Atlas', role: 'Researcher', initial: 'A', avatarBg: 'linear-gradient(135deg, #6B7BE6, #4452B5)', status: 'working', bio: 'I find patterns across noise. Best at long-form research and synthesis.', tools: ['web.search', 'pdf.read', 'linear'] },
   { id: 'iris', kind: 'agent', name: 'Iris', role: 'Designer', initial: 'I', avatarBg: 'linear-gradient(135deg, #FF8FBF, #C84F8B)', status: 'working', bio: "The team's eye. I move from sketch to ship without losing the feeling.", tools: ['image.gen', 'palette', 'web.read'] },
   { id: 'bram', kind: 'agent', name: 'Bram', role: 'Engineer', initial: 'B', avatarBg: 'linear-gradient(135deg, #4FC2A1, #2D8C72)', status: 'avail', bio: 'I build, I ship, I keep the bundles small.', tools: ['shell', 'docs'] },
@@ -85,15 +192,15 @@ interface SeedConvo {
  * (`cumora dm`).
  */
 const SEED_CONVOS: SeedConvo[] = [
-  { id: 'aurora', kind: 'group', title: 'Aurora · Q3 Launch', subtitle: 'team · 5', members: ['atlas', 'iris', 'bram', 'nova', 'yetone'], pinned: true, tag: 'team', projectId: 'p-aurora' },
-  { id: 'direct-atlas', kind: 'direct', title: 'Atlas', members: ['atlas', 'yetone'] },
-  { id: 'direct-iris', kind: 'direct', title: 'Iris', members: ['iris', 'yetone'] },
-  { id: 'direct-bram', kind: 'direct', title: 'Bram', members: ['bram', 'yetone'] },
-  { id: 'direct-nova', kind: 'direct', title: 'Nova', members: ['nova', 'yetone'] },
-  { id: 'direct-lumen', kind: 'direct', title: 'Lumen', members: ['lumen', 'yetone'] },
-  { id: 'direct-kael', kind: 'direct', title: 'Kael', members: ['kael', 'yetone'] },
-  { id: 'direct-wei', kind: 'direct', title: 'Wei', subtitle: 'teammate', members: ['wei', 'yetone'], tag: 'human' },
-  { id: 'direct-maya', kind: 'direct', title: 'Maya', subtitle: 'teammate', members: ['maya', 'yetone'], tag: 'human' },
+  { id: 'aurora', kind: 'group', title: 'Aurora · Q3 Launch', subtitle: 'team · 5', members: ['atlas', 'iris', 'bram', 'nova', DEV_USER_ID], pinned: true, tag: 'team', projectId: 'p-aurora' },
+  { id: 'direct-atlas', kind: 'direct', title: 'Atlas', members: ['atlas', DEV_USER_ID] },
+  { id: 'direct-iris', kind: 'direct', title: 'Iris', members: ['iris', DEV_USER_ID] },
+  { id: 'direct-bram', kind: 'direct', title: 'Bram', members: ['bram', DEV_USER_ID] },
+  { id: 'direct-nova', kind: 'direct', title: 'Nova', members: ['nova', DEV_USER_ID] },
+  { id: 'direct-lumen', kind: 'direct', title: 'Lumen', members: ['lumen', DEV_USER_ID] },
+  { id: 'direct-kael', kind: 'direct', title: 'Kael', members: ['kael', DEV_USER_ID] },
+  { id: 'direct-wei', kind: 'direct', title: 'Wei', subtitle: 'teammate', members: ['wei', DEV_USER_ID], tag: 'human' },
+  { id: 'direct-maya', kind: 'direct', title: 'Maya', subtitle: 'teammate', members: ['maya', DEV_USER_ID], tag: 'human' },
 ]
 
 interface SeedMsg {
@@ -113,7 +220,7 @@ const SEED_MESSAGES: SeedMsg[] = []
 
 export async function seedIfEmpty(): Promise<void> {
   // Always make sure the dev account exists so login works on a fresh DB.
-  // Email: yetone@dev.local  Password: cumora-dev (DEV ONLY).
+  // Email: davexxx1214@dev.local  Password: cumora-dev (DEV ONLY).
   await ensureDevUser()
 
   const { rows } = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM conversations')

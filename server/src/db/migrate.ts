@@ -513,7 +513,7 @@ CREATE TABLE IF NOT EXISTS company_members (
   PRIMARY KEY (company_id, user_id)
 );
 
--- Dev seed membership (yetone ↔ 'personal' company) lives in seed.ts, not
+-- Dev seed membership (davexxx1214 ↔ 'personal' company) lives in seed.ts, not
 -- here. Keeping it in DDL meant every prod boot tried to insert a row
 -- referencing a user id that only exists in dev seed data.
 
@@ -818,9 +818,9 @@ CREATE TABLE IF NOT EXISTS user_identities (
 CREATE INDEX IF NOT EXISTS idx_user_identities_user   ON user_identities(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_identities_email  ON user_identities(email_lower);
 
--- Migration: password auth is gone. Make password_hash nullable so OAuth-only
--- users can be created without a password, then drop the verification + reset
--- token tables (no more email-verification or password-reset flows).
+-- password_hash is nullable so OAuth-only users can be created without a
+-- password. Local email+password login still uses this column when set
+-- (see /auth/login). Verification + reset token tables stay dropped.
 ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
 DROP TABLE IF EXISTS password_reset_tokens;
 DROP TABLE IF EXISTS email_verification_tokens;

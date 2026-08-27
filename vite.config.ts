@@ -41,6 +41,7 @@ export default defineConfig({
   },
   server: {
     host: true,
+    allowedHosts: true,
     port: 5173,
     proxy: {
       '/api':      { target: HTTP_TARGET, changeOrigin: true, secure: false },

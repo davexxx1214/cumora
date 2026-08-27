@@ -26,7 +26,7 @@ Worker's separate `package.json`.
 
 Open http://localhost:5180 for the web app, or `npm run electron:dev` for the
 desktop shell. The database schema is created idempotently on boot and seeded
-with a starter team. Everything else (OAuth login, email, storage, push, the
+with a starter team. Sign in without OAuth as `davexxx1214@dev.local` / `cumora-dev` (DEV ONLY). Everything else (OAuth login, email, storage, push, the
 sub2api LLM gateway) soft-disables when its env vars are unset — see
 [`.env.example`](.env.example).
 

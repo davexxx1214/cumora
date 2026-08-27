@@ -542,6 +542,25 @@ export interface ServerCapabilities {
    *  Driven by EMAIL_DOMAIN being set on the server. The invite modal
    *  hides the "Email this invite" checkbox when false. */
   invitationEmail: boolean
+  /** Local email+password login is available. Always true today; the
+   *  AuthScreen uses this (and /auth/methods) to show the password form. */
+  passwordLogin?: boolean
+  /** OAuth providers currently configured on the server. Empty when the
+   *  corresponding GOOGLE_/GITHUB_ env vars are unset. */
+  oauthProviders?: Array<'google' | 'github'>
+}
+
+export interface AuthMethods {
+  passwordLogin: boolean
+  /** Local email+password registration. Always true today alongside passwordLogin. */
+  passwordSignup?: boolean
+  oauthProviders: Array<'google' | 'github'>
+}
+
+export interface PasswordLoginResponse {
+  token: string
+  user: { id: string; email: string; displayName: string }
+  companyId: string | null
 }
 
 export type ApiInvitationStatus = 'active' | 'revoked' | 'expired' | 'consumed'
@@ -771,6 +790,23 @@ export const api = {
   },
   authLogout: () =>
     http<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
+  /** Unauthenticated — which sign-in methods this server currently offers. */
+  authMethods: () =>
+    http<AuthMethods>('/auth/methods'),
+  /** Local email + password login. Same session-token shape as OAuth. */
+  authLogin: (input: { email: string; password: string }) =>
+    http<PasswordLoginResponse>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  /** Local email + password registration. Same session-token shape as login.
+   *  Pass `inviteToken` when signing up from /invite/<token> so the server
+   *  skips creating a stray personal workspace (matches OAuth Path C). */
+  authSignup: (input: { email: string; password: string; displayName?: string; inviteToken?: string | null }) =>
+    http<PasswordLoginResponse>('/auth/signup', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   /** Permanently delete the signed-in user's account. Soft-deletes
    *  the user row + clears PII + invalidates every session + drops
    *  OAuth linkages. After this call returns 200, the local Bearer
@@ -1005,6 +1041,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ id: participantId }),
     }),
+  /** Owner/admin only. Removes a human or agent from a group conversation. */
+  kickMember: (conversationId: string, participantId: string) =>
+    http<{ ok: boolean; members: string[] }>(
+      `/conversations/${encodeURIComponent(conversationId)}/members/${encodeURIComponent(participantId)}`,
+      { method: 'DELETE' },
+    ),
   getMessages: (
     conversationId: string,
     opts?: { before?: number; limit?: number },

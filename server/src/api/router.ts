@@ -12,6 +12,7 @@ import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypt
 import {
   deleteSession, authMiddleware, type AuthedRequest,
   audit, createWsTicket, gravatarUrlForEmail,
+  createSession, attemptPasswordLogin, attemptPasswordSignup,
 } from '../auth.js'
 import { joinAllHands, onboardStarterAgents, seedMemberDms } from '../onboardCompany.js'
 import {
@@ -19,7 +20,7 @@ import {
   authorizeUrl, handleCallback, errorUrl, returnUrlAllowed,
 } from '../oauth.js'
 import { adminRouter } from './admin-router.js'
-import { isWaitlistEnabled } from '../admin.js'
+import { isWaitlistEnabled, isAllowlistedAdmin, enqueueWaitlist } from '../admin.js'
 import { ogPreview, OgError } from '../og.js'
 import { sendInvitationEmail, type InvitationEmailDelivery } from '../invitation-email.js'
 import { getUserQuota, sub2apiConfigured } from '../sub2api.js'
@@ -637,7 +638,162 @@ api.get('/metrics', async (req, res) => {
   res.send(renderProm())
 })
 
-/* ============== Auth — OAuth only (Google + GitHub) ============== */
+/* ============== Auth — OAuth (Google / GitHub / Apple) + local password == */
+
+/** Which sign-in methods this server currently offers. Unauthenticated —
+ *  AuthScreen probes this before login so self-hosted deploys with no
+ *  OAuth creds still show the email+password form, and hide dead provider
+ *  buttons when those env vars are blank. */
+api.get('/auth/methods', safe(async (_req, res) => {
+  const oauthProviders: Array<'google' | 'github'> = []
+  if (providerEnabled('google')) oauthProviders.push('google')
+  if (providerEnabled('github')) oauthProviders.push('github')
+  res.json({
+    passwordLogin: true,
+    passwordSignup: true,
+    oauthProviders,
+  })
+}))
+
+/**
+ * Local email + password login. Additive to OAuth — same session token
+ * shape as the Apple-native and OAuth callback paths (createSession).
+ * Body: `{ email, password }`. Rate-limited via auth_attempts.
+ */
+api.post('/auth/login', safe(async (req, res) => {
+  const body = (req.body ?? {}) as { email?: unknown; password?: unknown }
+  const email = typeof body.email === 'string' ? body.email : ''
+  const password = typeof body.password === 'string' ? body.password : ''
+  if (!email.trim() || !password) {
+    res.status(400).json({ error: 'email and password required' }); return
+  }
+  const ip = req.socket.remoteAddress ?? null
+  const ua = (req.headers['user-agent'] as string | undefined) ?? null
+  const result = await attemptPasswordLogin({ email, password, ip })
+  if (!result.ok) {
+    // Uniform message for the common failure modes so we don't leak
+    // whether the email is registered / has a password.
+    if (result.reason === 'locked') {
+      res.status(429).json({ error: 'too many attempts — try again later' }); return
+    }
+    if (result.reason === 'suspended') {
+      res.status(403).json({ error: 'account suspended' }); return
+    }
+    res.status(401).json({ error: 'invalid email or password' }); return
+  }
+  const { token } = await createSession(result.userId, {
+    ip: ip ?? undefined, ua: ua ?? undefined,
+  })
+  const { rows: companies } = await pool.query<{ id: string }>(
+    `SELECT c.id
+       FROM company_members cm
+       JOIN companies c ON c.id = cm.company_id
+      WHERE cm.user_id = $1
+      ORDER BY cm.joined_at ASC
+      LIMIT 1`,
+    [result.userId],
+  )
+  const companyId = companies[0]?.id ?? null
+  await audit({
+    kind: 'login',
+    userId: result.userId,
+    companyId,
+    ip, userAgent: ua,
+    detail: { provider: 'password', email: result.email },
+  })
+  res.json({
+    token,
+    user: { id: result.userId, email: result.email, displayName: result.displayName },
+    companyId,
+  })
+}))
+
+/**
+ * Local email + password registration. Same session-token shape as login.
+ * Body: `{ email, password, displayName?, inviteToken? }`. Rate-limited via
+ * auth_attempts. Creates the user + a personal company (skipped when
+ * inviteToken is set — the invitee is joining someone else's workspace)
+ * and runs the same onboarding path OAuth Path C uses (gravatar, starter
+ * agents when paid, #all-hands). On the invite path there is no companyId,
+ * so post-commit onboardStarterAgents / joinAllHands are skipped — the
+ * inviter's workspace already has agents + #all-hands.
+ */
+api.post('/auth/signup', safe(async (req, res) => {
+  const body = (req.body ?? {}) as { email?: unknown; password?: unknown; displayName?: unknown; inviteToken?: unknown }
+  const email = typeof body.email === 'string' ? body.email : ''
+  const password = typeof body.password === 'string' ? body.password : ''
+  const displayName = typeof body.displayName === 'string' ? body.displayName : undefined
+  const inviteRaw = typeof body.inviteToken === 'string' ? body.inviteToken.trim() : ''
+  const inviteToken = inviteRaw || null
+  if (!email.trim() || !password) {
+    res.status(400).json({ error: 'email and password required' }); return
+  }
+  const ip = req.socket.remoteAddress ?? null
+  const ua = (req.headers['user-agent'] as string | undefined) ?? null
+  const normalizedEmail = email.trim().toLowerCase()
+  const waitlistEnabled = await isWaitlistEnabled()
+  const isAdmin = isAllowlistedAdmin(normalizedEmail)
+  const result = await attemptPasswordSignup({
+    email, password, displayName, ip, waitlistEnabled, isAdmin, inviteToken,
+  })
+  if (!result.ok) {
+    if (result.reason === 'waitlisted') {
+      const name = (displayName && displayName.trim()) || normalizedEmail.split('@')[0] || normalizedEmail
+      try {
+        await enqueueWaitlist({
+          provider: 'password',
+          providerId: normalizedEmail,
+          email: normalizedEmail,
+          displayName: name,
+          avatarUrl: gravatarUrlForEmail(normalizedEmail),
+        })
+      } catch (e) {
+        console.warn('[auth] waitlist enqueue failed', e)
+      }
+      await audit({
+        kind: 'signup_waitlisted',
+        ip, userAgent: ua,
+        detail: { provider: 'password', email: normalizedEmail },
+      })
+      res.status(403).json({ error: 'waitlisted' }); return
+    }
+    if (result.reason === 'locked') {
+      res.status(429).json({ error: 'too many attempts — try again later' }); return
+    }
+    if (result.reason === 'email_taken') {
+      res.status(409).json({ error: 'email already registered' }); return
+    }
+    if (result.reason === 'short_password') {
+      res.status(400).json({ error: 'password must be at least 8 characters' }); return
+    }
+    res.status(400).json({ error: 'invalid email or password' }); return
+  }
+  const { token } = await createSession(result.userId, {
+    ip: ip ?? undefined, ua: ua ?? undefined,
+  })
+  // Same post-commit onboarding as OAuth Path C — best-effort, never block signup.
+  if (result.companyId) {
+    try {
+      if ((await companyTier(result.companyId)) !== 'free') {
+        await ensureCloudComputer(result.companyId)
+        await onboardStarterAgents(result.companyId, { computerId: cloudComputerId(result.companyId), engine: 'managed' })
+      }
+    } catch (e) { console.warn('[auth] starter onboarding failed', e) }
+    try { await joinAllHands({ companyId: result.companyId, participantId: result.userId }) } catch (e) { console.warn('[auth] join all-hands failed', e) }
+  }
+  await audit({
+    kind: 'signup',
+    userId: result.userId,
+    companyId: result.companyId,
+    ip, userAgent: ua,
+    detail: { provider: 'password', email: result.email },
+  })
+  res.status(201).json({
+    token,
+    user: { id: result.userId, email: result.email, displayName: result.displayName },
+    companyId: result.companyId,
+  })
+}))
 
 /** 302 to the provider's consent screen. State is opaque to the client —
  *  we mint it server-side, save to Redis (5min TTL), and verify on the
@@ -898,6 +1054,14 @@ api.get('/auth/me', safe(async (req, res) => {
     // box that will always fail. Add other capabilities here as needed.
     serverCapabilities: {
       invitationEmail: !!env.EMAIL_DOMAIN,
+      // Local email+password is always available (additive to OAuth). The
+      // SPA uses this the same way it uses oauthProviders — to decide
+      // whether to show the password form on AuthScreen.
+      passwordLogin: true,
+      oauthProviders: [
+        ...(providerEnabled('google') ? ['google' as const] : []),
+        ...(providerEnabled('github') ? ['github' as const] : []),
+      ],
     },
   })
 }))
@@ -1643,9 +1807,6 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
   if (inv) {
     try { await joinAllHands({ companyId: inv.company_id, participantId: me }) }
     catch (e) { console.warn('[invite] join all-hands failed', e) }
-    // Seed 1:1 DMs with every existing teammate (agents + humans) so the
-    // invitee's sidebar matches the owner's experience — they can click any
-    // colleague directly instead of having to dig through #all-hands.
     try { await seedMemberDms({ companyId: inv.company_id, memberId: me }) }
     catch (e) { console.warn('[invite] seed member DMs failed', e) }
   }
@@ -3042,6 +3203,40 @@ api.post('/conversations/:id/leave', async (req, res) => {
     kind: 'left', participantId: me,
   })
   const next = c.members.filter((m) => m !== me)
+  await pool.query(
+    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
+    [id, JSON.stringify(next), tenant],
+  )
+  res.json({ ok: true, members: next })
+})
+
+/** Kick a participant (human or agent) from a group. Owner/admin of the
+ *  workspace — they do not need to already be a member of the group.
+ *  Posts the `kicked` system row BEFORE the members mutation so the
+ *  target's mailbox surfaces this final row (same order as `cumora kick`). */
+api.delete('/conversations/:id/members/:memberId', async (req, res) => {
+  const { userId: me, companyId: tenant } = await requireCompanyRole(req, PRIVILEGED_ROLES)
+  const { id, memberId } = req.params
+  const target = String(memberId ?? '').trim()
+  if (!target) { res.status(400).json({ error: 'id required' }); return }
+  if (target === me) {
+    res.status(400).json({ error: 'cannot kick yourself — leave the group instead' }); return
+  }
+  const { rows } = await pool.query<{ kind: string; members: string[] }>(
+    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
+  )
+  const c = rows[0]
+  if (!c) { res.status(404).json({ error: 'not found' }); return }
+  if (c.kind !== 'group') {
+    res.status(400).json({ error: `cannot kick from a ${c.kind} conversation` }); return
+  }
+  if (!c.members.includes(target)) { res.status(400).json({ error: 'not a member' }); return }
+  const { postMembershipSystemMessage } = await import('../agents/membership.js')
+  await postMembershipSystemMessage({
+    conversationId: id, companyId: tenant, actorId: me,
+    kind: 'kicked', participantId: target,
+  })
+  const next = c.members.filter((m) => m !== target)
   await pool.query(
     `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
     [id, JSON.stringify(next), tenant],

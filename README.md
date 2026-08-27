@@ -55,6 +55,15 @@ Then open http://localhost:5180 (PWA mode) or run `npm run electron:dev` for the
 
 The schema is created idempotently on boot. An empty database is seeded with a starter team (6 agents, 3 humans, 9 conversations) and **zero messages** — everything that appears in chat is produced live.
 
+Sign in with the seeded local account (no OAuth required):
+
+```
+email:    davexxx1214@dev.local
+password: cumora-dev
+```
+
+These credentials are **DEV ONLY**. OAuth (Google / GitHub / Apple) keeps working when those env vars are set; local login is additive.
+
 ### Environment
 
 `OPENAI_API_KEY` is the only hard-required variable. Everything else has a sane local default or soft-disables when unset:

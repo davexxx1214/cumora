@@ -26,7 +26,7 @@
  *   • already_member — they already belong; just route them in.
  *   • not_found — bad link.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { api, type ApiInvitationPreview } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { isElectron, isWebAppHost } from '@/lib/runtime'
@@ -44,9 +44,10 @@ const INVITE_TOKEN_KEY = 'cumora.pending-invite'
  *  back up on return. */
 export function consumeInviteFromUrl(): { token: string; clear: () => void } | null {
   const url = new URL(window.location.href)
-  const pathMatch = url.pathname.match(/^\/invite\/([^/?#]+)\/?$/)
+  const pathMatch = url.pathname.match(/\/invite\/([^/?#]+)\/?$/)
   if (pathMatch) {
     const token = decodeURIComponent(pathMatch[1])
+    try { localStorage.setItem(INVITE_TOKEN_KEY, token) } catch { /* swallow */ }
     const clear = () => {
       // Drop the /invite/<token> prefix while preserving any query / hash
       // that was on the URL.
@@ -59,6 +60,7 @@ export function consumeInviteFromUrl(): { token: string; clear: () => void } | n
   const fromHash = hashParams.get('invite')
   if (fromHash) {
     const token = decodeURIComponent(fromHash)
+    try { localStorage.setItem(INVITE_TOKEN_KEY, token) } catch { /* swallow */ }
     const clear = () => {
       hashParams.delete('invite')
       const remaining = hashParams.toString()
@@ -70,6 +72,7 @@ export function consumeInviteFromUrl(): { token: string; clear: () => void } | n
   const fromQuery = url.searchParams.get('invite')
   if (fromQuery) {
     const token = decodeURIComponent(fromQuery)
+    try { localStorage.setItem(INVITE_TOKEN_KEY, token) } catch { /* swallow */ }
     const clear = () => {
       url.searchParams.delete('invite')
       const nextUrl = `${url.origin}${url.pathname}${url.searchParams.toString() ? '?' + url.searchParams.toString() : ''}${url.hash}`
@@ -162,17 +165,10 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
         }
       }
       clearPendingInvite()
-      if (isElectron) {
-        // Already in the app — drop straight into the workspace, no
-        // success interstitial needed.
-        onDone()
-      } else {
-        // Web flow: park on the success screen so the user can choose
-        // between continuing in the browser, opening the desktop app via
-        // deep link, or downloading it. Auto-routing into the SPA was
-        // the wrong default — most invitees probably want the native app.
-        setJoinedCompany({ id: r.company.id, name: r.company.name, slug: r.company.slug })
-      }
+      // Always land in the workspace. Self-hosted has no native app;
+      // parking on "Open in Cumora app" lets people refresh into a
+      // stray personal workspace instead of the invited one.
+      onDone()
     } catch (e) {
       setAcceptErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -188,8 +184,22 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
     if (preview?.status !== 'valid') return
     if (busy) return
     if (joinedCompany) return  // already redeemed — don't re-POST in a loop
+    if (acceptErr) return      // failed accept — show the error, don't fall into AuthedApp
     void accept()
-  }, [tokenStr, preview, busy, accept, joinedCompany])
+  }, [tokenStr, preview, busy, accept, joinedCompany, acceptErr])
+
+  // already_member: auto-switch into the invited workspace instead of
+  // parking on "Open desktop" (self-hosted has no native app, and a
+  // refresh would drop them into a stray owned workspace + onboarding).
+  useEffect(() => {
+    if (!tokenStr) return
+    if (preview?.status !== 'already_member') return
+    const id = preview.invitation?.company.id
+    if (!id) return
+    setActive(id)
+    clearPendingInvite()
+    onDone()
+  }, [tokenStr, preview, setActive, onDone])
 
   const inv = preview?.invitation
   const companyName = inv?.company.name ?? 'Cumora'
@@ -452,7 +462,36 @@ function ErrorBlock({ title, body, onDismiss }: { title: string; body: string; o
 
 function SignInToAccept({ token }: { token: string }) {
   const t = useT()
-  const [busy, setBusy] = useState<'google' | 'github' | null>(null)
+  const [busy, setBusy] = useState<'google' | 'github' | 'password' | null>(null)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [mode, setMode] = useState<'login' | 'signup'>('login')
+  const [err, setErr] = useState<string | null>(null)
+  const goPassword = async (e: FormEvent) => {
+    e.preventDefault()
+    if (busy !== null) return
+    setBusy('password'); setErr(null)
+    stashPendingInvite(token)
+    try {
+      const r = mode === 'signup'
+        ? await api.authSignup({
+            email: email.trim(),
+            password,
+            displayName: displayName.trim() || undefined,
+            inviteToken: token,
+          })
+        : await api.authLogin({ email: email.trim(), password })
+      useAuth.getState().setSession(
+        r.token,
+        { id: r.user.id, email: r.user.email, name: r.user.displayName },
+        r.companyId,
+      )
+    } catch (err) {
+      setErr(err instanceof Error ? err.message : String(err))
+      setBusy(null)
+    }
+  }
   const go = (provider: 'google' | 'github') => {
     setBusy(provider)
     // Persist BEFORE redirect so the post-OAuth landing can resume here.
@@ -481,7 +520,64 @@ function SignInToAccept({ token }: { token: string }) {
   return (
     <div className="w-full flex flex-col gap-2.5">
       <div className="text-[12.5px] text-ink-500 font-display italic text-center">
-        {t('auth.signInToAccept')}
+        {mode === 'signup' ? t('auth.signUpToAccept') : t('auth.signInToAccept')}
+      </div>
+      <form onSubmit={goPassword} className="w-full flex flex-col gap-2">
+        {mode === 'signup' && (
+          <input
+            type="text"
+            autoComplete="name"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            placeholder={t('auth.displayNamePlaceholder')}
+            disabled={busy !== null}
+            className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+          />
+        )}
+        <input
+          type="email"
+          autoComplete="username"
+          required
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder={t('auth.emailPlaceholder')}
+          disabled={busy !== null}
+          className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+        />
+        <input
+          type="password"
+          autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+          required
+          minLength={mode === 'signup' ? 8 : undefined}
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder={t('auth.passwordPlaceholder')}
+          disabled={busy !== null}
+          className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+        />
+        <button
+          type="submit"
+          disabled={busy !== null || !email.trim() || !password}
+          className="h-11 rounded-[10px] bg-ink-800 text-white text-[14px] disabled:opacity-60"
+        >
+          {mode === 'signup'
+            ? (busy === 'password' ? t('auth.creatingAccount') : t('auth.createAccount'))
+            : (busy === 'password' ? t('auth.signingIn') : t('auth.signIn'))}
+        </button>
+        <button
+          type="button"
+          onClick={() => { setMode((m) => m === 'login' ? 'signup' : 'login'); setErr(null) }}
+          disabled={busy !== null}
+          className="text-[12px] text-ink-400 hover:text-ink-600 font-display italic disabled:opacity-60"
+        >
+          {mode === 'login' ? t('auth.noAccount') : t('auth.haveAccount')}
+        </button>
+      </form>
+      {err && <div className="text-[12px] text-red-600 text-center">{err}</div>}
+      <div className="flex items-center gap-2 py-0.5">
+        <div className="flex-1 h-px bg-ink-200" />
+        <div className="text-[11px] text-ink-300 font-display italic">{t('auth.or')}</div>
+        <div className="flex-1 h-px bg-ink-200" />
       </div>
       <button
         type="button"

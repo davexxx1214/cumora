@@ -264,7 +264,7 @@ export function AgentsView() {
   const allAgents = Object.values(byId).filter((p) => p.kind === 'agent')
   const list = allAgents.filter((p) => !p.departedAt)
   const departed = allAgents.filter((p) => p.departedAt).sort((a, b) => (b.departedAt ?? '').localeCompare(a.departedAt ?? ''))
-  const humans = Object.values(byId).filter((p) => p.kind === 'human' && p.id !== meId)
+  const humans = Object.values(byId).filter((p) => p.kind === 'human' && p.id !== meId && !p.departedAt)
 
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<Participant | null>(null)

@@ -292,6 +292,8 @@ function ChatHeader({
       </button>
       {membersAnchor && (
         <MembersPopover
+          conversationId={c.id}
+          kind={c.kind}
           members={memberPs}
           anchor={membersAnchor}
           triggerRef={memberStackRef}

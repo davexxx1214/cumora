@@ -1,17 +1,20 @@
 /**
- * Sign-in screen — OAuth only (Google + GitHub). No password forms, no
- * signup, no forgot. Provider buttons trigger a full-page redirect to
+ * Sign-in screen — local email+password plus optional OAuth (Google +
+ * GitHub). Password is the way in for self-hosted servers with no OAuth
+ * provider configured; OAuth buttons appear when /auth/methods says those
+ * providers are enabled. Provider buttons trigger a full-page redirect to
  * /api/auth/start/<provider> on the configured server origin (relative
  * URL goes through the Vite proxy in dev; baked-in absolute URL in
  * packaged builds). The provider returns to /auth/done with a fragment
- * the AuthGate consumes on next mount.
+ * the AuthGate consumes on next mount. Password login POSTs /auth/login
+ * and stamps the session in-process (same as native Apple).
  *
  * Server switcher: dev iteration constantly toggles between Local Dev
  * and Production; we surface that here (not buried in devtools) because
  * picking the server is a sign-in-time decision — the auth token is
  * per-server.
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type FormEvent } from 'react'
 import { api, getPairingServerOrigin, getServerOrigin, setServerOrigin } from '@/api/client'
 import { isCapacitorIOS, isElectron } from '@/lib/runtime'
 import { isNativePlatform, nativePlatform, runAppleSignIn, runOAuth } from '@/lib/native'
@@ -33,9 +36,38 @@ const PRESET_LABEL_KEY: Record<string, MessageKey> = {
 
 export function AuthScreen() {
   const t = useT()
-  const [busy, setBusy] = useState<'google' | 'github' | 'apple' | null>(null)
+  const [busy, setBusy] = useState<'google' | 'github' | 'apple' | 'password' | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [picker, setPicker] = useState(false)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [mode, setMode] = useState<'login' | 'signup'>('login')
+  const [methods, setMethods] = useState<{
+    passwordLogin: boolean
+    passwordSignup: boolean
+    oauthProviders: Array<'google' | 'github'> | null
+  }>({ passwordLogin: true, passwordSignup: true, oauthProviders: [] })
+
+  // Probe which sign-in methods the server offers. /auth/me reports the
+  // same flags once a session exists; this unauthenticated sibling is
+  // what the login screen itself can call.
+  useEffect(() => {
+    let cancelled = false
+    void api.authMethods().then((r) => {
+      if (!cancelled) setMethods({
+        passwordLogin: r.passwordLogin !== false,
+        passwordSignup: r.passwordSignup !== false && r.passwordLogin !== false,
+        oauthProviders: r.oauthProviders ?? [],
+      })
+    }).catch(() => {
+      // Probe failed — still offer password, and keep OAuth buttons as a
+      // fallback so a production deploy whose /auth/methods is briefly
+      // unreachable doesn't lock people out of Google/GitHub.
+      if (!cancelled) setMethods({ passwordLogin: true, passwordSignup: true, oauthProviders: ['google', 'github'] })
+    })
+    return () => { cancelled = true }
+  }, [])
 
   // AuthGate strips a successful fragment after consuming it. A failure
   // fragment looks like `#token=&companyId=&error=...` — surface that
@@ -89,6 +121,46 @@ export function AuthScreen() {
       } else {
         setErr(msg)
       }
+      setBusy(null)
+    }
+  }
+
+  async function goPassword(e: FormEvent) {
+    e.preventDefault()
+    if (busy !== null) return
+    setBusy('password'); setErr(null)
+    try {
+      const r = await api.authLogin({ email: email.trim(), password })
+      useAuth.getState().setSession(
+        r.token,
+        { id: r.user.id, email: r.user.email, name: r.user.displayName },
+        r.companyId,
+      )
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setErr(msg)
+      setBusy(null)
+    }
+  }
+
+  async function goSignup(e: FormEvent) {
+    e.preventDefault()
+    if (busy !== null) return
+    setBusy('password'); setErr(null)
+    try {
+      const r = await api.authSignup({
+        email: email.trim(),
+        password,
+        displayName: displayName.trim() || undefined,
+      })
+      useAuth.getState().setSession(
+        r.token,
+        { id: r.user.id, email: r.user.email, name: r.user.displayName },
+        r.companyId,
+      )
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setErr(msg)
       setBusy(null)
     }
   }
@@ -173,6 +245,11 @@ export function AuthScreen() {
     location.assign(`${api.authStartUrl(provider)}?return=${ret}`)
   }
 
+  const oauth = methods.oauthProviders
+  const showGoogle = oauth === null || oauth.includes('google')
+  const showGithub = oauth === null || oauth.includes('github')
+  const showOAuth = showGoogle || showGithub || (isCapacitorIOS && nativePlatform() === 'ios')
+
   return (
     <div
       className="fixed inset-0 grid place-items-center"
@@ -184,10 +261,72 @@ export function AuthScreen() {
         <div className="text-center">
           <div className="font-display text-[22px] text-ink-900">{t('auth.welcome')}</div>
           <div className="font-display italic text-[13px] text-ink-400 mt-1">
-            {t('auth.signInToContinue')}
+            {mode === 'signup' ? t('auth.createAccountToContinue') : t('auth.signInToContinue')}
           </div>
         </div>
         <div className="w-full flex flex-col gap-3">
+          {methods.passwordLogin && (
+            <form onSubmit={mode === 'signup' ? goSignup : goPassword} className="w-full flex flex-col gap-2">
+              {mode === 'signup' && (
+                <input
+                  type="text"
+                  autoComplete="name"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder={t('auth.displayNamePlaceholder')}
+                  disabled={busy !== null}
+                  className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+                />
+              )}
+              <input
+                type="email"
+                autoComplete="username"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder={t('auth.emailPlaceholder')}
+                disabled={busy !== null}
+                className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+              />
+              <input
+                type="password"
+                autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+                required
+                minLength={mode === 'signup' ? 8 : undefined}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={t('auth.passwordPlaceholder')}
+                disabled={busy !== null}
+                className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+              />
+              <button
+                type="submit"
+                disabled={busy !== null || !email.trim() || !password}
+                className="h-11 rounded-[10px] bg-ink-800 hover:bg-ink-900 text-white transition-colors text-[14px] disabled:opacity-60"
+              >
+                {mode === 'signup'
+                  ? (busy === 'password' ? t('auth.creatingAccount') : t('auth.createAccount'))
+                  : (busy === 'password' ? t('auth.signingIn') : t('auth.signIn'))}
+              </button>
+              {methods.passwordSignup && (
+                <button
+                  type="button"
+                  onClick={() => { setMode((m) => m === 'login' ? 'signup' : 'login'); setErr(null) }}
+                  disabled={busy !== null}
+                  className="text-[12px] text-ink-400 hover:text-ink-600 font-display italic disabled:opacity-60"
+                >
+                  {mode === 'login' ? t('auth.noAccount') : t('auth.haveAccount')}
+                </button>
+              )}
+            </form>
+          )}
+          {methods.passwordLogin && showOAuth && (
+            <div className="flex items-center gap-2 py-1">
+              <div className="flex-1 h-px bg-ink-200" />
+              <div className="text-[11px] text-ink-300 font-display italic">{t('auth.or')}</div>
+              <div className="flex-1 h-px bg-ink-200" />
+            </div>
+          )}
           {/* Sign in with Apple — iOS-only for now. Apple Review
               Guideline 4.8 requires SIWA be offered as an equivalent
               option whenever an iOS app exposes any third-party
@@ -205,24 +344,28 @@ export function AuthScreen() {
               {busy === 'apple' ? t('auth.signingIn') : t('auth.continueWithApple')}
             </button>
           )}
-          <button
-            type="button"
-            onClick={() => go('google')}
-            disabled={busy !== null}
-            className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
-          >
-            <GoogleMark />
-            {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
-          </button>
-          <button
-            type="button"
-            onClick={() => go('github')}
-            disabled={busy !== null}
-            className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
-          >
-            <GitHubMark />
-            {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
-          </button>
+          {showGoogle && (
+            <button
+              type="button"
+              onClick={() => go('google')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
+            >
+              <GoogleMark />
+              {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
+            </button>
+          )}
+          {showGithub && (
+            <button
+              type="button"
+              onClick={() => go('github')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
+            >
+              <GitHubMark />
+              {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
+            </button>
+          )}
         </div>
         {err && (
           <div className="text-[12px] text-red-600 text-center max-w-full break-words">
@@ -230,7 +373,7 @@ export function AuthScreen() {
           </div>
         )}
         <div className="text-[11px] text-ink-300 text-center font-display italic">
-          {t('auth.providerNote')}
+          {showOAuth ? t('auth.providerNote') : t('auth.localNote')}
         </div>
         <ServerSwitch open={picker} onToggle={() => setPicker((v) => !v)} />
       </div>
