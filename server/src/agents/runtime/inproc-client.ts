@@ -357,6 +357,9 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
    *  JSON array so the prompt renderer doesn't need a second roundtrip. */
   async loadContext(agentId: string, conversationIds: string[]): Promise<ContextRow[]> {
     if (conversationIds.length === 0) return []
+    // conversationIds can come directly from an authenticated runtime caller.
+    // They narrow the read but do not authorize it: bind every conversation to
+    // the active agent's tenant and require current conversation membership.
     // Drive from conversations (PK lookup on the given ids) + a LATERAL that pulls
     // each conversation's most-recent 25 messages via idx_messages_convo_created.
     // The old form scanned ALL messages of each conversation (big "allhands" rooms
@@ -396,6 +399,11 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                WHERE cr.conversation_id = c.id AND hp.kind = 'human'
             ) AS human_last_read_at
            FROM conversations c
+           JOIN participants requesting_agent
+             ON requesting_agent.id = $1
+            AND requesting_agent.company_id = c.company_id
+            AND requesting_agent.kind = 'agent'
+            AND requesting_agent.departed_at IS NULL
            LEFT JOIN projects pr ON pr.id = c.project_id
            JOIN LATERAL (
              SELECT * FROM messages mm
@@ -405,6 +413,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
            ) m ON true
            LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
           WHERE c.id = ANY($2::text[])
+            AND c.members @> to_jsonb(ARRAY[$1::text])
        )
        SELECT id, conversation_id, company_id, conversation_title, conversation_kind, conversation_topic,
               project_name,
