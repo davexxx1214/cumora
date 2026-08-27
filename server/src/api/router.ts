@@ -5434,6 +5434,13 @@ async function wakeMentionedAgents(args: {
   companyId: string
   mentions: string[] | undefined
   actorId: string
+  /** What on the board caused this wake. Without it the agent is woken with an
+   *  empty chat inbox and `runAgentTurn` returns before it looks at anything —
+   *  which is why an assigned card could sit in Todo while the work itself was
+   *  reported done in chat. The brief is what gives the turn something to act
+   *  on, and it names the ids so the agent can drive the card with
+   *  `cumora card …` rather than guess. */
+  card?: { boardId: string; cardId: string; columnId?: string | null; title?: string | null; what: string }
 }): Promise<void> {
   if (!args.mentions || args.mentions.length === 0) return
   const targets = args.mentions.filter((id) => id !== args.actorId)
@@ -5448,8 +5455,27 @@ async function wakeMentionedAgents(args: {
   )
   if (rows.length === 0) return
   const { wakeAgent } = await import('../agents/scheduler.js')
+  const brief = args.card
+    ? {
+        source: 'kanban',
+        title: args.card.what,
+        body: [
+          args.card.title ? `Card: ${args.card.title}` : null,
+          `card id: ${args.card.cardId}`,
+          `board id: ${args.card.boardId}`,
+          args.card.columnId ? `column id: ${args.card.columnId}` : null,
+          '',
+          'Drive it with the board tools rather than only replying in chat:',
+          `  cumora card claim ${args.card.cardId}`,
+          `  cumora card comment ${args.card.cardId} "<progress / evidence>"`,
+          `  cumora card move ${args.card.cardId} <column_id>`,
+          '',
+          'If the work finishes here, leave the card in a state that says so — a board that still reads Todo while the work is done is worse than no board.',
+        ].filter((l) => l !== null).join('\n'),
+      }
+    : undefined
   for (const r of rows) {
-    void wakeAgent(r.id, 'manual', null).catch((e) => {
+    void wakeAgent(r.id, 'manual', null, null, brief ? { backgroundBrief: brief } : {}).catch((e) => {
       console.warn(`[boards] wake ${r.id} failed`, e)
     })
   }
@@ -5776,11 +5802,17 @@ api.post('/boards/:id/cards', async (req, res) => {
   await publishBoardEvent({
     companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
   })
-  void wakeMentionedAgents({ companyId, mentions, actorId: me })
+  void wakeMentionedAgents({
+    companyId, mentions, actorId: me,
+    card: { boardId, cardId: id, columnId, title, what: 'You were mentioned on a new board card' },
+  })
   // Assignment counts as a mention even without an @-token in prose:
   // when you `assignee_id = someone`, that someone should know about it.
   if (assigneeId && assigneeId !== me) {
-    void wakeMentionedAgents({ companyId, mentions: [assigneeId], actorId: me })
+    void wakeMentionedAgents({
+      companyId, mentions: [assigneeId], actorId: me,
+      card: { boardId, cardId: id, columnId, title, what: 'A board card was assigned to you' },
+    })
   }
   res.json({ id, position, mentions })
 })
@@ -5854,12 +5886,18 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
     kind: columnChanged ? 'card.moved' : 'card.updated',
     boardId, cardId, mentions, actorId: me,
   })
-  void wakeMentionedAgents({ companyId, mentions, actorId: me })
+  void wakeMentionedAgents({
+    companyId, mentions, actorId: me,
+    card: { boardId, cardId, what: 'You were mentioned on a board card' },
+  })
   // A re-assignment also wakes the new assignee.
   if (typeof req.body?.assigneeId === 'string') {
     const newAssignee = String(req.body.assigneeId).trim()
     if (newAssignee && newAssignee !== me) {
-      void wakeMentionedAgents({ companyId, mentions: [newAssignee], actorId: me })
+      void wakeMentionedAgents({
+        companyId, mentions: [newAssignee], actorId: me,
+        card: { boardId, cardId, what: 'A board card was assigned to you' },
+      })
     }
   }
   res.json({ ok: true, mentions })

@@ -115,6 +115,8 @@ interface InboxRow {
   quoted: QuotedSummary | null
 }
 
+import { classifyWake } from './turn-wake.js'
+
 export interface AgentTurnOptions {
   /** Why this turn was started. Message-driven turns remain the default. */
   trigger?: 'message.new' | 'idle' | 'manual' | 'background_scan' | 'poll.updated'
@@ -1567,10 +1569,12 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   if (!persona) return
 
   const inbox = await loadInbox(agentId)
-  const isIdleWake = options.trigger === 'idle' && inbox.length === 0
-  const isBackgroundScanWake = options.trigger === 'background_scan' && Boolean(options.backgroundBrief)
-  const isPollUpdateWake = options.trigger === 'poll.updated' && Boolean(options.pollBrief)
-  if (inbox.length === 0 && !isIdleWake && !isBackgroundScanWake && !isPollUpdateWake) return
+  const wake = classifyWake(options, inbox.length)
+  const isIdleWake = wake.idle
+  const isBackgroundScanWake = wake.backgroundScan
+  const isPollUpdateWake = wake.pollUpdate
+  const isBriefedManualWake = wake.briefedManual
+  if (inbox.length === 0 && !wake.survivesEmptyInbox) return
 
   const fingerprint = isIdleWake
     ? `idle:${new Date().toISOString()}`
@@ -1578,6 +1582,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       ? `background_scan:${options.backgroundBrief?.source ?? 'scanner'}:${new Date().toISOString()}`
     : isPollUpdateWake
       ? `poll:${options.pollBrief?.messageId}:${options.pollBrief?.phase}:${options.pollBrief?.totalVotes ?? 0}:${new Date().toISOString()}`
+    : isBriefedManualWake
+      ? `manual:${options.backgroundBrief?.source ?? 'brief'}:${new Date().toISOString()}`
     : inbox.map((m) => m.id).join(',')
   const convoIds = [...new Set([
     ...inbox.map((m) => m.conversation_id),
@@ -1609,7 +1615,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       source: options.trigger ?? 'scheduler',
       conversationIds: convoIds,
       idle: isIdleWake ? { reason: options.idleReason ?? 'idle heartbeat' } : undefined,
-      backgroundScan: isBackgroundScanWake
+      backgroundScan: (isBackgroundScanWake || isBriefedManualWake)
         ? {
             source: options.backgroundBrief?.source ?? 'scanner',
             title: options.backgroundBrief?.title ?? 'Background scan',
@@ -1941,7 +1947,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   // agent up. For message wakes, use newest unread bodies. For idle
   // synthetic wakes, retrieve broad self/team memories without inventing
   // a fake message.
-  const memoryQuery = (isBackgroundScanWake
+  const memoryQuery = ((isBackgroundScanWake || isBriefedManualWake)
     ? [
         options.backgroundBrief?.title ?? 'background scan',
         options.backgroundBrief?.body ?? '',
@@ -2119,6 +2125,14 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   const renderedConversationContext = renderContext(context, inbox.length, convoIds.length, textExcerpts, agentId)
   const wakeContext = isPollUpdateWake && options.pollBrief
     ? renderPollUpdateWakeContext(options.pollBrief, renderedConversationContext)
+    : isBriefedManualWake
+    ? `Someone just put this on you directly — it is a deliberate human action, not a scan or a heartbeat.
+
+${options.backgroundBrief?.title ?? 'Assigned work'}
+
+${options.backgroundBrief?.body ?? ''}
+
+Your chat inbox is empty; this wake exists because of the action above, so act on THAT rather than looking for a message to answer. Handle the work, or say plainly why you are not the right owner. If you genuinely have nothing to do here, call set_turn_status({ status: "done", reason: "...", next_step: "" }) and explain — do not silently drop it.`
     : isBackgroundScanWake
     ? `You just got an internal background scan brief. This is not a user chat message, and there is no obligation to interrupt anyone.
 
