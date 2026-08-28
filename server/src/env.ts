@@ -16,6 +16,17 @@ function required(name: string, fallback?: string): string {
   return v
 }
 
+function optionalPositiveInteger(name: string): number | undefined {
+  const raw = process.env[name]?.trim()
+  if (!raw) return undefined
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 1) {
+    console.error(`[env] ${name} must be a positive integer`)
+    process.exit(1)
+  }
+  return value
+}
+
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? 'gpt-5.5'
 // Cerebellum default — small/fast model used by JSON classifiers and one-shot
 // utilities that don't drive the agent's perceived intelligence (gender infer,
@@ -302,6 +313,9 @@ export const env = {
    *  cumora://invite/<token>). Set this only if the invite-acceptance flow
    *  lives on a different origin than the OAuth redirect. */
   INVITE_BASE_URL: process.env.CUMORA_INVITE_BASE_URL ?? '',
+  /** Self-hosted override for human members per workspace, including the
+   *  owner. Applies to every tier; unset preserves the tier defaults. */
+  WORKSPACE_HUMAN_LIMIT: optionalPositiveInteger('CUMORA_WORKSPACE_HUMAN_LIMIT'),
   /**
    * sub2api LLM quota gateway. When SUB2API_ADMIN_KEY is set, OAuth
    * signup provisions a per-user sub2api account + API key, and every

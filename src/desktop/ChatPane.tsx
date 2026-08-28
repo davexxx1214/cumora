@@ -9,6 +9,7 @@ import type { MessagesState } from '@/stores/messages'
 import { api, type ApiAttachment } from '@/api/client'
 import { Avatar, AvatarStack } from '@/components/Avatar'
 import { MembersPopover } from '@/components/MembersPopover'
+import { GroupInviteButton } from '@/components/GroupInviteButton'
 import { PreviewText } from '@/components/PreviewText'
 import { RichInput, type RichInputHandle } from '@/components/RichInput'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
@@ -304,6 +305,7 @@ function ChatHeader({
           + Pin drop off but Convene stays full-text — it's the primary
           action in this header. */}
       <div className="flex gap-1 text-ink-500 shrink-0">
+        {c.kind === 'group' && <GroupInviteButton conversationId={c.id} conversationName={c.title} />}
         <button
           onClick={onToggleSearch}
           title={t('chat.search')}

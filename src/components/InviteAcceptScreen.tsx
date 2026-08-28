@@ -27,7 +27,9 @@
  *   • not_found — bad link.
  */
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { api, type ApiInvitationPreview } from '@/api/client'
+import { api, ws, type ApiInvitationPreview } from '@/api/client'
+import { useApp } from '@/stores/app'
+import { useConversations } from '@/stores/conversations'
 import { useAuth } from '@/stores/auth'
 import { isElectron, isWebAppHost } from '@/lib/runtime'
 import { useT } from '@/lib/i18n'
@@ -164,6 +166,13 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           setActive(r.company.id)
         }
       }
+      // setMe preserves a previous workspace selection, so explicitly choose
+      // the invitation's workspace before loading/selecting the target group.
+      setActive(r.company.id)
+      ws.reconnect()
+      useApp.getState().setView('conversations')
+      useApp.getState().selectConversation(r.conversation?.id ?? null)
+      await useConversations.getState().reload()
       clearPendingInvite()
       // Always land in the workspace. Self-hosted has no native app;
       // parking on "Open in Cumora app" lets people refresh into a
@@ -182,6 +191,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
   useEffect(() => {
     if (!tokenStr) return
     if (preview?.status !== 'valid') return
+    if (preview.invitation?.conversation) return // group join is an explicit click
     if (busy) return
     if (joinedCompany) return  // already redeemed — don't re-POST in a loop
     if (acceptErr) return      // failed accept — show the error, don't fall into AuthedApp
@@ -197,12 +207,14 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
     const id = preview.invitation?.company.id
     if (!id) return
     setActive(id)
+    useApp.getState().setView('conversations')
+    useApp.getState().selectConversation(preview.invitation?.conversation?.id ?? null)
     clearPendingInvite()
     onDone()
   }, [tokenStr, preview, setActive, onDone])
 
   const inv = preview?.invitation
-  const companyName = inv?.company.name ?? 'Cumora'
+  const companyName = inv?.conversation?.title ?? inv?.company.name ?? 'Cumora'
   const inviter = inv?.inviterName ?? 'Someone'
   const signedIn = !!tokenStr && !!tokenUserId
 
@@ -308,6 +320,9 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
               <h1 className="font-display text-[24px] tracking-tight text-ink-900">
                 {companyName}
               </h1>
+              {inv.conversation && <p className="text-xs text-ink-500 mt-2">
+                {t('inviteAccept.groupContext', { company: inv.company.name })}
+              </p>}
               {inv.note && (
                 <div className="text-[12.5px] text-ink-500 font-display italic mt-2 px-3 py-2 rounded-[10px]"
                      style={{ background: 'var(--cloud)' }}>
@@ -328,7 +343,9 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
                     background: 'var(--skype)',
                     boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
                   }}
-                >{busy ? t('inviteAccept.joinBusy') : t('inviteAccept.joinAs', { company: companyName, role: inv.role })}</button>
+                >{busy ? t('inviteAccept.joinBusy') : inv.conversation
+                  ? t('inviteAccept.joinGroup', { name: companyName })
+                  : t('inviteAccept.joinAs', { company: companyName, role: inv.role })}</button>
                 <button
                   onClick={() => { clearPendingInvite(); onDone() }}
                   className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic"

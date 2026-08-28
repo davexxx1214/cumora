@@ -2,7 +2,7 @@ import type React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso } from 'react-virtuoso'
 import { useApp } from '@/stores/app'
-import { useAuth, useMe } from '@/stores/auth'
+import { useAuth, useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
 import { useMessages } from '@/stores/messages'
 import { useParticipants } from '@/stores/participants'
@@ -11,6 +11,7 @@ import { PreviewText } from '@/components/PreviewText'
 import { HiveAvatar } from '@/components/HiveAvatar'
 import { ContextMenu, type ContextMenuItem } from '@/components/ContextMenu'
 import { GroupCreator } from '@/components/GroupCreator'
+import { DissolveGroupDialog } from '@/components/DissolveGroupDialog'
 import { ResizeHandle } from '@/components/ResizeHandle'
 import { ISearch, IMail, IPlus } from '@/components/icons'
 import { cn } from '@/lib/utils'
@@ -710,6 +711,8 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
   const [addingMembersTo, setAddingMembersTo] = useState<Conversation | null>(null)
   const [menu, setMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
   const [confirmLeave, setConfirmLeave] = useState<Conversation | null>(null)
+  const [confirmDissolve, setConfirmDissolve] = useState<Conversation | null>(null)
+  const canManage = useCanManageWorkspace()
   const meId = useAuth((s) => s.user?.id ?? null)
 
   const otherMember = (c: Conversation): string | null => {
@@ -779,6 +782,12 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
         destructive: true,
         icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>,
         onSelect: () => setConfirmLeave(c),
+      })
+      if (canManage) items.push({
+        label: t('convo.dissolveGroup'),
+        destructive: true,
+        icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6" /></svg>,
+        onSelect: () => setConfirmDissolve(c),
       })
     } else if (c.kind === 'direct') {
       // Direct chats: actions for the *other* participant.
@@ -1105,6 +1114,9 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
             setConfirmLeave(null)
           }}
         />
+      )}
+      {canManage && confirmDissolve && (
+        <DissolveGroupDialog conversation={confirmDissolve} onClose={() => setConfirmDissolve(null)} />
       )}
       {onResizeStart && <ResizeHandle onMouseDown={onResizeStart} />}
     </aside>

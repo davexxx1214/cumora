@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect } from 'react'
 import { useApp } from '@/stores/app'
+import { useAuth } from '@/stores/auth'
 import { useDevtools } from '@/stores/devtools'
 import { isElectron } from '@/lib/runtime'
 import { useResizableWidth } from '@/lib/useResizableWidth'
@@ -68,14 +69,16 @@ export function DesktopApp() {
   const devtoolsEnabled = useDevtools((s) => s.enabled)
   const devtoolsLoaded = useDevtools((s) => s.loaded)
   const loadDevtools = useDevtools((s) => s.load)
+  const role = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.role)
+  const canObserve = role === 'owner' || role === 'admin'
 
   useEffect(() => {
     void loadDevtools()
   }, [loadDevtools])
 
   useEffect(() => {
-    if (view === 'observability' && devtoolsLoaded && !devtoolsEnabled) setView('conversations')
-  }, [devtoolsEnabled, devtoolsLoaded, setView, view])
+    if (view === 'observability' && (!canObserve || (devtoolsLoaded && !devtoolsEnabled))) setView('conversations')
+  }, [canObserve, devtoolsEnabled, devtoolsLoaded, setView, view])
 
   // In Electron, fill the full window. In browser, render as a "windowed app" card.
   const wrap = isElectron
@@ -108,7 +111,7 @@ export function DesktopApp() {
         {view === 'calendar' && <CalendarView />}
         {view === 'documents' && <DocumentsView />}
         {view === 'shipping' && <Suspense fallback={<div className="h-full grid place-items-center text-sm text-ink-400">{t('desktop.openingShip')}</div>}><ShippingView /></Suspense>}
-        {view === 'observability' && devtoolsEnabled && <ObservabilityView />}
+        {view === 'observability' && canObserve && devtoolsEnabled && <ObservabilityView />}
         {view === 'me' && <MeView />}
       </div>
       {/* Email composer drawer — globally rendered so opening it works

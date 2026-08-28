@@ -1,5 +1,5 @@
 /**
- * Modal for inviting humans to a company workspace.
+ * Modal for inviting humans to a specific group in a workspace.
  *
  * Two flows surfaced from the same modal:
  *   1. **Shareable link** — mint a long-lived multi-use invite the owner
@@ -23,12 +23,13 @@ import { useT } from '@/lib/i18n'
 interface Props {
   companyId: string
   companyName: string
+  conversation: { id: string; title: string }
   onClose: () => void
 }
 
 type Tab = 'link' | 'email'
 
-export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
+export function InvitePeopleModal({ companyId, companyName, conversation, onClose }: Props) {
   const t = useT()
   const [tab, setTab] = useState<Tab>('link')
   const [list, setList] = useState<ApiInvitation[]>([])
@@ -54,14 +55,14 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
   const reload = useCallback(async () => {
     setLoadingList(true); setListErr(null)
     try {
-      const rows = await api.listInvitations(companyId)
+      const rows = await api.listInvitations(companyId, conversation.id)
       setList(rows)
     } catch (e) {
       setListErr(e instanceof Error ? e.message : String(e))
     } finally {
       setLoadingList(false)
     }
-  }, [companyId])
+  }, [companyId, conversation.id])
 
   useEffect(() => { void reload() }, [reload])
   useEffect(() => {
@@ -82,7 +83,7 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
       const payload = tab === 'email'
         ? { email: email.trim(), role, note: note.trim() || null, sendEmail: emailCapable && sendEmail }
         : { multiUse: true, role, note: note.trim() || null }
-      const inv = await api.createInvitation(companyId, payload)
+      const inv = await api.createInvitation(companyId, { ...payload, conversationId: conversation.id })
       setCreated(inv)
       setEmail(''); setNote('')
       void reload()
@@ -118,10 +119,10 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
       >
         <div className="px-6 py-5 border-b border-ink-100 shrink-0">
           <h2 className="font-display font-medium text-[20px] tracking-tight">
-            {t('invite.title', { name: companyName })}
+            {t('invite.title', { name: conversation.title })}
           </h2>
           <div className="text-[12.5px] text-ink-500 italic font-display mt-0.5">
-            {t('invite.intro')}
+            {t('invite.groupIntro', { name: conversation.title, company: companyName })}
           </div>
         </div>
 

@@ -9,11 +9,12 @@
  */
 import type React from 'react'
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api } from '@/api/client'
 import { useApp } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
 import { useT } from '@/lib/i18n'
-import { InvitePeopleModal } from './InvitePeopleModal'
+import { WorkspaceMembersModal } from './WorkspaceMembersModal'
 
 export function CompanySwitcher() {
   const t = useT()
@@ -27,7 +28,7 @@ export function CompanySwitcher() {
   const [newName, setNewName] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
-  const [inviteOpen, setInviteOpen] = useState(false)
+  const [membersOpen, setMembersOpen] = useState(false)
   const popRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -121,14 +122,14 @@ export function CompanySwitcher() {
 
           {active && (active.role === 'owner' || active.role === 'admin') && (
             <button
-              onClick={() => { setInviteOpen(true); setOpen(false) }}
+              onClick={() => { setMembersOpen(true); setOpen(false) }}
               className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
             >
               <span
                 className="w-5 h-5 rounded grid place-items-center shrink-0 text-[11px]"
                 style={{ background: 'var(--sky-50)', color: 'var(--skype)' }}
               >+</span>
-              <span className="flex-1">{t('company.invitePeoplePrefix')}<b className="font-semibold">{active.name}</b></span>
+              <span className="flex-1">{t('workspaceMembers.manage')}</span>
             </button>
           )}
 
@@ -168,12 +169,12 @@ export function CompanySwitcher() {
           )}
         </div>
       )}
-      {inviteOpen && active && (
-        <InvitePeopleModal
+      {membersOpen && active && createPortal(
+        <WorkspaceMembersModal
           companyId={active.id}
           companyName={active.name}
-          onClose={() => setInviteOpen(false)}
-        />
+          onClose={() => setMembersOpen(false)}
+        />, document.body,
       )}
     </div>
   )

@@ -1,7 +1,7 @@
 import { useApp } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
-import { IChat, IWhisper, IDoc, IAgent, IAgents, IShip } from '@/components/icons'
+import { IChat, IWhisper, IDoc, IAgent, IAgents } from '@/components/icons'
 import { Pressable } from './Pressable'
 import { useT, type MessageKey } from '@/lib/i18n'
 import type { ViewKey } from '@/types'
@@ -10,7 +10,6 @@ import type { ViewKey } from '@/types'
 const tabs: Array<{ key: ViewKey['view']; Icon: typeof IChat; label: MessageKey }> = [
   { key: 'conversations', Icon: IChat, label: 'nav.chats' },
   { key: 'whispers', Icon: IWhisper, label: 'nav.whispers' },
-  { key: 'shipping', Icon: IShip, label: 'nav.ship' },
   { key: 'library', Icon: IDoc, label: 'nav.library' },
   { key: 'agents', Icon: IAgent, label: 'nav.agents' },
   { key: 'me', Icon: IAgents, label: 'nav.me' },

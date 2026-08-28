@@ -31,6 +31,7 @@ export const CH_MESSAGE_NEW = 'cumora:msg.new'
 export const CH_MESSAGE_DELTA = 'cumora:msg.delta'
 export const CH_TYPING = 'cumora:typing'
 export const CH_STATUS = 'cumora:status'
+export const CH_WORKSPACE_MEMBERS = 'cumora:workspace.members'
 export const CH_REACTIONS = 'cumora:reactions'
 export const CH_POLLS = 'cumora:polls'
 export const CH_GROUP_PULLED = 'cumora:group.pulled'
@@ -236,6 +237,13 @@ export interface ConversationUpdatedEvent extends TenantTagged {
   patch: { topic?: string | null; title?: string }
 }
 
+export interface ConversationDissolvedEvent extends TenantTagged {
+  type: 'conversation.dissolved'
+  conversationId: string
+  /** Server-only audience snapshot: membership no longer exists after deletion. */
+  recipientUserIds: string[]
+}
+
 export interface GroupPulledEvent extends TenantTagged {
   type: 'group.pulled'
   conversationId: string
@@ -398,9 +406,14 @@ export interface PollUpdatedEvent extends TenantTagged {
   actorId: string | null
 }
 
-export type BroadcastEvent = MessageNewEvent | MessageDeltaEvent | TypingEvent
+export interface WorkspaceMemberRemovedEvent extends TenantTagged {
+  type: 'workspace.member_removed'
+  userId: string
+}
+
+export type BroadcastEvent = WorkspaceMemberRemovedEvent | MessageNewEvent | MessageDeltaEvent | TypingEvent
   | StatusEvent | AvatarEvent | ParticipantAddedEvent | ReactionsEvent
-  | GroupPulledEvent | ConversationUpdatedEvent | ConveneEvent
+  | GroupPulledEvent | ConversationUpdatedEvent | ConversationDissolvedEvent | ConveneEvent
   | BoardEvent | DocIndexEvent | DocUpdateEvent | DocAwarenessEvent | DocMentionEvent | CalendarReminderEvent
   | CalendarEventChangedEvent
   | PollUpdatedEvent

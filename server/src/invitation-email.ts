@@ -39,6 +39,7 @@ export interface InvitationEmailArgs {
   /** Inviter's own email for Reply-To. */
   inviterEmail: string
   companyName: string
+  conversationName?: string
   role: 'member' | 'admin'
   /** Optional free-text note the inviter attached. */
   note: string | null
@@ -62,6 +63,7 @@ function escapeHtml(s: string): string {
 function buildInvitationEmailHtml(args: {
   inviterName: string
   companyName: string
+  conversationName?: string
   role: 'member' | 'admin'
   note: string | null
   inviteUrl: string
@@ -70,7 +72,10 @@ function buildInvitationEmailHtml(args: {
   const logoUrl = cdn ? `${cdn}/email/logo.png` : null
   const fontStack = `'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif`
   const inviter = escapeHtml(args.inviterName)
-  const company = escapeHtml(args.companyName)
+  const company = escapeHtml(args.conversationName ?? args.companyName)
+  const context = args.conversationName
+    ? `You will join this group in ${escapeHtml(args.companyName)}. You can see the colleague directory, but not other groups you have not joined. You will not automatically join Everyone.`
+    : 'You will join the workspace and can see its colleague directory.'
   const roleLabel = args.role === 'admin' ? 'an admin' : 'a member'
   const noteBlock = args.note ? `
                 <tr>
@@ -126,7 +131,7 @@ function buildInvitationEmailHtml(args: {
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                 <tr>
                   <td style="font-family:${fontStack}; font-size:13px; font-weight:600; letter-spacing:0.04em; text-transform:uppercase; color:#5B7186; padding:0 0 8px;">
-                    Workspace invitation
+                    ${args.conversationName ? 'Group invitation' : 'Workspace invitation'}
                   </td>
                 </tr>
                 <tr>
@@ -136,7 +141,7 @@ function buildInvitationEmailHtml(args: {
                 </tr>
                 <tr>
                   <td style="font-family:${fontStack}; font-size:15px; font-weight:400; line-height:1.6; color:#233A53; padding:0 0 24px;">
-                    You&rsquo;ll join as ${roleLabel}. Cumora is a desktop chat where humans and AI teammates share the same rooms &mdash; once you accept, you&rsquo;ll see your new workspace and the agents that live there.
+                    You&rsquo;ll join as ${roleLabel}. ${context}
                   </td>
                 </tr>${noteBlock}
                 <tr>
@@ -145,7 +150,7 @@ function buildInvitationEmailHtml(args: {
                       <tr>
                         <td bgcolor="#00A8F0" style="border-radius:8px; background:#00A8F0; mso-padding-alt:14px 28px;">
                           <a href="${args.inviteUrl}" target="_blank" style="display:inline-block; padding:14px 28px; font-family:${fontStack}; font-size:14px; font-weight:600; line-height:1; color:#FFFFFF; text-decoration:none; letter-spacing:0.01em;">
-                            Accept invitation &nbsp;&rarr;
+                            ${args.conversationName ? `Join ${company}` : 'Accept invitation'} &nbsp;&rarr;
                           </a>
                         </td>
                       </tr>
@@ -199,12 +204,13 @@ export async function sendInvitationEmail(args: InvitationEmailArgs): Promise<In
 
   const fromAddr = `invites@${env.EMAIL_DOMAIN}`
   const senderDisplay = `${args.inviterName} (via Cumora)`
-  const subject = `${args.inviterName} invited you to ${args.companyName} on Cumora`
+  const subject = `${args.inviterName} invited you to ${args.conversationName ?? args.companyName} on Cumora`
 
   const text = [
     `Hi,`,
     ``,
-    `${args.inviterName} invited you to ${args.companyName} on Cumora — you'll join as ${args.role === 'admin' ? 'an admin' : 'a member'}.`,
+    `${args.inviterName} invited you to ${args.conversationName ?? args.companyName} on Cumora — you'll join as ${args.role === 'admin' ? 'an admin' : 'a member'}.`,
+    args.conversationName ? `Workspace: ${args.companyName}. You will only join this group, not Everyone. The colleague directory is visible; other groups remain private.` : null,
     ``,
     args.note ? `Note from ${args.inviterName}: "${args.note}"` : null,
     args.note ? `` : null,
@@ -222,6 +228,7 @@ export async function sendInvitationEmail(args: InvitationEmailArgs): Promise<In
   const html = buildInvitationEmailHtml({
     inviterName: args.inviterName,
     companyName: args.companyName,
+    conversationName: args.conversationName,
     role: args.role,
     note: args.note,
     inviteUrl: args.inviteUrl,

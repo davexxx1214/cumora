@@ -3,7 +3,7 @@ import { api, ws, type ApiConversation } from '@/api/client'
 import type { Conversation } from '@/types'
 import { useApp } from '@/stores/app'
 import { commitIfContextCurrent, useAuth } from '@/stores/auth'
-import { useMessages } from '@/stores/messages'
+import { useMessages, forgetConversation } from '@/stores/messages'
 import { useParticipants } from '@/stores/participants'
 
 interface ConversationsState {
@@ -11,6 +11,18 @@ interface ConversationsState {
   loaded: boolean
   load: () => Promise<void>
   reload: () => Promise<void>
+}
+
+// A late list response must not resurrect a group deleted during the request.
+const dissolvedIds = new Set<string>()
+
+export function removeConversation(id: string): void {
+  dissolvedIds.add(id)
+  useConversations.setState((s) => ({ list: s.list.filter((c) => c.id !== id) }))
+  forgetConversation(id)
+  const app = useApp.getState()
+  app.setReplyingTo(id, null)
+  if (app.selectedConversationId === id) app.selectConversation(null)
 }
 
 function timeFromIso(iso?: string): string {
@@ -151,6 +163,11 @@ function refreshActiveMessagesIfSidebarMoved(conversations: Conversation[]): voi
   const active = useApp.getState().selectedConversationId
   if (!active) return
   const activeConvo = conversations.find((c) => c.id === active)
+  if (!activeConvo) {
+    // Also handles a dissolution missed while the socket was disconnected.
+    useApp.getState().selectConversation(null)
+    return
+  }
   const lastMessageId = activeConvo?.lastMessageId
   if (!lastMessageId) return
 
@@ -186,7 +203,7 @@ export const useConversations = create<ConversationsState>((set) => ({
     set({ list: [], loaded: false })
     try {
       await commitIfContextCurrent(() => api.getConversations(), (list) => {
-        const conversations = list.map(fromApi)
+        const conversations = list.filter((c) => !dissolvedIds.has(c.id)).map(fromApi)
         set({ list: conversations, loaded: true })
         refreshActiveMessagesIfSidebarMoved(conversations)
       })
@@ -197,7 +214,7 @@ export const useConversations = create<ConversationsState>((set) => ({
   async reload() {
     try {
       await commitIfContextCurrent(() => api.getConversations(), (list) => {
-        const conversations = list.map(fromApi)
+        const conversations = list.filter((c) => !dissolvedIds.has(c.id)).map(fromApi)
         set({ list: conversations })
         refreshActiveMessagesIfSidebarMoved(conversations)
       })
@@ -226,7 +243,11 @@ export function bootConversations() {
       void useConversations.getState().reload()
       return
     }
-    if (e.type === 'message.new' || e.type === 'group.pulled') {
+    if (e.type === 'conversation.dissolved') {
+      removeConversation(e.conversationId)
+    } else if (e.type === 'workspace.member_removed') {
+      void useConversations.getState().reload()
+    } else if (e.type === 'message.new' || e.type === 'group.pulled') {
       // If a new message arrives for the conversation the user is currently
       // viewing, treat it as already-seen — mark read on the server BEFORE we
       // reload, so the badge never blinks up to 1 just to drop back to 0.

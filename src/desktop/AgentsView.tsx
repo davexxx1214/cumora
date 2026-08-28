@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useApp } from '@/stores/app'
-import { useMe } from '@/stores/auth'
+import { useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
 import { useConversations } from '@/stores/conversations'
@@ -18,8 +18,9 @@ const STATUS_COLOR: Record<string, string> = {
   avail: 'var(--avail)', working: 'var(--working)', thinking: 'var(--thinking)', waiting: 'var(--waiting)', resting: 'var(--resting)',
 }
 
-function AgentCard({ p, onEdit, onDelete }: {
+function AgentCard({ p, canManage, onEdit, onDelete }: {
   p: Participant
+  canManage: boolean
   onEdit: (p: Participant) => void
   onDelete: (p: Participant) => void
 }) {
@@ -67,7 +68,7 @@ function AgentCard({ p, onEdit, onDelete }: {
     <div className="bg-cloud rounded-[16px] p-5 transition hover:shadow-pop relative group/card flex flex-col h-full"
       style={{ border: '1px solid var(--ink-100)' }}>
       {/* Hover actions: edit / delete */}
-      <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
+      {canManage && <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
         <button
           onClick={() => onEdit(p)}
           className="w-7 h-7 rounded-full grid place-items-center bg-cloud hover:bg-sky2-50 text-ink-500 hover:text-skype-deep transition"
@@ -86,7 +87,7 @@ function AgentCard({ p, onEdit, onDelete }: {
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
         </button>
-      </div>
+      </div>}
 
       <div className="flex items-start gap-3.5 mb-3">
         <Avatar p={p} size={56} statusOverride={displayStatus} />
@@ -229,7 +230,7 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
   )
 }
 
-function FormerAgentCard({ p, onRehire }: { p: Participant; onRehire: (p: Participant) => void }) {
+function FormerAgentCard({ p, canManage, onRehire }: { p: Participant; canManage: boolean; onRehire: (p: Participant) => void }) {
   const t = useT()
   const departed = p.departedAt
     ? t('agents.offboardedAt', { date: new Date(p.departedAt).toLocaleDateString() })
@@ -244,7 +245,7 @@ function FormerAgentCard({ p, onRehire }: { p: Participant; onRehire: (p: Partic
         <div className="font-bold text-[14px] text-ink-700 truncate">{p.name}</div>
         <div className="text-[11px] text-ink-500 italic font-display">{p.role} · {departed}</div>
       </div>
-      <button
+      {canManage && <button
         onClick={() => onRehire(p)}
         className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition inline-flex items-center gap-1"
         style={{ border: '1px solid var(--sky2-200)' }}
@@ -252,7 +253,7 @@ function FormerAgentCard({ p, onRehire }: { p: Participant; onRehire: (p: Partic
       >
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>
         {t('agents.rehire')}
-      </button>
+      </button>}
     </div>
   )
 }
@@ -261,6 +262,7 @@ export function AgentsView() {
   const t = useT()
   const byId = useParticipants((s) => s.byId)
   const meId = useMe()
+  const canManage = useCanManageWorkspace()
   const allAgents = Object.values(byId).filter((p) => p.kind === 'agent')
   const list = allAgents.filter((p) => !p.departedAt)
   const departed = allAgents.filter((p) => p.departedAt).sort((a, b) => (b.departedAt ?? '').localeCompare(a.departedAt ?? ''))
@@ -270,9 +272,10 @@ export function AgentsView() {
   const [editing, setEditing] = useState<Participant | null>(null)
   const [confirmingOffboard, setConfirmingOffboard] = useState<Participant | null>(null)
 
-  const openCreate = () => { setEditing(null); setEditorOpen(true) }
-  const openEdit = (p: Participant) => { setEditing(p); setEditorOpen(true) }
+  const openCreate = () => { if (canManage) { setEditing(null); setEditorOpen(true) } }
+  const openEdit = (p: Participant) => { if (canManage) { setEditing(p); setEditorOpen(true) } }
   const rehire = async (p: Participant) => {
+    if (!canManage) return
     try {
       await api.rehireAgent(p.id)
       await useParticipants.getState().load()
@@ -295,7 +298,7 @@ export function AgentsView() {
               {t('agents.teamSubtitle')}
             </div>
           </div>
-          <button
+          {canManage && <button
             onClick={openCreate}
             className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-[10px] text-[12.5px] font-semibold text-white transition"
             style={{
@@ -305,7 +308,7 @@ export function AgentsView() {
           >
             <IPlus className="w-4 h-4" strokeWidth={2.5} />
             {t('agents.newAgent')}
-          </button>
+          </button>}
         </div>
 
         <div className="flex gap-3 mb-6 text-[11px]">
@@ -325,9 +328,9 @@ export function AgentsView() {
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {list.map((a) => (
-            <AgentCard key={a.id} p={a} onEdit={openEdit} onDelete={setConfirmingOffboard} />
+            <AgentCard key={a.id} p={a} canManage={canManage} onEdit={openEdit} onDelete={setConfirmingOffboard} />
           ))}
-          <HireCard onClick={openCreate} />
+          {canManage && <HireCard onClick={openCreate} />}
         </div>
 
         {departed.length > 0 && (
@@ -339,7 +342,7 @@ export function AgentsView() {
               {t('agents.formerSubtitle')}
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-              {departed.map((p) => <FormerAgentCard key={p.id} p={p} onRehire={rehire} />)}
+              {departed.map((p) => <FormerAgentCard key={p.id} p={p} canManage={canManage} onRehire={rehire} />)}
             </div>
           </div>
         )}
@@ -369,10 +372,10 @@ export function AgentsView() {
         )}
       </div>
 
-      {editorOpen && (
+      {canManage && editorOpen && (
         <AgentEditor agent={editing} onClose={() => { setEditorOpen(false); setEditing(null) }} />
       )}
-      {confirmingOffboard && (
+      {canManage && confirmingOffboard && (
         <ConfirmOffboard
           p={confirmingOffboard}
           onCancel={() => setConfirmingOffboard(null)}

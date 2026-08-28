@@ -4,6 +4,7 @@ import {
   sub,
   CH_MESSAGE_NEW, CH_MESSAGE_DELTA, CH_TYPING,
   CH_STATUS, CH_REACTIONS, CH_POLLS,
+  CH_WORKSPACE_MEMBERS,
   CH_GROUP_PULLED, CH_CONVO_UPDATED, CH_CONVENE,
   CH_BOARDS, CH_DOCS, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, CH_DOC_MENTION,
   publish,
@@ -13,6 +14,7 @@ import type { MessageNewEvent } from './redis.js'
 import { env } from './env.js'
 import { consumeWsTicket } from './auth.js'
 import { pool } from './db/pool.js'
+import { broadcastRecipients } from './ws-audience.js'
 import { setStatus } from './status.js'
 import {
   subscribe as docSubscribe,
@@ -584,6 +586,7 @@ export function attachWebSocket(httpServer: Server) {
   // be filtered by doc-subscription, not just company.
   sub.subscribe(
     CH_MESSAGE_NEW, CH_MESSAGE_DELTA, CH_TYPING,
+    CH_WORKSPACE_MEMBERS,
     CH_STATUS, CH_REACTIONS, CH_POLLS,
     CH_GROUP_PULLED, CH_CONVO_UPDATED, CH_CONVENE,
     CH_BOARDS, CH_DOCS, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, CH_DOC_MENTION,
@@ -591,15 +594,18 @@ export function attachWebSocket(httpServer: Server) {
     console.log(`[ws] subscribed to ${count} redis channels`)
   })
 
-  sub.on('message', (channel, payload) => {
+  const forward = async (channel: string, payload: string) => {
+    if (clients.size === 0) return
     // Doc channels are room-scoped, not company-scoped — skip them here.
     if (channel === 'cumora:doc.update' || channel === 'cumora:doc.awareness') return
     // Tenant-aware fan-out: only deliver an event to a socket if the event's
     // companyId is in the socket's set of memberships. Untagged events are
     // dropped (no leakage), since every publisher is expected to tag.
     let companyId: string | undefined
+    let event: { type?: string; companyId?: string; conversationId?: string; userId?: string; recipientUserIds?: string[] }
     try {
-      const parsed = JSON.parse(payload) as { companyId?: string }
+      const parsed = JSON.parse(payload) as typeof event
+      event = parsed
       if (typeof parsed.companyId === 'string') companyId = parsed.companyId
     } catch { /* malformed — drop */ return }
 
@@ -611,8 +617,29 @@ export function attachWebSocket(httpServer: Server) {
       return
     }
 
+    if (event.type === 'workspace.member_removed' && typeof event.userId === 'string') {
+      for (const c of clients) {
+        if (c.userId !== event.userId) continue
+        c.companies.delete(companyId)
+        for (const [docId, subscription] of c.docSubs) docUnsubscribe(docId, subscription)
+        c.docSubs.clear()
+        sendJson(c.ws, event)
+        c.ws.close(4403, 'workspace membership removed')
+      }
+    }
+    const dissolved = event.type === 'conversation.dissolved'
+    const recipients = await broadcastRecipients(companyId,
+      !dissolved && typeof event.conversationId === 'string' ? event.conversationId : undefined)
+    if (dissolved) {
+      // Intersect the pre-deletion group audience with CURRENT workspace
+      // membership. Never send a private group id to unrelated colleagues.
+      const formerMembers = new Set(event.recipientUserIds ?? [])
+      for (const id of recipients) if (!formerMembers.has(id)) recipients.delete(id)
+      payload = JSON.stringify({ type: event.type, companyId, conversationId: event.conversationId })
+    }
     for (const c of clients) {
       if (!c.companies.has(companyId)) continue
+      if (!recipients.has(c.userId)) continue
       if (c.ws.readyState !== c.ws.OPEN) continue
       // Backpressure guard (OOM fix): `ws.send()` buffers unsent frames in
       // process memory when a socket can't drain (slow/stuck client). Under a
@@ -629,7 +656,16 @@ export function attachWebSocket(httpServer: Server) {
       if (buffered > WS_MAX_BUFFERED_BYTES) continue // skip frame; let it drain
       try { c.ws.send(payload) } catch { /* ignore */ }
     }
-  })
+  }
+  // Keep streaming deltas ordered while resolving their current audience.
+  let forwarding = Promise.resolve()
+  const onBroadcast = (channel: string, payload: string) => {
+    forwarding = forwarding.then(() => forward(channel, payload)).catch((e) => {
+      console.warn('[ws] broadcast failed', e)
+    })
+  }
+  sub.on('message', onBroadcast)
+  wss.once('close', () => sub.off('message', onBroadcast))
 
   // Heartbeat sweeper. Real-deal human presence used to drift because TCP
   // can keep a half-open socket "alive" for many minutes after the

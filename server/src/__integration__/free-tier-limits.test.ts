@@ -1,7 +1,7 @@
 /**
- * Integration tests for free-tier structural limits.
+ * Integration tests for tier structural limits and self-hosted seat overrides.
  */
-import { test, before, beforeEach, after } from 'node:test'
+import { test, before, beforeEach, after, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
@@ -9,8 +9,10 @@ import {
   buildApiTestApp, ensureSchemaOnce, resetAllTables, teardownAll,
 } from './_helpers.js'
 import { pool } from '../db/pool.js'
+import { env } from '../env.js'
 
 const FREE_USER_ID = 'u-free-limit'
+const initialHumanLimit = env.WORKSPACE_HUMAN_LIMIT
 let server: Server
 let baseUrl = ''
 
@@ -27,7 +29,12 @@ before(async () => {
 })
 
 beforeEach(async () => {
+  env.WORKSPACE_HUMAN_LIMIT = undefined
   await resetAllTables()
+})
+
+afterEach(() => {
+  env.WORKSPACE_HUMAN_LIMIT = initialHumanLimit
 })
 
 after(async () => {
@@ -162,4 +169,90 @@ test('[integration] free workspaces cannot accept a sixth human member', async (
 
   assert.equal(res.status, 403)
   assert.match(body.error ?? '', /at most 5 human members/)
+})
+
+for (const tier of ['free', 'pro', 'max'] as const) {
+  test(`[integration] ${tier} workspace links use the configured 50-person limit`, async () => {
+    env.WORKSPACE_HUMAN_LIMIT = 50
+    const companyId = 'co-link-limit'
+    await seedCompanyWithOwner(companyId, FREE_USER_ID, tier)
+    for (let i = 1; i < 4; i++) {
+      await seedHumanMember(companyId, `u-link-${i}`)
+    }
+
+    const res = await fetch(`${baseUrl}/api/companies/${companyId}/invitations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ multiUse: true }),
+    })
+    const body = await res.json() as { maxUses: number }
+
+    assert.equal(res.status, 201)
+    assert.equal(body.maxUses, 46)
+  })
+}
+
+test('[integration] a configured workspace accepts its 50th human member', async () => {
+  env.WORKSPACE_HUMAN_LIMIT = 50
+  await seedUser(FREE_USER_ID)
+  const companyId = 'co-50th-member'
+  await seedCompanyWithOwner(companyId, 'u-human-owner')
+  for (let i = 1; i < 49; i++) {
+    await seedHumanMember(companyId, `u-human-${i}`)
+  }
+  const token = await seedInvitation(companyId, 'u-human-owner')
+
+  const res = await fetch(`${baseUrl}/api/invitations/${encodeURIComponent(token)}/accept`, {
+    method: 'POST',
+  })
+  const body = await res.json() as { ok?: boolean }
+
+  assert.equal(res.status, 200)
+  assert.equal(body.ok, true)
+  const { rows } = await pool.query<{ count: number }>(
+    'SELECT COUNT(*)::int AS count FROM company_members WHERE company_id = $1', [companyId],
+  )
+  assert.equal(rows[0].count, 50)
+})
+
+test('[integration] a configured workspace rejects a 51st human member', async () => {
+  env.WORKSPACE_HUMAN_LIMIT = 50
+  await seedUser(FREE_USER_ID)
+  const companyId = 'co-51st-member'
+  await seedCompanyWithOwner(companyId, 'u-human-owner')
+  for (let i = 1; i < 50; i++) {
+    await seedHumanMember(companyId, `u-human-${i}`)
+  }
+  const token = await seedInvitation(companyId, 'u-human-owner')
+
+  const res = await fetch(`${baseUrl}/api/invitations/${encodeURIComponent(token)}/accept`, {
+    method: 'POST',
+  })
+  const body = await res.json() as { error?: string }
+
+  assert.equal(res.status, 403)
+  assert.match(body.error ?? '', /at most 50 human members/)
+  const { rows } = await pool.query<{ count: number }>(
+    'SELECT COUNT(*)::int AS count FROM company_members WHERE company_id = $1', [companyId],
+  )
+  assert.equal(rows[0].count, 50)
+})
+
+test('[integration] a configured workspace cannot create invitations when all 50 seats are used', async () => {
+  env.WORKSPACE_HUMAN_LIMIT = 50
+  const companyId = 'co-full-workspace'
+  await seedCompanyWithOwner(companyId, FREE_USER_ID)
+  for (let i = 1; i < 50; i++) {
+    await seedHumanMember(companyId, `u-human-${i}`)
+  }
+
+  const res = await fetch(`${baseUrl}/api/companies/${companyId}/invitations`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ multiUse: true }),
+  })
+  const body = await res.json() as { error?: string }
+
+  assert.equal(res.status, 403)
+  assert.match(body.error ?? '', /at most 50 human members/)
 })

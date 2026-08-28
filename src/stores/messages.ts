@@ -5,6 +5,29 @@ import { useApp } from '@/stores/app'
 import { getMeId } from '@/stores/auth'
 
 const EMPTY_MESSAGES: Message[] = []
+const dissolvedConversationIds = new Set<string>()
+
+/** Evict the whole room, including streaming bodies and pending reply state. */
+export function forgetConversation(id: string): void {
+  dissolvedConversationIds.add(id)
+  for (const [key, timer] of typingExpiryTimers) {
+    if (!key.startsWith(`${id}:`)) continue
+    window.clearTimeout(timer)
+    typingExpiryTimers.delete(key)
+  }
+  const omit = <T,>(rows: Record<string, T>): Record<string, T> => {
+    const { [id]: _removed, ...rest } = rows
+    return rest
+  }
+  useMessages.setState((s) => ({
+    byConvo: omit(s.byConvo), typing: omit(s.typing), errors: omit(s.errors),
+    hasMoreOlder: omit(s.hasMoreOlder), firstItemIndex: omit(s.firstItemIndex),
+    loaded: new Set([...s.loaded].filter((key) => key !== id)),
+    loading: new Set([...s.loading].filter((key) => key !== id)),
+    loadingOlder: new Set([...s.loadingOlder].filter((key) => key !== id)),
+    streaming: Object.fromEntries(Object.entries(s.streaming).filter(([, value]) => value.conversationId !== id)),
+  }))
+}
 
 /** Default page size for both initial load and "load older". Matches the
  *  server's default cap; keep these in sync. */
@@ -339,6 +362,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
   errors: {},
 
   async loadConversation(id) {
+    if (dissolvedConversationIds.has(id)) return
     const s = get()
     if (s.loaded.has(id) || s.loading.has(id)) return
     set((s) => {
@@ -347,6 +371,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
     })
     try {
       const msgs = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+      if (dissolvedConversationIds.has(id)) return
       const normalized = msgs.map(fromApi)
       // Fewer rows than the page cap → we've already got everything older.
       // Equal-to-cap is ambiguous (could be exactly N or N+more) so default
@@ -383,10 +408,12 @@ export const useMessages = create<MessagesState>((set, get) => ({
   },
 
   async reloadConversation(id) {
+    if (dissolvedConversationIds.has(id)) return
     try {
       // Reload pulls the same window the initial load did — last N. Older
       // history that was already paged in stays in byConvo via the merge.
       const msgs = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+      if (dissolvedConversationIds.has(id)) return
       const normalized = msgs.map(fromApi)
       const hasMore = normalized.length >= MESSAGES_PAGE_SIZE
       set((s) => ({
@@ -405,6 +432,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
   },
 
   async loadOlder(id) {
+    if (dissolvedConversationIds.has(id)) return
     const s = get()
     // Guard: nothing loaded yet, no more pages known, or another loadOlder
     // is already mid-flight (virtuoso start-reached fires more than once
@@ -430,6 +458,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
     set((s) => ({ loadingOlder: new Set(s.loadingOlder).add(id) }))
     try {
       const msgs = await api.getMessages(id, { before: oldest, limit: MESSAGES_PAGE_SIZE })
+      if (dissolvedConversationIds.has(id)) return
       const normalized = msgs.map(fromApi)
       const hasMore = normalized.length >= MESSAGES_PAGE_SIZE
       set((s) => {
@@ -471,6 +500,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
   },
 
   applyEvent(e) {
+    if ('conversationId' in e && e.conversationId && dissolvedConversationIds.has(e.conversationId)) return
     if (e.type === 'message.new') {
       const m = fromApi(e.message)
       clearTypingExpiry(e.conversationId, m.authorId)
@@ -699,6 +729,7 @@ export async function sendUserMessage(
 
   try {
     const { id: realId } = await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, clientId)
+    if (dissolvedConversationIds.has(convoId)) return
     // Reconcile the temp bubble with the server. Either the WS `message.new`
     // already raced ahead of us (real id already in the list → drop the temp)
     // or it hasn't (rename temp → real id so the eventual WS event dedupes
@@ -718,6 +749,7 @@ export async function sendUserMessage(
     })
   } catch (err) {
     console.warn('[messages] send failed', err)
+    if (dissolvedConversationIds.has(convoId)) return
     const failed = isDefinitiveSendFailure(err)
     useMessages.setState((s) => {
       const list = s.byConvo[convoId] ?? []

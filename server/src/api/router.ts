@@ -1,7 +1,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express'
 import { storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey, storageKeyFromPublicUrl } from '../storage.js'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, publish } from '../redis.js'
+import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_WORKSPACE_MEMBERS, CH_STATUS, publish } from '../redis.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
@@ -14,7 +14,7 @@ import {
   audit, createWsTicket, gravatarUrlForEmail,
   createSession, attemptPasswordLogin, attemptPasswordSignup,
 } from '../auth.js'
-import { joinAllHands, onboardStarterAgents, seedMemberDms } from '../onboardCompany.js'
+import { joinAllHands, onboardStarterAgents } from '../onboardCompany.js'
 import {
   type Provider, providerEnabled, createState, consumeState,
   authorizeUrl, handleCallback, errorUrl, returnUrlAllowed,
@@ -197,7 +197,7 @@ async function companyHumanSeatInfo(companyId: string, db: Queryable = pool): Pr
       WHERE company_id = $1`,
     [companyId],
   )
-  return { tier, used: rows[0]?.used ?? 0, limit: TIER_LIMITS[tier].humansPerCompany }
+  return { tier, used: rows[0]?.used ?? 0, limit: env.WORKSPACE_HUMAN_LIMIT ?? TIER_LIMITS[tier].humansPerCompany }
 }
 
 async function assertCompanyHumanLimit(companyId: string, db: Queryable = pool): Promise<void> {
@@ -348,8 +348,9 @@ async function getDevtoolsState(req: Request & AuthedRequest): Promise<{
   const localDev = env.NODE_ENV !== 'production'
   const requested = requestedDevMode(req)
   const privileged = DEVTOOLS_ROLES.has(role)
-  const canEnable = localDev || privileged
-  const enabled = localDev || (requested && privileged)
+  // Development mode changes the default, never the workspace permission.
+  const canEnable = privileged
+  const enabled = privileged && (localDev || requested)
   return { userId, companyId, role, localDev, requested, canEnable, enabled }
 }
 
@@ -1317,6 +1318,70 @@ api.post('/agents/:id/runtime-token', safe(async (req, res) => {
   res.json(minted)
 }))
 
+/* ============== Workspace members ============== */
+
+api.get('/companies/:id/members', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  await requireCompanyAdmin(req, companyId)
+  const { rows } = await pool.query(
+    `SELECT cm.user_id AS id, u.display_name AS name, u.email, cm.role,
+            (cm.role = 'owner' OR c.owner_user_id = cm.user_id) AS "isOwner"
+       FROM company_members cm
+       JOIN users u ON u.id = cm.user_id
+       JOIN companies c ON c.id = cm.company_id
+      WHERE cm.company_id = $1
+      ORDER BY cm.joined_at, cm.user_id`, [companyId],
+  )
+  res.json(rows)
+}))
+
+api.delete('/companies/:id/members/:memberId', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  const memberId = String(req.params.memberId)
+  const me = requireAuth(req)
+  if (memberId === me) throw new HttpError(400, 'cannot remove yourself')
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Serialize removal with invite acceptance and other removals.
+    const { rows: companies } = await client.query<{ owner_user_id: string | null }>(
+      'SELECT owner_user_id FROM companies WHERE id = $1 FOR UPDATE', [companyId],
+    )
+    await requireCompanyAdmin(req, companyId, client)
+    const { rows: members } = await client.query<{ role: string }>(
+      'SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2', [companyId, memberId],
+    )
+    if (!members[0]) throw new HttpError(404, 'workspace member not found')
+    if (members[0].role === 'owner' || companies[0]?.owner_user_id === memberId) {
+      throw new HttpError(403, 'cannot remove the workspace owner')
+    }
+    await client.query('DELETE FROM company_members WHERE company_id = $1 AND user_id = $2', [companyId, memberId])
+    await client.query(
+      `UPDATE conversations SET members = members - $2::text, updated_at = NOW()
+        WHERE company_id = $1 AND members @> to_jsonb(ARRAY[$2::text])`, [companyId, memberId],
+    )
+    // Keep authors and messages for history; hide the departed colleague from
+    // active pickers and reactivate this row if they accept a fresh invite.
+    await client.query(
+      `UPDATE participants SET departed_at = NOW(), status = 'resting', status_updated_at = NOW()
+        WHERE company_id = $1 AND id = $2 AND kind = 'human'`, [companyId, memberId],
+    )
+    await client.query(
+      `UPDATE company_invitations SET revoked_at = COALESCE(revoked_at, NOW())
+        WHERE company_id = $1 AND invited_by = $2`, [companyId, memberId],
+    )
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+  await publish(CH_WORKSPACE_MEMBERS, { type: 'workspace.member_removed', companyId, userId: memberId })
+  await audit({ kind: 'workspace_member_remove', userId: me, companyId, detail: { memberId } })
+  res.json({ ok: true })
+}))
+
 /* ============== Company invitations ============== */
 
 const INVITE_TTL_MS = 1000 * 60 * 60 * 24 * 7    // 7 days
@@ -1335,6 +1400,7 @@ function generateInviteToken(): string {
 interface InvitationRow {
   token_hash: string
   company_id: string
+  conversation_id: string | null
   invited_by: string
   email: string | null
   role: string
@@ -1358,6 +1424,7 @@ interface InvitationPreview {
     createdAt: string
     inviterName: string | null
     company: { id: string; name: string; slug: string }
+    conversation: { id: string; title: string } | null
     multiUse: boolean
   }
 }
@@ -1373,15 +1440,16 @@ async function loadInvitation(args: {
 }): Promise<InvitationPreview> {
   const hash = hashInviteToken(args.token)
   const { rows } = await pool.query<InvitationRow & {
-    company_name: string; company_slug: string; inviter_name: string | null
+    company_name: string; company_slug: string; inviter_name: string | null; conversation_title: string | null
   }>(
-    `SELECT i.token_hash, i.company_id, i.invited_by, i.email, i.role, i.note,
+    `SELECT i.token_hash, i.company_id, i.conversation_id, g.title AS conversation_title, i.invited_by, i.email, i.role, i.note,
             i.max_uses, i.use_count, i.created_at, i.expires_at, i.revoked_at,
             i.last_accepted_at, i.last_accepted_by,
             c.name AS company_name, c.slug AS company_slug,
             u.display_name AS inviter_name
        FROM company_invitations i
        JOIN companies c ON c.id = i.company_id
+       LEFT JOIN conversations g ON g.id = i.conversation_id AND g.company_id = i.company_id
        LEFT JOIN users u ON u.id = i.invited_by
       WHERE i.token_hash = $1`,
     [hash],
@@ -1396,28 +1464,32 @@ async function loadInvitation(args: {
     createdAt: new Date(r.created_at).toISOString(),
     inviterName: r.inviter_name,
     company: { id: r.company_id, name: r.company_name, slug: r.company_slug },
+    conversation: r.conversation_id ? { id: r.conversation_id, title: r.conversation_title ?? '' } : null,
     multiUse: r.max_uses > 1,
   }
   if (r.revoked_at) return { status: 'revoked', invitation: baseInvite }
   if (new Date(r.expires_at).getTime() < Date.now()) return { status: 'expired', invitation: baseInvite }
-  if (r.use_count >= r.max_uses) return { status: 'consumed', invitation: baseInvite }
-  if (args.viewerUserId) {
-    const { rows: mem } = await pool.query(
-      `SELECT 1 FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`,
-      [r.company_id, args.viewerUserId],
-    )
-    if (mem[0]) return { status: 'already_member', invitation: baseInvite }
-  }
   if (r.email && args.viewerEmailLower && r.email.toLowerCase() !== args.viewerEmailLower) {
     return { status: 'wrong_email', invitation: baseInvite }
   }
+  if (args.viewerUserId) {
+    const { rows: mem } = await pool.query(
+      `SELECT 1 FROM company_members cm WHERE cm.company_id = $1 AND cm.user_id = $2
+         AND ($3::text IS NULL OR EXISTS (
+           SELECT 1 FROM conversations g WHERE g.id = $3 AND g.company_id = $1
+             AND g.members @> to_jsonb(ARRAY[$2::text]))) LIMIT 1`,
+      [r.company_id, args.viewerUserId, r.conversation_id],
+    )
+    if (mem[0]) return { status: 'already_member', invitation: baseInvite }
+  }
+  if (r.use_count >= r.max_uses) return { status: 'consumed', invitation: baseInvite }
   return { status: 'valid', invitation: baseInvite }
 }
 
 /** Require that the caller is owner / admin of the company in question. */
-async function requireCompanyAdmin(req: Request & AuthedRequest, companyId: string): Promise<{ userId: string; role: string }> {
+async function requireCompanyAdmin(req: Request & AuthedRequest, companyId: string, db: Queryable = pool): Promise<{ userId: string; role: string }> {
   const me = requireAuth(req)
-  const { rows } = await pool.query<{ role: string }>(
+  const { rows } = await db.query<{ role: string }>(
     `SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`,
     [companyId, me],
   )
@@ -1448,24 +1520,30 @@ function buildInviteUrl(token: string): string {
  *  time. */
 api.get('/companies/:id/invitations', safe(async (req, res) => {
   const companyId = String(req.params.id)
-  await requireCompanyAdmin(req, companyId)
+  const { userId: me } = await requireCompanyAdmin(req, companyId)
+  const conversationId = typeof req.query.conversationId === 'string' ? req.query.conversationId : null
   const { rows } = await pool.query<{
     token_hash: string; email: string | null; role: string; note: string | null
     max_uses: number; use_count: number; created_at: string; expires_at: string
     revoked_at: string | null; last_accepted_at: string | null
     last_accepted_by: string | null; invited_by: string
     inviter_name: string | null
+    conversation_id: string | null; conversation_title: string | null
   }>(
     `SELECT i.token_hash, i.email, i.role, i.note, i.max_uses, i.use_count,
+            i.conversation_id, g.title AS conversation_title,
             i.created_at, i.expires_at, i.revoked_at,
             i.last_accepted_at, i.last_accepted_by, i.invited_by,
             u.display_name AS inviter_name
        FROM company_invitations i
        LEFT JOIN users u ON u.id = i.invited_by
+       LEFT JOIN conversations g ON g.id = i.conversation_id AND g.company_id = i.company_id
       WHERE i.company_id = $1
+        AND ($2::text IS NULL OR i.conversation_id = $2)
+        AND (i.conversation_id IS NULL OR g.members @> to_jsonb(ARRAY[$3::text]))
       ORDER BY i.created_at DESC
       LIMIT 200`,
-    [companyId],
+    [companyId, conversationId, me],
   )
   const now = Date.now()
   res.json(rows.map((r) => {
@@ -1480,6 +1558,7 @@ api.get('/companies/:id/invitations', safe(async (req, res) => {
       // is fine here — we look invites up by the full hash, which the
       // revoke endpoint accepts.
       id: r.token_hash,
+      conversation: r.conversation_id ? { id: r.conversation_id, title: r.conversation_title ?? '' } : null,
       email: r.email,
       role: r.role,
       note: r.note,
@@ -1507,6 +1586,16 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
   const companyId = String(req.params.id)
   const { userId: me } = await requireCompanyAdmin(req, companyId)
   const body = req.body ?? {}
+  const conversationId = typeof body.conversationId === 'string' ? body.conversationId.trim() || null : null
+  let conversation: { id: string; title: string } | null = null
+  if (conversationId) {
+    const { rows } = await pool.query<{ id: string; title: string }>(
+      `SELECT id, title FROM conversations WHERE id = $1 AND company_id = $2 AND kind = 'group'
+         AND members @> to_jsonb(ARRAY[$3::text])`, [conversationId, companyId, me],
+    )
+    if (!rows[0]) throw new HttpError(404, 'group not found')
+    conversation = rows[0]
+  }
   const rawEmail = typeof body.email === 'string' ? body.email.trim() : ''
   const email = rawEmail ? rawEmail.toLowerCase() : null
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -1525,7 +1614,7 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
   // Email-targeted invites: refuse if the email already belongs to a
   // member (avoid spamming/revoke-loop in the UI). We don't refuse for
   // link invites — link reuse is the whole point.
-  if (email) {
+  if (email && !conversationId) {
     const { rows: existing } = await pool.query(
       `SELECT 1 FROM company_members cm
          JOIN users u ON u.id = cm.user_id
@@ -1543,34 +1632,48 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
       `UPDATE company_invitations
           SET revoked_at = NOW()
         WHERE company_id = $1 AND email = $2
+          AND conversation_id IS NULL
           AND revoked_at IS NULL AND expires_at > NOW()
           AND use_count < max_uses`,
       [companyId, email],
     )
   }
 
-  const humanSeats = await companyHumanSeatInfo(companyId)
-  const remaining = humanSeats.limit - humanSeats.used
-  if (remaining <= 0) {
-    throw new HttpError(403, `${humanSeats.tier} tier workspaces can have at most ${humanSeats.limit} human members`)
+  if (email && conversationId) {
+    await pool.query(
+      `UPDATE company_invitations SET revoked_at = NOW()
+        WHERE company_id = $1 AND email = $2 AND conversation_id = $3
+          AND revoked_at IS NULL AND expires_at > NOW() AND use_count < max_uses`,
+      [companyId, email, conversationId],
+    )
   }
-  maxUses = Math.min(maxUses, remaining)
+
+  // Group links can also be used by existing colleagues, even when all
+  // workspace seats are occupied. Only new workspace members consume seats.
+  if (!conversationId) {
+    const humanSeats = await companyHumanSeatInfo(companyId)
+    const remaining = humanSeats.limit - humanSeats.used
+    if (remaining <= 0) {
+      throw new HttpError(403, `${humanSeats.tier} tier workspaces can have at most ${humanSeats.limit} human members`)
+    }
+    maxUses = Math.min(maxUses, remaining)
+  }
 
   const token = generateInviteToken()
   const tokenHash = hashInviteToken(token)
   const expiresAt = new Date(Date.now() + INVITE_TTL_MS)
   await pool.query(
     `INSERT INTO company_invitations
-       (token_hash, company_id, invited_by, email, role, note, max_uses, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [tokenHash, companyId, me, email, role, note, maxUses, expiresAt],
+       (token_hash, company_id, invited_by, email, role, note, max_uses, expires_at, conversation_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [tokenHash, companyId, me, email, role, note, maxUses, expiresAt, conversationId],
   )
   const ip = req.socket.remoteAddress ?? null
   const ua = (req.headers['user-agent'] as string | undefined) ?? null
   await audit({
     kind: 'invitation_create',
     userId: me, companyId, ip, userAgent: ua,
-    detail: { email, role, maxUses, note: note ?? undefined },
+    detail: { email, role, maxUses, conversationId, note: note ?? undefined },
   })
 
   // Optional: send the invitation email on the inviter's behalf. Only
@@ -1595,6 +1698,7 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
         inviterName: inviter.display_name || inviter.email,
         inviterEmail: inviter.email,
         companyName: company.name,
+        conversationName: conversation?.title,
         role,
         note,
         inviteUrl,
@@ -1608,6 +1712,7 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
     id: tokenHash,
     token,
     url: buildInviteUrl(token),
+    conversation,
     email,
     role,
     note,
@@ -1667,174 +1772,125 @@ api.get('/invitations/:token', safe(async (req, res) => {
   res.json(preview)
 }))
 
-/** Accept an invitation. Auth required — the joiner must already have a
- *  Cumora account (sign in / sign up via OAuth first). Atomically:
- *    1. Re-checks the invite state under FOR UPDATE so two simultaneous
- *       redemptions on a single-use invite can't both win.
- *    2. Inserts a company_members row (idempotent on conflict).
- *    3. Mirrors the human as a participant in the target company.
- *    4. Bumps use_count + last_accepted_at/by.
- *  Then (post-commit, best-effort) joins #all-hands so the new member
- *  gets the visible "X joined" event. Returns the company summary the
- *  client adds to the switcher list. */
+/** Accept a workspace/group invitation. Company, invitation and group locks
+ * keep seat limits and redemptions atomic. Group invites never auto-join the
+ * all-hands group or restore memberships from a prior workspace removal. */
 api.post('/invitations/:token/accept', safe(async (req, res) => {
   const me = requireAuth(req)
   const token = String(req.params.token)
-  if (!token || token.length < 8) { res.status(400).json({ error: 'bad token' }); return }
+  if (!token || token.length < 8) throw new HttpError(400, 'bad token')
   const tokenHash = hashInviteToken(token)
-  const { rows: userRow } = await pool.query<{ email: string; display_name: string; avatar_url: string | null }>(
-    `SELECT email, display_name, avatar_url FROM users WHERE id = $1`, [me],
+  const { rows: users } = await pool.query<{ email: string; display_name: string; avatar_url: string | null }>(
+    'SELECT email, display_name, avatar_url FROM users WHERE id = $1', [me],
   )
-  if (!userRow[0]) { res.status(401).json({ error: 'session points to missing user' }); return }
-  const viewerEmail = userRow[0].email.toLowerCase()
-  const displayName = userRow[0].display_name
-  // Reuse the user's OAuth-mirrored avatar (stamped on users.avatar_url at
-  // signup) so they show up in the inviter's workspace with the same face
-  // they have everywhere else. Fall back to gravatar for users who pre-date
-  // the avatar_url column (NULL after migration backfill).
-  const userAvatar = userRow[0].avatar_url ?? gravatarUrlForEmail(userRow[0].email)
-
+  const user = users[0]
+  if (!user) throw new HttpError(401, 'session points to missing user')
+  const avatar = user.avatar_url ?? gravatarUrlForEmail(user.email)
+  let inv!: InvitationRow
+  let conversation: { id: string; title: string } | null = null
+  let alreadyMember = false
+  let joinedWorkspace = false
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    const { rows: target } = await client.query<{ company_id: string }>(
+      'SELECT company_id FROM company_invitations WHERE token_hash = $1', [tokenHash],
+    )
+    if (!target[0]) throw new HttpError(404, 'invitation not found')
+    // Lock order matches workspace-member removal: company before invite.
+    await client.query('SELECT id FROM companies WHERE id = $1 FOR UPDATE', [target[0].company_id])
     const { rows } = await client.query<InvitationRow>(
-      `SELECT token_hash, company_id, invited_by, email, role, note,
-              max_uses, use_count, created_at, expires_at, revoked_at,
-              last_accepted_at, last_accepted_by
-         FROM company_invitations
-        WHERE token_hash = $1
-        FOR UPDATE`,
-      [tokenHash],
+      'SELECT * FROM company_invitations WHERE token_hash = $1 FOR UPDATE', [tokenHash],
     )
-    if (rows.length === 0) {
-      await client.query('ROLLBACK')
-      res.status(404).json({ error: 'invitation not found' }); return
+    inv = rows[0]
+    if (!inv) throw new HttpError(404, 'invitation not found')
+    if (inv.revoked_at) throw new HttpError(410, 'invitation revoked')
+    if (new Date(inv.expires_at).getTime() < Date.now()) throw new HttpError(410, 'invitation expired')
+    if (inv.email && inv.email.toLowerCase() !== user.email.toLowerCase()) {
+      throw new HttpError(403, `this invitation is reserved for ${inv.email} — sign in with that email to accept`)
     }
-    const inv = rows[0]
-    if (inv.revoked_at) {
-      await client.query('ROLLBACK')
-      res.status(410).json({ error: 'invitation revoked' }); return
-    }
-    if (new Date(inv.expires_at).getTime() < Date.now()) {
-      await client.query('ROLLBACK')
-      res.status(410).json({ error: 'invitation expired' }); return
-    }
-    if (inv.use_count >= inv.max_uses) {
-      await client.query('ROLLBACK')
-      res.status(410).json({ error: 'invitation already used' }); return
-    }
-    if (inv.email && inv.email.toLowerCase() !== viewerEmail) {
-      await client.query('ROLLBACK')
-      res.status(403).json({
-        error: `this invitation is reserved for ${inv.email} — sign in with that email to accept`,
-      }); return
-    }
-
-    // Idempotent membership upsert — if already a member, decline to
-    // double-bump usage but still return success so the client can route
-    // them into the workspace.
-    const { rows: existingMembership } = await client.query(
-      `SELECT 1 FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`,
-      [inv.company_id, me],
+    const { rows: memberships } = await client.query<{ role: string }>(
+      'SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2', [inv.company_id, me],
     )
-    if (existingMembership[0]) {
-      await client.query('ROLLBACK')
-      const { rows: meta } = await pool.query<{ name: string; slug: string; role: string }>(
-        `SELECT c.name, c.slug, cm.role
-           FROM companies c JOIN company_members cm
-             ON cm.company_id = c.id AND cm.user_id = $2
-          WHERE c.id = $1`,
-        [inv.company_id, me],
+    const workspaceMember = Boolean(memberships[0])
+    let groupMember = false
+    if (inv.conversation_id) {
+      const { rows: groups } = await client.query<{ id: string; title: string; kind: string; members: string[] }>(
+        'SELECT id, title, kind, members FROM conversations WHERE id = $1 AND company_id = $2 FOR UPDATE',
+        [inv.conversation_id, inv.company_id],
       )
-      res.json({
-        ok: true,
-        alreadyMember: true,
-        company: {
-          id: inv.company_id,
-          name: meta[0]?.name ?? '',
-          slug: meta[0]?.slug ?? '',
-          role: meta[0]?.role ?? 'member',
-        },
-      })
-      return
+      const group = groups[0]
+      if (!group || group.kind !== 'group') throw new HttpError(404, 'group not found')
+      conversation = { id: group.id, title: group.title }
+      groupMember = group.members.includes(me)
     }
-
-    await assertUserCompanyLimit(me, client)
-    await assertCompanyHumanLimit(inv.company_id, client)
-
-    await client.query(
-      `INSERT INTO company_members (company_id, user_id, role)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (company_id, user_id) DO NOTHING`,
-      [inv.company_id, me, inv.role],
-    )
-
-    // Mirror the human as a participant in the target company so they
-    // appear in conversation member lists and avatar grids. Idempotent
-    // on the (id, company_id) composite PK.
-    await client.query(
-      `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, avatar_url, status, company_id)
-       VALUES ($1, 'human', $2, NULL, $3, '#FF8870', $4, 'avail', $5)
-       ON CONFLICT (id, company_id) DO NOTHING`,
-      [me, displayName, displayName.charAt(0).toUpperCase(),
-       userAvatar, inv.company_id],
-    )
-
-    await client.query(
-      `UPDATE company_invitations
-          SET use_count = use_count + 1,
-              last_accepted_at = NOW(),
-              last_accepted_by = $2
-        WHERE token_hash = $1`,
-      [tokenHash, me],
-    )
+    alreadyMember = workspaceMember && (!inv.conversation_id || groupMember)
+    if (!alreadyMember) {
+      if (inv.use_count >= inv.max_uses) throw new HttpError(410, 'invitation already used')
+      if (!workspaceMember) {
+        await assertUserCompanyLimit(me, client)
+        await assertCompanyHumanLimit(inv.company_id, client)
+        await client.query(
+          'INSERT INTO company_members (company_id, user_id, role) VALUES ($1, $2, $3)',
+          [inv.company_id, me, inv.role],
+        )
+        await client.query(
+          `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, avatar_url, status, company_id)
+           VALUES ($1, 'human', $2, NULL, $3, '#FF8870', $4, 'avail', $5)
+           ON CONFLICT (id, company_id) DO UPDATE
+             SET departed_at = NULL, name = EXCLUDED.name, initial = EXCLUDED.initial,
+                 avatar_url = EXCLUDED.avatar_url, status = 'avail', status_updated_at = NOW()`,
+          [me, user.display_name, user.display_name.charAt(0).toUpperCase(), avatar, inv.company_id],
+        )
+        joinedWorkspace = true
+      }
+      if (conversation && !groupMember) {
+        await client.query(
+          `UPDATE conversations SET members = members || to_jsonb(ARRAY[$2::text]), updated_at = NOW()
+            WHERE id = $1 AND company_id = $3 AND NOT (members @> to_jsonb(ARRAY[$2::text]))`,
+          [conversation.id, me, inv.company_id],
+        )
+      }
+      await client.query(
+        `UPDATE company_invitations SET use_count = use_count + 1,
+                last_accepted_at = NOW(), last_accepted_by = $2 WHERE token_hash = $1`, [tokenHash, me],
+      )
+    }
     await client.query('COMMIT')
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => { /* swallow */ })
+    await client.query('ROLLBACK')
     throw e
   } finally {
     client.release()
   }
 
-  // Post-commit fan-out. joinAllHands creates the "X joined" system
-  // message + WS broadcast so existing members see the newcomer arrive
-  // in real time.
-  const { rows: invRow } = await pool.query<{ company_id: string; role: string; invited_by: string }>(
-    `SELECT company_id, role, invited_by FROM company_invitations WHERE token_hash = $1`,
-    [tokenHash],
-  )
-  const inv = invRow[0]
-  if (inv) {
-    try { await joinAllHands({ companyId: inv.company_id, participantId: me }) }
-    catch (e) { console.warn('[invite] join all-hands failed', e) }
-    try { await seedMemberDms({ companyId: inv.company_id, memberId: me }) }
-    catch (e) { console.warn('[invite] seed member DMs failed', e) }
+  // The directory remains workspace-wide. Do not attach a private group id
+  // to this event; the separate joined message is delivered only to the group.
+  if (joinedWorkspace) {
+    try {
+      await publish(CH_STATUS, { type: 'participants.added', companyId: inv.company_id, participant: {
+        id: me, kind: 'human', name: user.display_name, role: null,
+        initial: user.display_name.charAt(0).toUpperCase(), avatarBg: '#FF8870', avatarUrl: avatar,
+        status: 'avail', statusUpdatedAt: new Date().toISOString(),
+      } })
+    } catch (e) { console.warn('[invite] participant broadcast failed', e) }
   }
-
-  const { rows: companyRow } = await pool.query<{ name: string; slug: string; role: string }>(
-    `SELECT c.name, c.slug, cm.role
-       FROM companies c JOIN company_members cm
-         ON cm.company_id = c.id AND cm.user_id = $2
-      WHERE c.id = $1`,
-    [inv?.company_id ?? '', me],
+  if (conversation && !alreadyMember) {
+    try {
+      const { postMembershipSystemMessage } = await import('../agents/membership.js')
+      await postMembershipSystemMessage({ conversationId: conversation.id, companyId: inv.company_id,
+        actorId: me, kind: 'joined', participantId: me })
+    } catch (e) { console.warn('[invite] group join broadcast failed', e) }
+  }
+  const { rows: companies } = await pool.query<{ id: string; name: string; slug: string; role: string }>(
+    `SELECT c.id, c.name, c.slug, cm.role FROM companies c
+       JOIN company_members cm ON cm.company_id = c.id AND cm.user_id = $2 WHERE c.id = $1`, [inv.company_id, me],
   )
-  const ip = req.socket.remoteAddress ?? null
-  const ua = (req.headers['user-agent'] as string | undefined) ?? null
-  await audit({
-    kind: 'invitation_accept',
-    userId: me, companyId: inv?.company_id ?? null, ip, userAgent: ua,
-    detail: { invitedBy: inv?.invited_by, role: inv?.role },
-  })
-  res.json({
-    ok: true,
-    alreadyMember: false,
-    company: {
-      id: inv?.company_id ?? '',
-      name: companyRow[0]?.name ?? '',
-      slug: companyRow[0]?.slug ?? '',
-      role: companyRow[0]?.role ?? 'member',
-    },
-  })
+  if (!alreadyMember) {
+    await audit({ kind: 'invitation_accept', userId: me, companyId: inv.company_id,
+      detail: { invitedBy: inv.invited_by, role: inv.role, conversationId: conversation?.id } })
+  }
+  res.json({ ok: true, alreadyMember, company: companies[0], conversation })
 }))
 
 /* ============== Projects ============== */
@@ -2951,7 +3007,7 @@ api.post('/conversations', async (req, res) => {
 
   // Validate every member exists in this tenant.
   const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM participants WHERE id = ANY($1::text[]) AND company_id = $2`,
+    `SELECT id FROM participants WHERE id = ANY($1::text[]) AND company_id = $2 AND departed_at IS NULL`,
     [members, tenant],
   )
   const validIds = new Set(existing.map((r) => r.id))
@@ -2978,6 +3034,53 @@ api.post('/conversations', async (req, res) => {
   await pool.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
   res.status(201).json({ id, members, projectId })
 })
+
+/** Permanently dissolve a group. Workspace owner/admin AND group membership
+ * are required. Company-first locking serializes against invite acceptance
+ * and colleague removal; cascading FKs remove messages and invitation links. */
+api.delete('/conversations/:id', safe(async (req, res) => {
+  const { userId: me, companyId } = await requireCompanyRole(req)
+  const id = String(req.params.id)
+  let members: string[] = []
+  let calendarIds: string[] = []
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('SELECT id FROM companies WHERE id = $1 FOR UPDATE', [companyId])
+    // Recheck inside the lock in case the caller was concurrently removed.
+    await requireCompanyAdmin(req, companyId, client)
+    const { rows } = await client.query<{ kind: string; members: string[] }>(
+      'SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2 FOR UPDATE', [id, companyId],
+    )
+    const group = rows[0]
+    if (!group || !group.members.includes(me)) throw new HttpError(404, 'group not found')
+    if (group.kind !== 'group') throw new HttpError(400, 'only group chats can be dissolved')
+    members = group.members
+    // A deleted calendar target falls back to a DM. Cancel pending tasks
+    // first so dissolving a group cannot silently redirect its automations.
+    const calendar = await client.query<{ id: string }>(
+      `UPDATE calendar_events SET status = 'cancelled', updated_at = NOW()
+        WHERE company_id = $1 AND target_conversation_id = $2
+          AND kind = 'agent_task' AND status IN ('active', 'paused') RETURNING id`, [companyId, id],
+    )
+    calendarIds = calendar.rows.map((row) => row.id)
+    await client.query('DELETE FROM conversations WHERE id = $1 AND company_id = $2', [id, companyId])
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+  await audit({ kind: 'conversation_dissolve', userId: me, companyId, detail: { conversationId: id } })
+  // The DB operation is already committed. A transient pubsub failure must
+  // not report a failed deletion; reconnect/list reload also reconciles it.
+  await publish(CH_CONVO_UPDATED, {
+    type: 'conversation.dissolved', companyId, conversationId: id, recipientUserIds: members,
+  }).catch((err) => console.warn('[conversations] dissolution broadcast failed', err))
+  for (const eventId of calendarIds) publishCalendarChange({ kind: 'event.updated', eventId, companyId, actorId: me })
+  res.json({ ok: true })
+}))
 
 /** Set or clear a conversation's topic. Any member can change it. */
 api.post('/conversations/:id/topic', async (req, res) => {
@@ -3042,7 +3145,7 @@ api.post('/conversations/direct', async (req, res) => {
   if (!otherId) { res.status(400).json({ error: 'otherId required' }); return }
   if (otherId === me) { res.status(400).json({ error: 'cannot DM yourself' }); return }
   const { rows: pp } = await pool.query<{ id: string; kind: string }>(
-    `SELECT id, kind FROM participants WHERE id = $1 AND company_id = $2`, [otherId, tenant],
+    `SELECT id, kind FROM participants WHERE id = $1 AND company_id = $2 AND departed_at IS NULL`, [otherId, tenant],
   )
   if (!pp[0]) { res.status(404).json({ error: 'unknown participant' }); return }
 
@@ -3165,7 +3268,7 @@ api.post('/conversations/:id/members', async (req, res) => {
   if (c.members.includes(newMember)) { res.json({ ok: true, members: c.members, alreadyIn: true }); return }
   // Validate participant exists in this tenant.
   const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM participants WHERE id = $1 AND company_id = $2`, [newMember, tenant],
+    `SELECT id FROM participants WHERE id = $1 AND company_id = $2 AND departed_at IS NULL`, [newMember, tenant],
   )
   if (!existing[0]) { res.status(400).json({ error: `unknown participant: ${newMember}` }); return }
   const next = [...c.members, newMember]

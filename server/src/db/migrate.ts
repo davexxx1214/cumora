@@ -936,6 +936,12 @@ CREATE INDEX IF NOT EXISTS idx_company_invitations_company
   ON company_invitations(company_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_company_invitations_email
   ON company_invitations(email) WHERE email IS NOT NULL;
+-- A deleted group must invalidate its invitations, never turn them into
+-- workspace-wide links. NULL preserves legacy workspace invitations.
+ALTER TABLE company_invitations ADD COLUMN IF NOT EXISTS conversation_id TEXT
+  REFERENCES conversations(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_company_invitations_conversation
+  ON company_invitations(conversation_id) WHERE conversation_id IS NOT NULL;
 
 -- ============== Admin panel: is_admin + settings + waitlist ===============
 -- Admin is a per-user flag, not a separate role table — there are only ever a

@@ -4,7 +4,9 @@ import { Pressable } from './Pressable'
 import { useLongPress } from './useLongPress'
 import { MobileMessageTapback, type TapbackAction } from './MobileMessageTapback'
 import { useApp } from '@/stores/app'
-import { useMe } from '@/stores/auth'
+import { GroupInviteButton } from '@/components/GroupInviteButton'
+import { DissolveGroupDialog } from '@/components/DissolveGroupDialog'
+import { useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, toggleReaction, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
@@ -1063,6 +1065,8 @@ function buildMessageTapbackActions(
 
 export function MobileChatInfo() {
   const t = useT()
+  const canManage = useCanManageWorkspace()
+  const [confirmDissolve, setConfirmDissolve] = useState(false)
   const pushStack = useApp((s) => s.pushMobileStack)
   const setView = useApp((s) => s.setView)
   const convoId = useApp((s) => s.selectedConversationId)
@@ -1202,6 +1206,7 @@ export function MobileChatInfo() {
           <div className="mx-auto mb-3 inline-flex justify-center">
             <AvatarStack ps={groupAgents} size={64} max={5} />
           </div>
+          <div><GroupInviteButton conversationId={c.id} conversationName={c.title} /></div>
           {editingTitle ? (
             <input
               autoFocus
@@ -1399,7 +1404,12 @@ export function MobileChatInfo() {
           {t('mobchat.leaveConversation')}
           <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">{t('mobchat.agentsContinueWithout')}</span>
         </button>
+        {isGroup && canManage && <button type="button" onClick={() => setConfirmDissolve(true)}
+          className="w-full mt-3 py-3 px-4 rounded-[12px] text-[13px] font-semibold text-coral-deep border border-coral-deep text-left">
+          {t('convo.dissolveGroup')}
+        </button>}
       </div>
+      {isGroup && canManage && confirmDissolve && <DissolveGroupDialog conversation={c} onClose={() => setConfirmDissolve(false)} />}
     </section>
   )
 }

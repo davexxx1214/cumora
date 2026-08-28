@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { api, setDevModeEnabled, type ApiDevtoolsCapabilities } from '@/api/client'
+import { commitIfContextCurrent } from '@/stores/auth'
 
 interface DevtoolsState extends ApiDevtoolsCapabilities {
   loaded: boolean
@@ -15,21 +16,20 @@ const DEFAULT_CAPS: ApiDevtoolsCapabilities = {
   role: 'member',
 }
 
-export const useDevtools = create<DevtoolsState>((set) => ({
+export const useDevtools = create<DevtoolsState>((set, get) => ({
   ...DEFAULT_CAPS,
   loaded: false,
   async load() {
-    try {
-      const caps = await api.getDevtoolsCapabilities()
-      set({ ...caps, loaded: true })
-    } catch (err) {
-      console.warn('[devtools] capability check failed', err)
-      set({ ...DEFAULT_CAPS, loaded: true })
-    }
+    await commitIfContextCurrent(async () => {
+      try { return await api.getDevtoolsCapabilities() }
+      catch (err) {
+        console.warn('[devtools] capability check failed', err)
+        return DEFAULT_CAPS
+      }
+    }, (caps) => set({ ...caps, loaded: true }))
   },
   async setDevMode(enabled) {
     setDevModeEnabled(enabled)
-    const caps = await api.getDevtoolsCapabilities()
-    set({ ...caps, loaded: true })
+    await get().load()
   },
 }))

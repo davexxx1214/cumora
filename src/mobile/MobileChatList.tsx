@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import { useApp } from '@/stores/app'
-import { useMe } from '@/stores/auth'
+import { useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
 import { useMessages } from '@/stores/messages'
 import { useParticipants } from '@/stores/participants'
@@ -11,6 +11,7 @@ import { HiveAvatar } from '@/components/HiveAvatar'
 import { HumanBadge } from '@/components/HumanBadge'
 import { ISearch } from '@/components/icons'
 import { GroupCreator } from '@/components/GroupCreator'
+import { DissolveGroupDialog } from '@/components/DissolveGroupDialog'
 import { api } from '@/api/client'
 import { cn } from '@/lib/utils'
 import { Pressable } from './Pressable'
@@ -336,6 +337,8 @@ function convoMenuItems(
     meId: string | null
     byId: Record<string, Participant>
     onCreateGroupWith: (otherId: string) => void
+    canManage: boolean
+    onDissolve: (conversation: Conversation) => void
   },
 ): ContextMenuItem[] {
   const reload = () => useConversations.getState().reload()
@@ -406,6 +409,9 @@ function convoMenuItems(
       },
     })
   }
+  if (c.kind === 'group' && ctx.canManage) {
+    items.push({ label: t('convo.dissolveGroup'), destructive: true, onClick: () => ctx.onDissolve(c) })
+  }
   return items
 }
 
@@ -419,6 +425,8 @@ export function MobileChatList() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQ, setSearchQ] = useState('')
   const [actionFor, setActionFor] = useState<{ c: Conversation; coords: { x: number; y: number } } | null>(null)
+  const canManage = useCanManageWorkspace()
+  const [confirmDissolve, setConfirmDissolve] = useState<Conversation | null>(null)
   // GroupCreator is opened from a long-press → "Create group with {name}…"
   // on a direct chat (mirrors the desktop right-click pattern). When
   // non-null, the modal is open; `initialPicked` pre-seeds the other person.
@@ -635,6 +643,8 @@ export function MobileChatList() {
         items={actionFor ? convoMenuItems(actionFor.c, {
           meId,
           byId,
+          canManage,
+          onDissolve: (conversation) => { setActionFor(null); setConfirmDissolve(conversation) },
           onCreateGroupWith: (id) => {
             setActionFor(null)
             setCreating({ initialPicked: [id] })
@@ -647,6 +657,9 @@ export function MobileChatList() {
           initialPicked={creating.initialPicked}
           onClose={() => setCreating(null)}
         />
+      )}
+      {canManage && confirmDissolve && (
+        <DissolveGroupDialog conversation={confirmDissolve} onClose={() => setConfirmDissolve(null)} />
       )}
     </section>
   )

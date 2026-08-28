@@ -89,6 +89,7 @@ test('attemptPasswordSignup: success creates user + personal company', async () 
     assert.match(result.userId, /^u-/)
     assert.equal(result.email, 'newuser@dev.local')
     assert.equal(result.displayName, 'New User')
+    assert.ok(result.companyId)
     assert.match(result.companyId, /^co-/)
   }
   assert.deepEqual(inserts, ['users', 'companies', 'company_members', 'participants'])

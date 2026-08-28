@@ -6,7 +6,7 @@ import { useComputers } from '@/stores/computers'
 import { useDevtools } from '@/stores/devtools'
 import { useParticipants } from '@/stores/participants'
 import { Avatar } from '@/components/Avatar'
-import { IChat, IWhisper, IAgent, IAgents, IBoard, IDoc, ICalendar, IObserve, IExit, IShip } from '@/components/icons'
+import { IChat, IWhisper, IAgent, IAgents, IBoard, IDoc, ICalendar, IObserve, IExit } from '@/components/icons'
 import { api } from '@/api/client'
 import { cn } from '@/lib/utils'
 import { useT, type MessageKey } from '@/lib/i18n'
@@ -18,7 +18,6 @@ import type { Participant, ViewKey } from '@/types'
 const baseItems: Array<{ key: ViewKey['view']; Icon: typeof IChat; label: MessageKey }> = [
   { key: 'conversations', Icon: IChat, label: 'nav.conversations' },
   { key: 'whispers', Icon: IWhisper, label: 'nav.whispers' },
-  { key: 'shipping', Icon: IShip, label: 'nav.ship' },
   { key: 'boards', Icon: IBoard, label: 'nav.boards' },
   { key: 'calendar', Icon: ICalendar, label: 'nav.calendar' },
   { key: 'documents', Icon: IDoc, label: 'nav.docs' },
@@ -46,12 +45,14 @@ export function Rail() {
   // Whispers is the OWNER-ONLY agent-chat observer view (server gates
   // /peek/agent-chats to the company owner). Hide the rail item for non-owners
   // so they never click into a 403/empty view.
-  const isOwner = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.role === 'owner')
-  const assembled = devtoolsEnabled
+  const role = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.role)
+  const isOwner = role === 'owner'
+  const canObserve = isOwner || role === 'admin'
+  const assembled = devtoolsEnabled && canObserve
     ? [
-        ...baseItems.slice(0, 3),
+        ...baseItems.slice(0, 2),
         { key: 'observability' as const, Icon: IObserve, label: 'nav.observe' as MessageKey },
-        ...baseItems.slice(3),
+        ...baseItems.slice(2),
       ]
     : baseItems
   const items = isOwner ? assembled : assembled.filter((i) => i.key !== 'whispers')

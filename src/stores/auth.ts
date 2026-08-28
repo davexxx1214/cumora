@@ -193,6 +193,14 @@ export function useMe(): string | null {
   return useAuth((s) => s.user?.id ?? null)
 }
 
+/** Shared workspace configuration is editable only by its owner/admin. */
+export function useCanManageWorkspace(): boolean {
+  return useAuth((s) => {
+    const role = s.companies.find((company) => company.id === s.activeCompanyId)?.role
+    return role === 'owner' || role === 'admin'
+  })
+}
+
 /** Sync getter for the current company id (for the x-company-id header). */
 export function getActiveCompanyId(): string | null {
   return useAuth.getState().activeCompanyId

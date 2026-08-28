@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Avatar } from '@/components/Avatar'
-import { useMe } from '@/stores/auth'
+import { useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useApp } from '@/stores/app'
 import { useParticipants } from '@/stores/participants'
 import { useConversations } from '@/stores/conversations'
@@ -45,6 +45,7 @@ export function MobileAgents() {
   const setView = useApp((s) => s.setView)
   const select = useApp((s) => s.selectConversation)
   const meId = useMe()
+  const canManage = useCanManageWorkspace()
   const [editing, setEditing] = useState<Participant | null>(null)
   const [editorOpen, setEditorOpen] = useState(false)
 
@@ -103,7 +104,9 @@ export function MobileAgents() {
         <div className="space-y-2.5">
           {agents.length === 0 && (
             <div className="text-center text-ink-300 italic font-display py-12 text-[13px]">
-              {tLabel('magents.empty', 'No agents in this workspace yet. Hire one below.')}
+              {canManage
+                ? tLabel('magents.empty', 'No agents in this workspace yet. Hire one below.')
+                : tLabel('obs.noAgents', 'No agents yet')}
             </div>
           )}
           {agents.map((p) => (
@@ -141,7 +144,7 @@ export function MobileAgents() {
             </button>
           ))}
 
-          <button
+          {canManage && <button
             type="button"
             onClick={() => { setEditing(null); setEditorOpen(true) }}
             className="w-full rounded-[14px] p-5 flex items-center justify-center gap-3 text-skype-deep mt-2 active:scale-[0.99] transition"
@@ -154,10 +157,10 @@ export function MobileAgents() {
               <div className="font-display font-medium text-[15px] text-ink-900" style={{ letterSpacing: '-0.01em' }}>{tLabel('magents.hireTitle', 'Hire an agent')}</div>
               <div className="font-display italic text-[11.5px] text-ink-500">{tLabel('magents.hireSub', 'design a new teammate')}</div>
             </div>
-          </button>
+          </button>}
         </div>
 
-        {editorOpen && (
+        {canManage && editorOpen && (
           <AgentEditor agent={editing} onClose={() => { setEditorOpen(false); setEditing(null) }} />
         )}
 

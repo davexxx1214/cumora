@@ -4,7 +4,7 @@ import { isNativePlatform } from '@/lib/native'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
 import { useConversations } from '@/stores/conversations'
-import { useAuth } from '@/stores/auth'
+import { useAuth, useCanManageWorkspace } from '@/stores/auth'
 import { Input } from '@/components/Input'
 import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
@@ -23,7 +23,12 @@ interface Props {
   onClose: () => void
 }
 
-export function AgentEditor({ agent, onClose }: Props) {
+export function AgentEditor(props: Props) {
+  const canManage = useCanManageWorkspace()
+  return canManage ? <EditableAgentEditor {...props} /> : null
+}
+
+function EditableAgentEditor({ agent, onClose }: Props) {
   const t = useT()
   const editing = agent !== null
   const [name, setName] = useState(agent?.name ?? '')

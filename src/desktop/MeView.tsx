@@ -639,6 +639,8 @@ function PreferencesTab() {
   const devtoolsEnabled = useDevtools((s) => s.enabled)
   const devtoolsCanEnable = useDevtools((s) => s.canEnable)
   const devtoolsLocal = useDevtools((s) => s.localDev)
+  const role = useAuth((s) => s.companies.find((c) => c.id === s.activeCompanyId)?.role)
+  const canObserve = role === 'owner' || role === 'admin'
   const setDevMode = useDevtools((s) => s.setDevMode)
   const loadDevtools = useDevtools((s) => s.load)
   const get = (k: string, fallback: boolean) => (prefs[k] === undefined ? fallback : Boolean(prefs[k]))
@@ -673,7 +675,7 @@ function PreferencesTab() {
       ))}
       <LanguageSection />
       <SkypeSoundSection />
-      {devtoolsCanEnable && (
+      {canObserve && devtoolsCanEnable && (
         <Section title={`↳ ${t('me.prefs.developer')}`}>
           <Checkbox
             checked={devtoolsEnabled}

@@ -145,6 +145,8 @@ export function bootParticipants() {
       // covers the only failure mode where avatar updates silently
       // stick at stale.
       void useParticipants.getState().refresh()
+    } else if (e.type === 'workspace.member_removed') {
+      void useParticipants.getState().refresh()
     } else if (e.type === 'participants.status') {
       useParticipants.getState().applyStatus(e.participantId, e.status, e.statusUpdatedAt)
     } else if (e.type === 'participants.avatar') {

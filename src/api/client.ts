@@ -566,6 +566,7 @@ export interface PasswordLoginResponse {
 export type ApiInvitationStatus = 'active' | 'revoked' | 'expired' | 'consumed'
 
 export interface ApiInvitation {
+  conversation: { id: string; title: string } | null
   /** Stable identifier (= server-side token_hash). Used by the revoke
    *  endpoint. The raw token itself is ONLY returned on create — never
    *  re-exposed. */
@@ -589,6 +590,7 @@ export interface ApiInvitation {
  *  raw token + the public accept URL — the server keeps only the hash, so
  *  the UI must surface this immediately for the user to copy / send. */
 export interface ApiInvitationWithToken {
+  conversation: { id: string; title: string } | null
   id: string
   token: string
   url: string
@@ -631,11 +633,13 @@ export interface ApiInvitationPreview {
     createdAt: string
     inviterName: string | null
     company: { id: string; name: string; slug: string }
+    conversation?: { id: string; title: string } | null
     multiUse: boolean
   }
 }
 
 export interface ApiInvitationAccept {
+  conversation?: { id: string; title: string } | null
   ok: true
   alreadyMember: boolean
   company: { id: string; name: string; slug: string; role: string }
@@ -894,15 +898,24 @@ export const api = {
     http<{ id: string; name: string; slug: string; role: string }>('/companies', {
       method: 'POST', body: JSON.stringify({ name }),
     }),
+  listWorkspaceMembers: (companyId: string) =>
+    http<Array<{ id: string; name: string; email: string; role: string; isOwner: boolean }>>(
+      `/companies/${encodeURIComponent(companyId)}/members`,
+    ),
+  removeWorkspaceMember: (companyId: string, memberId: string) =>
+    http<{ ok: boolean }>(`/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(memberId)}`, {
+      method: 'DELETE',
+    }),
   /** Owner/admin-only: list every invitation (active + historical) for a
    *  company so the management UI can show recent activity. */
-  listInvitations: (companyId: string) =>
-    http<ApiInvitation[]>(`/companies/${encodeURIComponent(companyId)}/invitations`),
+  listInvitations: (companyId: string, conversationId?: string) =>
+    http<ApiInvitation[]>(`/companies/${encodeURIComponent(companyId)}/invitations${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`),
   /** Owner/admin-only: mint a fresh invite. Pass `email` for a single-use
    *  email-locked invite, omit (or set `multiUse: true`) for a shareable
    *  link. The returned `url` + `token` are the ONLY copy — the server
    *  stores just the hash. */
   createInvitation: (companyId: string, input: {
+    conversationId?: string
     email?: string | null
     role?: 'member' | 'admin'
     note?: string | null
@@ -980,6 +993,8 @@ export const api = {
     http<{ ok: boolean; members: string[] }>(`/conversations/${encodeURIComponent(conversationId)}/leave`, {
       method: 'POST',
     }),
+  dissolveGroup: (conversationId: string) =>
+    http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}`, { method: 'DELETE' }),
   openDirect: (otherId: string) =>
     http<{ id: string; created: boolean }>('/conversations/direct', {
       method: 'POST',
@@ -1457,6 +1472,7 @@ export interface CalendarEventInput {
 /* ============== WebSocket bridge ============== */
 
 export type WsEvent =
+  | { type: 'workspace.member_removed'; companyId: string; userId: string }
   | { type: 'hello'; instanceId: string; ts: number }
   | { type: 'message.new'; conversationId: string; message: ApiMessage }
   | { type: 'message.delta'; conversationId: string; messageId: string; authorId: string; delta: string; sequence: number; done: boolean }
@@ -1472,6 +1488,7 @@ export type WsEvent =
   | { type: 'message.reactions'; conversationId: string; messageId: string; reactions: Array<{ emoji: string; count: number; mine?: boolean; users?: string[] }> }
   | { type: 'group.pulled'; conversationId: string; pulledById: string }
   | { type: 'conversation.updated'; conversationId: string; patch: { topic?: string | null; title?: string } }
+  | { type: 'conversation.dissolved'; conversationId: string }
   | { type: 'convene'; sessionId: string; conversationId: string; kind: 'started' | 'transcript' | 'ended' | 'tile'; data?: unknown }
   | { type: 'board.changed'; kind:
         | 'board.created' | 'board.updated' | 'board.deleted'
@@ -1574,7 +1591,13 @@ class WsClient {
     sock.onopen = () => { this.reconnectDelay = 500 }
     sock.onmessage = (ev) => {
       try {
-        const data = JSON.parse(ev.data) as WsEvent
+        const data = JSON.parse(ev.data) as WsEvent & { companyId?: string }
+        if (data.type === 'workspace.member_removed' && data.userId === useAuth.getState().user?.id) {
+          // Re-probe /auth/me and discard all cached workspace content.
+          window.location.reload()
+          return
+        }
+        if (data.companyId && data.companyId !== getActiveCompanyId()) return
         this.listeners.forEach((l) => { l(data) })
       } catch { /* ignore */ }
     }
