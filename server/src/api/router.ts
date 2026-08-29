@@ -36,6 +36,7 @@ import { projectFilesRouter } from './project-files-router.js'
 import { archiveProject, attachGroupProject, prepareGroupProjectStop, validateNewProjectBinding } from '../project-files/bindings.js'
 import { ProjectFileError } from '../project-files/model.js'
 import { projectAttachment } from '../project-files/references.js'
+import { resolveAgentRecipientIds } from '../agents/message-routing.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -3658,8 +3659,15 @@ api.post('/conversations/:id/messages', async (req, res) => {
     }
   })
 
-  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string }>(
-    `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2`,
+  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string; agent_ids: string[] }>(
+    `SELECT c.members, c.kind,
+            ARRAY(
+              SELECT p.id FROM participants p
+               WHERE p.company_id = c.company_id
+                 AND p.kind = 'agent' AND p.departed_at IS NULL
+                 AND c.members @> to_jsonb(ARRAY[p.id])
+            ) AS agent_ids
+       FROM conversations c WHERE c.id = $1 AND c.company_id = $2`,
     [id, tenant],
   )
   const convo = convoRows[0]
@@ -3671,6 +3679,11 @@ api.post('/conversations/:id/messages', async (req, res) => {
     res.status(403).json({ error: 'not a member of this conversation' })
     return
   }
+  const agentRecipientIds = resolveAgentRecipientIds({
+    body,
+    conversationKind: convo.kind,
+    agentMemberIds: convo.agent_ids,
+  })
 
   // Email conversations: auto-promote a "chat-style" reply into a real
   // email reply. Without this, typing in the chat input of an email
@@ -3756,12 +3769,13 @@ api.post('/conversations/:id/messages', async (req, res) => {
   const proposedMessageId = `m-${randomUUID()}`
   const inserted = await pool.query<{ id: string; sequence: number }>(
     `INSERT INTO messages
-       (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id)
-     VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9)
+       (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id, agent_recipient_ids)
+     VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb)
      ON CONFLICT (conversation_id, author_id, client_id) WHERE client_id IS NOT NULL
      DO NOTHING
      RETURNING id, sequence`,
-    [proposedMessageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant, clientId],
+    [proposedMessageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant, clientId,
+      agentRecipientIds ? JSON.stringify(agentRecipientIds) : null],
   )
   const persisted = inserted.rows[0] ?? (clientId
     ? (await pool.query<{ id: string; sequence: number }>(
@@ -3794,10 +3808,9 @@ api.post('/conversations/:id/messages', async (req, res) => {
     return
   }
 
-  // Drop the message into the bus. The mailbox scheduler (subscribed to
-  // CH_MESSAGE_NEW) wakes every agent member and lets each decide for itself
-  // whether to reply, react, dm, or stay silent. The companyId tag lets
-  // the WS bridge filter who sees it.
+  // Drop the message into the bus. Explicit agent mentions carry a durable
+  // delivery audience; ordinary room messages and @all remain broadcasts.
+  // The companyId tag lets the WS bridge filter who sees it.
   await publish(CH_MESSAGE_NEW, {
     type: 'message.new',
     conversationId: id,
@@ -3806,6 +3819,7 @@ api.post('/conversations/:id/messages', async (req, res) => {
       id: messageId, conversationId: id, authorId: me,
       kind: 'text', body, sequence: persistedSequence, at: new Date().toISOString(),
       attachment: attachment ?? undefined,
+      agentRecipientIds,
       quotedMessageId: resolvedQuotedId ?? undefined,
       quoted: quotedSummary ?? undefined,
       clientId: clientId ?? undefined,

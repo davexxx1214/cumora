@@ -21,6 +21,7 @@ import {
   parseMemoryPath,
 } from './memory-scope.js'
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
+import { resolveAgentRecipientIds } from './message-routing.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -858,6 +859,10 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
       WHERE c.members @> to_jsonb(ARRAY[$1::text])
         AND m.author_id <> $1
+        AND (
+          m.agent_recipient_ids IS NULL
+          OR m.agent_recipient_ids @> to_jsonb(ARRAY[$1::text])
+        )
         AND m.created_at > COALESCE(
           (SELECT last_read_at FROM conversation_reads
             WHERE user_id = $1 AND conversation_id = c.id),
@@ -1534,14 +1539,20 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
 
   // Verify the participant is a member of the conversation.
   const { rows: cv } = await pool.query<{
-    members: string[]; company_id: string; kind: string; actor_is_agent: boolean
+    members: string[]; company_id: string; kind: string; actor_is_agent: boolean; agent_ids: string[]
   }>(
     `SELECT c.members, c.company_id, c.kind,
             EXISTS (
               SELECT 1 FROM participants p
                WHERE p.id = $2 AND p.company_id = c.company_id
                  AND p.kind = 'agent' AND p.departed_at IS NULL
-            ) AS actor_is_agent
+            ) AS actor_is_agent,
+            ARRAY(
+              SELECT member.id FROM participants member
+               WHERE member.company_id = c.company_id
+                 AND member.kind = 'agent' AND member.departed_at IS NULL
+                 AND c.members @> to_jsonb(ARRAY[member.id])
+            ) AS agent_ids
        FROM conversations c WHERE c.id = $1`,
     [convoId, me],
   )
@@ -1940,6 +1951,11 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const consumedAsTextContent =
     parsed.flags['attach-text'] && !parsed.flags['attach-text-content']
   const finalBody = consumedAsTextContent ? '' : body
+  const agentRecipientIds = resolveAgentRecipientIds({
+    body: finalBody,
+    conversationKind: cv[0].kind,
+    agentMemberIds: cv[0].agent_ids,
+  })
 
   // Atomically claim next sequence + check verbatim-dup + INSERT, all in
   // ONE transaction. The conversation_counters UPSERT takes a row-level
@@ -2010,9 +2026,10 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       }
     }
     await txClient.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id)
-       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8)`,
-      [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId],
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, agent_recipient_ids)
+       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9::jsonb)`,
+      [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId,
+        agentRecipientIds ? JSON.stringify(agentRecipientIds) : null],
     )
     await txClient.query('COMMIT')
   } catch (e) {
@@ -2058,6 +2075,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       id: messageId, conversationId: convoId, authorId: me,
       kind: 'text', body: finalBody, sequence, at: new Date().toISOString(),
       attachment: attachment ?? undefined,
+      agentRecipientIds,
       quotedMessageId: resolvedQuotedId ?? undefined,
       quoted: quotedSummary ? {
         id: quotedSummary.id,

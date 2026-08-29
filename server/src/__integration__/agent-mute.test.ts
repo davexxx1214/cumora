@@ -80,3 +80,40 @@ test('[integration] direct conversations cannot be muted', async () => {
   assert.equal(result.ok, false)
   assert.match(result.text, /direct conversations always deliver/i)
 })
+
+test('[integration] named agent mention enters only the addressed agent inbox', async () => {
+  const { companyId, agentId: codexId } = await seedCompanyWithAgent()
+  const atlasId = `atlas-${randomUUID().slice(0, 8)}`
+  const humanId = `u-${randomUUID().slice(0, 8)}`
+  const conversationId = `g-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO participants (id,company_id,kind,name,role,initial,avatar_bg,status)
+     VALUES ($1,$2,'agent','Atlas','researcher','A','#123456','avail'),
+            ($3,$2,'human','Human','owner','H','#654321','avail')`,
+    [atlasId, companyId, humanId],
+  )
+  await pool.query(
+    `INSERT INTO conversations (id,kind,title,members,tag,company_id)
+     VALUES ($1,'group','Routed room',$2::jsonb,'group',$3)`,
+    [conversationId, JSON.stringify([codexId, atlasId, humanId]), companyId],
+  )
+
+  const sent = await runCli(['--as', humanId, 'reply', conversationId, `@${codexId} inspect the project files`])
+  assert.equal(sent.ok, true, sent.text)
+
+  const { rows } = await pool.query<{ agent_recipient_ids: string[] | null }>(
+    `SELECT agent_recipient_ids FROM messages WHERE conversation_id = $1 ORDER BY sequence DESC LIMIT 1`,
+    [conversationId],
+  )
+  assert.deepEqual(rows[0]?.agent_recipient_ids, [codexId])
+
+  const codexInbox = await runCli(['--as', codexId, 'inbox'])
+  const atlasInbox = await runCli(['--as', atlasId, 'inbox'])
+  assert.match(codexInbox.text, /inspect the project files/)
+  assert.doesNotMatch(atlasInbox.text, /inspect the project files/)
+
+  const all = await runCli(['--as', humanId, 'reply', conversationId, '@all status check'])
+  assert.equal(all.ok, true, all.text)
+  assert.match((await runCli(['--as', codexId, 'inbox'])).text, /status check/)
+  assert.match((await runCli(['--as', atlasId, 'inbox'])).text, /status check/)
+})

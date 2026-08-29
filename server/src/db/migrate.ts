@@ -45,6 +45,12 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_message_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_messages_quoted ON messages(quoted_message_id);
 
+-- Agent delivery audience. NULL keeps the normal room broadcast; a JSON
+-- array makes the message unread only for those named agents. Conversation
+-- history remains shared with every member. Persisting this on the row is
+-- what prevents an unmentioned agent from answering later after a restart.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS agent_recipient_ids JSONB;
+
 CREATE TABLE IF NOT EXISTS participants (
   id             TEXT NOT NULL,
   -- Composite PK with company_id below — the same id (e.g. a user's id, or

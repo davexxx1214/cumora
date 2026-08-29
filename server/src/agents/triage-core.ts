@@ -393,16 +393,17 @@ export function buildTriageRequest(args: {
   // contract is "if a human is involved → actionable=true, ALWAYS"; against a human
   // message the gate can only ever answer "yes". The one extra it yields is the
   // responseMode hint (each / one-of-us), and NEITHER consumer acts on it — the big
-  // brain decides who/how/whether-to-stay-silent by reading the room. So paying the
+  // brain decides who/how/whether-to-stay-silent by reading the room. Named agent
+  // mentions have already been narrowed by durable delivery routing before this
+  // function runs. So paying the
   // gate on a human message spends a small-model call + its full latency to compute
   // an answer we already know. Skip it and wake the big brain directly. For a group
   // @all this removes ONE redundant gate spawn per agent (7 on the counting-game
   // opener) and their latency; it is also strictly SAFER — a misbehaving gate can no
   // longer drop a human on the floor. Big-brain spend is unchanged (the gate said
   // yes anyway); only the gate's own cost + latency go away. Reaching the big brain
-  // is NOT the same as replying: the standing GLANCE_YIELD_RULES still make an agent
-  // yield / stay silent when the human named someone else. (A DM keeps its own note
-  // so 1:1s never read as "maybe not yours".)
+  // is NOT the same as replying: ordinary broadcasts still rely on the standing
+  // GLANCE_YIELD_RULES. (A DM keeps its own note so 1:1s never read as "maybe not yours".)
   const humanUnread = realUnread.filter((m) => m.author_kind === 'human')
   if (humanUnread.length > 0) {
     const anyDm = humanUnread.some((m) => m.conversation_kind === 'direct')

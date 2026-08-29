@@ -101,3 +101,31 @@ test('[integration] concurrent requests with the same client id create one messa
   )
   assert.equal(rows[0]?.count, '1')
 })
+
+test('[integration] HTTP message send persists the named agent delivery audience', async () => {
+  const codexId = 'codex-route-test'
+  const atlasId = 'atlas-route-test'
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status)
+     VALUES ($1,$3,'agent','codex','engineer','C','#123456','avail'),
+            ($2,$3,'agent','Atlas','researcher','A','#654321','avail')`,
+    [codexId, atlasId, COMPANY_ID],
+  )
+  await pool.query(
+    `UPDATE conversations SET members = $2::jsonb WHERE id = $1`,
+    [CONVERSATION_ID, JSON.stringify([USER_ID, codexId, atlasId])],
+  )
+
+  const response = await fetch(`${baseUrl}/api/conversations/${CONVERSATION_ID}/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-company-id': COMPANY_ID },
+    body: JSON.stringify({ body: `@${codexId} inspect the project files` }),
+  })
+  assert.equal(response.status, 202)
+
+  const { rows } = await pool.query<{ agent_recipient_ids: string[] | null }>(
+    `SELECT agent_recipient_ids FROM messages WHERE conversation_id = $1 ORDER BY sequence DESC LIMIT 1`,
+    [CONVERSATION_ID],
+  )
+  assert.deepEqual(rows[0]?.agent_recipient_ids, [codexId])
+})

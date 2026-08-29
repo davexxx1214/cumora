@@ -33,6 +33,7 @@ import { inprocClient, isAgentBusy } from './runtime/inproc-client.js'
 import { classifyInboxTriage, type InboxTriageVerdict } from './inbox-triage.js'
 import type { AgentTurnOptions } from './turn.js'
 import { Semaphore } from '../concurrency.js'
+import { hasExactMention } from './message-routing.js'
 
 /** Bounds how many recipients the wake fan-out triages + wakes at once
  *  (per replica). See env.WAKE_FANOUT_CONCURRENCY — this is the
@@ -549,19 +550,25 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     steerPayload = { messageId, conversationId, authorName, body: messageBody, companyId: payload.companyId ?? '' }
   }
 
-  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string; muted_agent_ids: string[] }>(
-    `SELECT c.members, c.kind,
+  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string; muted_agent_ids: string[]; agent_recipient_ids: string[] | null }>(
+    `SELECT c.members, c.kind, msg.agent_recipient_ids,
             COALESCE(array_agg(mu.user_id) FILTER (WHERE mu.user_id IS NOT NULL), ARRAY[]::text[]) AS muted_agent_ids
        FROM conversations c
+       LEFT JOIN messages msg ON msg.id = $2 AND msg.conversation_id = c.id
        LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id
         AND (mu.muted_until IS NULL OR mu.muted_until > NOW())
       WHERE c.id = $1
-      GROUP BY c.id`,
-    [conversationId],
+      GROUP BY c.id, msg.agent_recipient_ids`,
+    [conversationId, messageId],
   )
   const conversation = convoRows[0]
   const members = conversation?.members ?? []
   const mutedAgentIds = new Set(conversation?.muted_agent_ids ?? [])
+  // The DB row is authoritative so a daemon restart or missed SSE cannot
+  // turn a named mention back into a broadcast. Synthetic/legacy rows have
+  // NULL here and retain the original broadcast behavior.
+  const routedAgentIds = conversation?.agent_recipient_ids ?? null
+  const routedAgentSet = routedAgentIds ? new Set(routedAgentIds) : null
   let quotedAuthorId = payload.message.quoted?.authorId ?? null
   if (!quotedAuthorId && payload.message.quotedMessageId && mutedAgentIds.size > 0) {
     const { rows } = await pool.query<{ author_id: string }>(
@@ -574,6 +581,7 @@ async function wake(payload: MessageNewEvent): Promise<void> {
   for (const m of members) {
     if (m === authorId) continue
     if (!(await isAgent(m))) continue
+    if (routedAgentSet && !routedAgentSet.has(m)) continue
     if (mutedAgentIds.has(m) && !shouldDeliverToMutedAgent({
       agentId: m,
       conversationKind: conversation?.kind ?? 'group',
@@ -602,21 +610,17 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     }
   }
 
-  // Always parallel fan-out. We tried a scheduler-side serial queue
+  // Always parallel fan-out for the selected audience. We tried a scheduler-side serial queue
   // for @all (stagger → event-driven Redis state machine) — both
   // worked mechanically but felt like nothing a real team would do.
   // Real coordination happens at the AGENT level: see the room,
   // glance once more before committing, defer when a peer is on it.
   // Those affordances live in pod-agent + the `cumora glance` tool +
   // the broadcast etiquette section of the persona prompt — the
-  // scheduler wakes every subscribed, non-muted agent at the same time,
-  // like a Slack room. A muted agent only passes through for an exact
-  // mention or quoted reply.
+  // ordinary messages wake every subscribed, non-muted agent at the same
+  // time, like a Slack room. Explicit named mentions are narrowed before
+  // fan-out. A muted agent only passes through for an exact mention or quote.
   await fanOutWake(recipients, conversationId, steerPayload)
-}
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 /** Muted rooms are genuinely absent from an agent's delivery stream. The
@@ -631,8 +635,7 @@ export function shouldDeliverToMutedAgent(args: {
 }): boolean {
   if (args.conversationKind === 'direct') return true
   if (args.quotedAuthorId === args.agentId) return true
-  const mention = new RegExp(`(^|[^\\w@])@${escapeRegex(args.agentId)}(?![\\w-])`, 'i')
-  return mention.test(args.body)
+  return hasExactMention(args.body, args.agentId)
 }
 
 /** Exported for tests — pulled out of `wake` so the wake-policy is

@@ -450,9 +450,9 @@ async function postDocMentionWake(args: {
   const messageId = `m-${randomUUID()}`
   const body = `@${agentId} heads-up — I @-mentioned you in the doc "${documentTitle}". Take a look with \`cumora doc read ${documentId}\`, then either reply here or edit the doc directly (\`cumora doc append/replace ${documentId} …\`).`
   await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-     VALUES ($1, $2, $3, 'text', $4, $5, $6)`,
-    [messageId, conversationId, mentionerId, body, sequence, companyId],
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id, agent_recipient_ids)
+     VALUES ($1, $2, $3, 'text', $4, $5, $6, $7::jsonb)`,
+    [messageId, conversationId, mentionerId, body, sequence, companyId, JSON.stringify([agentId])],
   )
   await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
 
@@ -471,6 +471,7 @@ async function postDocMentionWake(args: {
       body,
       sequence,
       at: new Date().toISOString(),
+      agentRecipientIds: [agentId],
     },
   }
   await publish(CH_MESSAGE_NEW, event)

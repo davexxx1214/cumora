@@ -3,10 +3,10 @@
  *
  * Mailbox model (instead of server-side classifier + cascade):
  *   1. A new message lands in any conversation.
- *   2. The scheduler publishes a wake to every agent member of that conversation
- *      (except the author). Per-agent serial; coalesces bursts.
+ *   2. The scheduler publishes a wake to the delivered agent audience
+ *      (named @agents, otherwise every agent member except the author).
  *   3. Each waking agent enters runAgentTurn:
- *        - Loads its inbox (everything since its last_read_at, across all convos)
+ *        - Loads its inbox (delivered messages since its last_read_at, across all convos)
  *        - Runs a bounded multi-hop LLM/tool loop with `bash` for world actions
  *          and `set_turn_status` for the model's explicit turn-state protocol.
  *        - The LLM is prompted to read the inbox and decide what to do via

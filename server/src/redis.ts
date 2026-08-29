@@ -88,6 +88,9 @@ export interface MessageNewEvent extends TenantTagged {
     clientId?: string
     /** When this message is a reply, the id of the quoted-original. */
     quotedMessageId?: string
+    /** Durable agent delivery audience. null/omitted = normal room
+     *  broadcast; a non-empty list = only those named agents wake/read it. */
+    agentRecipientIds?: string[] | null
     /** Inlined summary so the renderer can draw the quote card on receipt
      *  without re-fetching. Matches the QuotedSummary shape used elsewhere. */
     quoted?: {

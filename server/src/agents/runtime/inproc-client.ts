@@ -192,6 +192,10 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
            SELECT * FROM messages mm
             WHERE mm.conversation_id = co.id
               AND mm.author_id <> $1
+              AND (
+                mm.agent_recipient_ids IS NULL
+                OR mm.agent_recipient_ids @> to_jsonb(ARRAY[$1::text])
+              )
               AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
               AND (
                 NOT co.muted
@@ -369,6 +373,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
          SELECT
             m.id, m.conversation_id, m.author_id, m.kind, m.body, m.sequence,
             m.created_at, m.attachment, m.quoted_message_id,
+            m.agent_recipient_ids,
             c.company_id,
             c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
             pr.name AS project_name,
@@ -419,7 +424,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                  WHERE qm.id = recent.quoted_message_id
                    AND qm.conversation_id = recent.conversation_id
               ) AS quoted,
-              (created_at > last_read_at AND author_id <> $1) AS is_unread,
+              (created_at > last_read_at AND author_id <> $1 AND
+                (agent_recipient_ids IS NULL OR agent_recipient_ids @> to_jsonb(ARRAY[$1::text]))) AS is_unread,
               (author_id = $1) AS is_self,
               COALESCE((
                 SELECT jsonb_agg(jsonb_build_object('emoji', emoji, 'users', users) ORDER BY count DESC, emoji ASC)
