@@ -234,7 +234,14 @@ export interface ConversationUpdatedEvent extends TenantTagged {
   type: 'conversation.updated'
   conversationId: string
   /** what changed (so clients can patch surgically instead of refetching) */
-  patch: { topic?: string | null; title?: string }
+  patch: { topic?: string | null; title?: string; projectId?: string | null }
+}
+
+export interface ProjectFilesChangedEvent extends TenantTagged {
+  type: 'project.files_changed'
+  conversationId: string
+  projectId: string
+  bindingVersion: string
 }
 
 export interface ConversationDissolvedEvent extends TenantTagged {
@@ -411,7 +418,7 @@ export interface WorkspaceMemberRemovedEvent extends TenantTagged {
   userId: string
 }
 
-export type BroadcastEvent = WorkspaceMemberRemovedEvent | MessageNewEvent | MessageDeltaEvent | TypingEvent
+export type BroadcastEvent = ProjectFilesChangedEvent | WorkspaceMemberRemovedEvent | MessageNewEvent | MessageDeltaEvent | TypingEvent
   | StatusEvent | AvatarEvent | ParticipantAddedEvent | ReactionsEvent
   | GroupPulledEvent | ConversationUpdatedEvent | ConversationDissolvedEvent | ConveneEvent
   | BoardEvent | DocIndexEvent | DocUpdateEvent | DocAwarenessEvent | DocMentionEvent | CalendarReminderEvent

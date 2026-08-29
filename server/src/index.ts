@@ -22,6 +22,7 @@ import { startStaleAgentRunSweeper } from './agents/observability.js'
 import { sweepOfflineComputers } from './agents/computer/registry.js'
 import { sweepStaleNamespaces } from './agents/runtime/fs-namespace.js'
 import { runtimeRouter } from './agents/runtime/server.js'
+import { projectMountRouter } from './project-files/mount-router.js'
 import { startCompletedPodGc, startClusterFuseMonitor, startChromeProfilePvcGc } from './agents/runtime/orchestrator.js'
 import { inboundEmailRouter } from './api/inbound-email.js'
 import { startEmailRetryWorker } from './email-retry.js'
@@ -109,10 +110,9 @@ async function main() {
   // becomes a no-op for these requests.
   app.use('/webhooks/email', inboundEmailRouter)
 
-  // Bumped from 256kb to 32mb because the upload endpoint takes base64-encoded
-  // file bodies up to MAX_UPLOAD_BYTES (25MB raw → ~34MB base64). R2-mode
-  // uploads bypass this limit entirely (browser PUTs directly to R2).
-  app.use(express.json({ limit: '34mb' }))
+  // A 25MiB file expands to 34,952,536 base64 bytes, plus its JSON envelope.
+  // Keep a narrow allowance above that exact supported boundary.
+  app.use(express.json({ limit: '36mb' }))
   if (storage.mode === 'local') {
     app.use('/uploads', express.static(UPLOAD_DIR, {
       fallthrough: false,
@@ -144,6 +144,7 @@ async function main() {
   // Per-pod agent runtime API — JWT-authed, completely separate from the
   // cookie-auth /api/* surface used by humans. See agents/runtime/server.ts.
   app.use('/runtime', runtimeRouter)
+  app.use('/project-fs', projectMountRouter)
 
   // ============== Host gating ==============
   // api.cumora.ai is JSON-only. The /api, /runtime, /uploads mounts above

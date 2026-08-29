@@ -19,7 +19,8 @@
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { execFileSync, type ChildProcess } from 'node:child_process'
+import { spawnTaskProcess as spawn } from './task-sandbox.js'
 import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'

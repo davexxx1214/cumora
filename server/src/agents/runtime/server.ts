@@ -27,6 +27,9 @@ import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+import { ProjectFileError } from '../../project-files/model.js'
+import { createProjectLease, currentAgentProject, filesEnabled, stopProjectLease } from '../../project-files/service.js'
+import { requireProjectHost } from '../../project-files/runtime-host.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -57,6 +60,7 @@ function withAgent(
     try {
       await handler(claims, req, res)
     } catch (err) {
+      if (err instanceof ProjectFileError) { res.status(err.status).json({ error: err.message, code: err.code }); return }
       const msg = err instanceof Error ? err.message : String(err)
       console.error(`[runtime] ${req.method} ${req.path} failed`, msg)
       res.status(500).json({ error: msg })
@@ -66,6 +70,24 @@ function withAgent(
 
 export const runtimeRouter: Router = Router()
 runtimeRouter.use(authMiddleware as never)
+
+runtimeRouter.get('/project-files/capabilities', withAgent(async (_c, _req, res) => {
+  res.json({ enabled: filesEnabled() })
+}))
+runtimeRouter.get('/project-files/context/:conversationId', withAgent(async (c, req, res) => {
+  requireProjectHost(req)
+  res.json(await currentAgentProject(c.sub, c.companyId ?? '', String(req.params.conversationId)))
+}))
+runtimeRouter.post('/project-files/leases', withAgent(async (c, req, res) => {
+  requireProjectHost(req)
+  res.json(await createProjectLease({ agentId: c.sub, companyId: c.companyId ?? '',
+    conversationId: String(req.body?.conversationId ?? ''), runId: String(req.body?.runId ?? ''), bindingVersion: String(req.body?.bindingVersion ?? '') }))
+}))
+runtimeRouter.post('/project-files/leases/:id/stopped', withAgent(async (c, req, res) => {
+  requireProjectHost(req)
+  await stopProjectLease({ id: String(req.params.id), agentId: c.sub, companyId: c.companyId ?? '' })
+  res.json({ ok: true })
+}))
 
 // ─── wake stream: server pushes events to the agent's long-running pod ─
 
@@ -149,10 +171,12 @@ runtimeRouter.get('/inbox', withAgent(async (c, req, res) => {
 // small brain, so judgment never leaves the operator's machine and never spends
 // cloud quota. This is the whole point of BYOA: local compute. NB: no regex
 // decides anything — every actionability/mode call is the small model's.
-runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
+runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, req, res) => {
   const persona = await inprocClient.loadPersona(c.sub)
   if (!persona) { res.status(404).json({ error: 'agent not found' }); return }
-  const inbox = await inprocClient.loadInbox(c.sub)
+  const allInbox = await inprocClient.loadInbox(c.sub)
+  const focus = typeof req.query.conversationId === 'string' ? req.query.conversationId : null
+  const inbox = focus ? allInbox.filter(row => row.conversation_id === focus) : allInbox
   const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
   // Content-blind cost floor (NOT a loop decision). The daemon self-polls every
   // 20s, bypassing the scheduler's fan-out rate limit, so a runaway could spin
@@ -201,9 +225,18 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
 // operator's quota; the operator's brain is spent only on the actual work. The
 // daemon gates calls behind a "quiet for N minutes" window (its anti-loop), so
 // this isn't hit every poll. Empty / non-actionable → { actionable: false }.
-runtimeRouter.get('/agenda', withAgent(async (c, _req, res) => {
+runtimeRouter.get('/agenda', withAgent(async (c, req, res) => {
   if (!c.companyId) { res.json({ actionable: false }); return }
   const agenda = await gatherAgentAgenda(c.sub, c.companyId)
+  let conversationId: string | null = null
+  if (req.query.singleConversation === '1') {
+    conversationId = agenda.events.find(e => e.target_conversation_id)?.target_conversation_id ?? agenda.stalls[0]?.conversationId ?? null
+    if (conversationId) {
+      agenda.events = agenda.events.filter(e => e.target_conversation_id === conversationId)
+      agenda.stalls = agenda.stalls.filter(s => s.conversationId === conversationId)
+      agenda.cards = [] // workspace cards have no project/conversation binding
+    } else agenda.stalls = []
+  }
   if (agenda.cards.length === 0 && agenda.events.length === 0 && agenda.stalls.length === 0) {
     res.json({ actionable: false, cards: 0, events: 0, stalls: 0 })
     return
@@ -237,6 +270,7 @@ runtimeRouter.get('/agenda', withAgent(async (c, _req, res) => {
   }
   res.json({
     actionable: true,
+    conversationId,
     focus: verdict.focus,
     brief: renderAgendaBrief(finalAgenda, verdict.focus),
     cards: finalAgenda.cards.length,

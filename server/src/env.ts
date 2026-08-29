@@ -316,6 +316,9 @@ export const env = {
   /** Self-hosted override for human members per workspace, including the
    *  owner. Applies to every tier; unset preserves the tier defaults. */
   WORKSPACE_HUMAN_LIMIT: optionalPositiveInteger('CUMORA_WORKSPACE_HUMAN_LIMIT'),
+  /** Phase-one project files stay disabled until the isolated runner is configured. */
+  PROJECT_FILES_ENABLED: process.env.CUMORA_PROJECT_FILES_ENABLED === '1',
+  PROJECT_FILES_ROOT: process.env.CUMORA_PROJECT_FILES_ROOT ?? '',
   /**
    * sub2api LLM quota gateway. When SUB2API_ADMIN_KEY is set, OAuth
    * signup provisions a per-user sub2api account + API key, and every

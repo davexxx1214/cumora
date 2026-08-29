@@ -19,7 +19,8 @@
  *   - `attachments/` — user uploads
  *   - `avatars/`     — agent portraits
  */
-import { writeFile, mkdir, readdir, stat, unlink } from 'node:fs/promises'
+import { writeFile, mkdir, readdir, stat, unlink, open, realpath } from 'node:fs/promises'
+import { constants } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
 import { createHmac } from 'node:crypto'
 import {
@@ -28,6 +29,7 @@ import {
 } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { env } from './env.js'
+import type { ProjectFileReference } from './project-files/model.js'
 
 /** Keys under these prefixes get HMAC-signed URLs when a signing secret is
  *  configured. Other prefixes (e.g. `avatars/`) are served unsigned — they
@@ -38,6 +40,9 @@ function needsSignature(key: string): boolean {
 }
 
 const STORAGE_KEY_PREFIXES = ['attachments/', 'email-attachments/', 'avatars/']
+function validateAttachmentReadKey(key: string): void {
+  if (!/^attachments\/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,16}$/u.test(key)) throw new Error('Only stored chat attachments can be copied into projects.')
+}
 function isStorageKey(key: string): boolean {
   return STORAGE_KEY_PREFIXES.some((p) => key.startsWith(p))
 }
@@ -104,6 +109,8 @@ export interface StorageObject {
 
 export interface Storage {
   mode: 'local' | 'r2'
+  /** Authenticated callers only. Read by a validated storage key, never a URL. */
+  read(key: string, maxBytes: number): Promise<Buffer>
   /** Write bytes synchronously from the server side (avatar gen path).
    *  Returns the resolved public URL. */
   put(key: string, body: Buffer, mime: string): Promise<string>
@@ -126,6 +133,18 @@ export interface Storage {
 
 class LocalStorage implements Storage {
   mode = 'local' as const
+
+  async read(key: string, maxBytes: number): Promise<Buffer> {
+    validateAttachmentReadKey(key)
+    const target = resolve(UPLOAD_DIR, key)
+    if (await realpath(dirname(target)) !== dirname(target)) throw new Error('Unsafe attachment directory.')
+    const file = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    try {
+      const info = await file.stat()
+      if (!info.isFile() || info.nlink !== 1 || info.size > maxBytes) throw new Error('Attachment unavailable or too large.')
+      return await file.readFile()
+    } finally { await file.close() }
+  }
 
   async put(key: string, body: Buffer, _mime: string): Promise<string> {
     const path = join(UPLOAD_DIR, key)
@@ -184,6 +203,20 @@ class R2Storage implements Storage {
   private publicBase: string
   private signingSecret: string
   private urlTtl: number
+
+  async read(key: string, maxBytes: number): Promise<Buffer> {
+    validateAttachmentReadKey(key)
+    const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }), { abortSignal: AbortSignal.timeout(30_000) })
+    if (!response.Body || (response.ContentLength ?? 0) > maxBytes) throw new Error('Attachment unavailable or too large.')
+    let size = 0
+    const parts: Buffer[] = []
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      size += chunk.length
+      if (size > maxBytes) throw new Error('Attachment too large.')
+      parts.push(Buffer.from(chunk))
+    }
+    return Buffer.concat(parts)
+  }
 
   constructor(opts: {
     endpoint: string; bucket: string;
@@ -337,6 +370,7 @@ export interface StoredAttachment {
   mime?: string
   size?: number
   key?: string
+  projectFile?: ProjectFileReference
   [extra: string]: unknown
 }
 
@@ -349,6 +383,7 @@ export async function freshenAttachmentUrl<T extends StoredAttachment | null | u
   att: T,
 ): Promise<T> {
   if (!att) return att
+  if (att.projectFile) return { ...att, url: '', key: undefined } as T
   // Re-sign from the stored key, or derive it from the (possibly already-signed)
   // url — older attachments persisted no `key`, and without this they'd be stuck
   // with a stale signed url that 403s once its TTL lapses.

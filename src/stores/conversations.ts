@@ -258,6 +258,13 @@ export function bootConversations() {
       }
       void useConversations.getState().reload()
     } else if (e.type === 'conversation.updated') {
+      if (e.patch.projectId !== undefined) {
+        // Drop the old mount immediately; fetch labels without retaining an old
+        // project's file panel while the refresh is in flight.
+        useConversations.setState(s => ({ list: s.list.map(c => c.id === e.conversationId ? { ...c, projectId: e.patch.projectId, projectName: null } : c) }))
+        void useConversations.getState().reload()
+        return
+      }
       // Surgical patch — apply patch fields to the matching conversation in
       // place without a full network reload.
       useConversations.setState((s) => ({

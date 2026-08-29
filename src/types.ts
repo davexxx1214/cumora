@@ -215,6 +215,7 @@ export interface Message {
     url?: string
     /** Storage key used to refresh expiring signed URLs. */
     key?: string
+    projectFile?: { projectId: string; entryId: string; versionId: string; name: string }
     mime?: string
     size?: number
     /** legacy descriptor — fallback when no real file is present (e.g. mock data) */

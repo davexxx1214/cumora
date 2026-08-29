@@ -5,8 +5,9 @@ import { useLongPress } from './useLongPress'
 import { MobileMessageTapback, type TapbackAction } from './MobileMessageTapback'
 import { useApp } from '@/stores/app'
 import { GroupInviteButton } from '@/components/GroupInviteButton'
+import { ProjectFilesButton } from '@/components/ProjectFilesButton'
 import { DissolveGroupDialog } from '@/components/DissolveGroupDialog'
-import { useMe, useCanManageWorkspace } from '@/stores/auth'
+import { useAuth, useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, toggleReaction, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
@@ -17,6 +18,7 @@ import { RichInput, type RichInputHandle } from '@/components/RichInput'
 import { ScrollToLatestButton } from '@/components/ScrollToLatestButton'
 import { IBack, IConvene, IMore, IClip, IAt, ISmile, ISend, ISearch } from '@/components/icons'
 import { api, type ApiAttachment } from '@/api/client'
+import { uploadConversationFile } from '@/api/project-files'
 import type { Message, Participant } from '@/types'
 import { cn } from '@/lib/utils'
 import { isImeComposing } from '@/lib/keyboard'
@@ -345,10 +347,13 @@ export function MobileChat() {
   }
 
   const upload = async (file: File) => {
+    const epoch = useAuth.getState().contextEpoch
+    const target = convoId
+    if (!target) return
     setUploading(true); setUploadError(null)
     try {
-      const a = await api.uploadFile(file)
-      setAttachment(a)
+      const a = await uploadConversationFile(target, file)
+      if (useAuth.getState().contextEpoch === epoch && useApp.getState().selectedConversationId === target) setAttachment(a)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       setUploadError(msg)
@@ -666,6 +671,7 @@ export function MobileChat() {
             )}
             <div className="min-w-0">
               <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[220px]">{attachment.name}</div>
+              {attachment.projectFile && <div className="text-xs text-skype-deep">{t('projectFiles.savedAttachment')}</div>}
               <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
             </div>
             <button
@@ -1207,6 +1213,7 @@ export function MobileChatInfo() {
             <AvatarStack ps={groupAgents} size={64} max={5} />
           </div>
           <div><GroupInviteButton conversationId={c.id} conversationName={c.title} /></div>
+          <div><ProjectFilesButton conversationId={c.id} /></div>
           {editingTitle ? (
             <input
               autoFocus

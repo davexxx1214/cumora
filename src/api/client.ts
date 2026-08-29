@@ -316,6 +316,7 @@ export interface ApiAttachment {
   size?: number
   /** Object-storage key, present when the file lives in R2. */
   key?: string
+  projectFile?: { projectId: string; entryId: string; versionId: string; name: string }
 }
 
 export interface UploadCapabilities {
@@ -1487,7 +1488,8 @@ export type WsEvent =
     } }
   | { type: 'message.reactions'; conversationId: string; messageId: string; reactions: Array<{ emoji: string; count: number; mine?: boolean; users?: string[] }> }
   | { type: 'group.pulled'; conversationId: string; pulledById: string }
-  | { type: 'conversation.updated'; conversationId: string; patch: { topic?: string | null; title?: string } }
+  | { type: 'conversation.updated'; conversationId: string; patch: { topic?: string | null; title?: string; projectId?: string | null } }
+  | { type: 'project.files_changed'; conversationId: string; projectId: string; bindingVersion: string }
   | { type: 'conversation.dissolved'; conversationId: string }
   | { type: 'convene'; sessionId: string; conversationId: string; kind: 'started' | 'transcript' | 'ended' | 'tile'; data?: unknown }
   | { type: 'board.changed'; kind:

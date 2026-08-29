@@ -32,6 +32,10 @@ import {
 } from '../agents/computer/registry.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
+import { projectFilesRouter } from './project-files-router.js'
+import { archiveProject, attachGroupProject, prepareGroupProjectStop, validateNewProjectBinding } from '../project-files/bindings.js'
+import { ProjectFileError } from '../project-files/model.js'
+import { projectAttachment } from '../project-files/references.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -95,6 +99,7 @@ interface AttachmentPayload {
   /** Storage key — present when the file lives in object storage; lets us
    *  resolve a fresh URL later without re-uploading. */
   key?: string
+  projectFile?: import('../project-files/model.js').ProjectFileReference
 }
 
 export const api = Router()
@@ -102,6 +107,7 @@ export const api = Router()
 // Every request goes through the auth middleware first; handlers that need
 // a logged-in user call `requireAuth(req)` which throws 401 otherwise.
 api.use(authMiddleware as never)
+api.use('/project-files', projectFilesRouter)
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message) }
@@ -383,6 +389,10 @@ function safe(handler: (req: Request & AuthedRequest, res: Response) => Promise<
  *  async route's rejection bubbles here in Express 5. HttpError → its status
  *  code; anything else → 500 with a generic message (real cause logged). */
 function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction): void {
+  if (err instanceof ProjectFileError) {
+    res.status(err.status).json({ error: err.message, code: err.code })
+    return
+  }
   if (err instanceof HttpError) {
     res.status(err.status).json({ error: err.message })
     return
@@ -1896,21 +1906,25 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
 /* ============== Projects ============== */
 
 api.get('/projects', async (req, res) => {
-  const { companyId: tenant } = await requireCompany(req)
+  const { companyId: tenant, userId: me } = await requireCompany(req)
   const { rows } = await pool.query(
     `SELECT id, name, description, color, status,
             created_at AS "createdAt", archived_at AS "archivedAt",
             (SELECT COUNT(*)::int FROM conversations WHERE project_id = projects.id) AS "conversationCount"
        FROM projects
-      WHERE company_id = $1
+      WHERE company_id = $1 AND (
+        EXISTS (SELECT 1 FROM conversations c WHERE c.project_id = projects.id AND c.members @> jsonb_build_array($2::text))
+        OR (NOT EXISTS (SELECT 1 FROM conversations c WHERE c.project_id = projects.id)
+            AND EXISTS (SELECT 1 FROM company_members cm WHERE cm.company_id = $1 AND cm.user_id = $2 AND cm.role IN ('owner','admin')))
+      )
       ORDER BY status ASC, created_at DESC`,
-    [tenant],
+    [tenant, me],
   )
   res.json(rows)
 })
 
 api.post('/projects', async (req, res) => {
-  const { companyId: tenant } = await requireCompany(req)
+  const { companyId: tenant } = await requireCompanyRole(req)
   const name = String(req.body?.name ?? '').trim().slice(0, 80)
   const description = String(req.body?.description ?? '').slice(0, 1000)
   const color = req.body?.color ? String(req.body.color).slice(0, 200) : null
@@ -1928,11 +1942,12 @@ api.put('/projects/:id', async (req, res) => {
   // Renaming or recoloring a shared project ripples through every member's
   // sidebar — gate to owner/admin so a single member can't unilaterally
   // re-brand the team's work.
-  const { companyId: tenant } = await requireCompanyRole(req)
+  const { userId: me, companyId: tenant } = await requireCompanyRole(req)
   const { id } = req.params
   const { rows: gate } = await pool.query(
-    `SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 LIMIT 1`,
-    [id, tenant],
+    `SELECT 1 FROM projects p WHERE p.id = $1 AND p.company_id = $2
+       AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.project_id = p.id AND NOT c.members @> $3::jsonb) LIMIT 1`,
+    [id, tenant, JSON.stringify([me])],
   )
   if (!gate[0]) { res.status(404).json({ error: 'not found' }); return }
   const sets: string[] = []
@@ -1953,45 +1968,28 @@ api.put('/projects/:id', async (req, res) => {
 api.post('/projects/:id/archive', async (req, res) => {
   // Archive/unarchive is destructive (hides every linked conversation from
   // the active list); owner/admin only.
-  const { companyId: tenant } = await requireCompanyRole(req)
+  const { userId: me, companyId: tenant } = await requireCompanyRole(req)
   const { id } = req.params
   const archive = req.body?.archive !== false
-  await pool.query(
-    archive
-      ? `UPDATE projects SET status = 'archived', archived_at = NOW() WHERE id = $1 AND company_id = $2`
-      : `UPDATE projects SET status = 'active', archived_at = NULL WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
-  )
+  await archiveProject(tenant, me, String(id), archive)
   res.json({ ok: true, status: archive ? 'archived' : 'active' })
 })
 
 /** Attach (or detach when projectId=null) a conversation to a project. */
 api.post('/conversations/:id/project', async (req, res) => {
-  const { userId: me, companyId: tenant } = await requireCompany(req)
+  const { userId: me, companyId: tenant } = await requireCompanyRole(req)
   const { id } = req.params
   const projectId = req.body?.projectId === null ? null
                   : (typeof req.body?.projectId === 'string' ? req.body.projectId.trim() : undefined)
   if (projectId === undefined) { res.status(400).json({ error: 'projectId required (string or null to detach)' }); return }
-  const { rows } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
-  )
-  if (!rows[0]) { res.status(404).json({ error: 'not found' }); return }
-  if (!rows[0].members.includes(me)) {
-    res.status(403).json({ error: 'only members can change the project' }); return
+  try {
+    const result = await attachGroupProject(tenant, me, String(id), projectId)
+    await publish(CH_CONVO_UPDATED, { type: 'conversation.updated', companyId: tenant, conversationId: String(id), patch: { projectId } }).catch(() => {})
+    res.json(result)
+  } catch (error) {
+    if (error instanceof ProjectFileError) res.status(error.status).json({ error: error.message, code: error.code })
+    else throw error
   }
-  if (projectId !== null) {
-    const { rows: pj } = await pool.query(
-      `SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 LIMIT 1`,
-      [projectId, tenant],
-    )
-    if (!pj[0]) { res.status(400).json({ error: 'unknown project' }); return }
-  }
-  await pool.query(
-    `UPDATE conversations SET project_id = $2, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, projectId, tenant],
-  )
-  res.json({ ok: true, projectId })
 })
 
 api.get('/participants', async (req, res) => {
@@ -3016,22 +3014,23 @@ api.post('/conversations', async (req, res) => {
     res.status(400).json({ error: `unknown participant(s): ${missing.join(', ')}` }); return
   }
 
-  // If a project was specified, validate it exists in this tenant.
-  if (projectId) {
-    const { rows: pj } = await pool.query(
-      `SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 LIMIT 1`,
-      [projectId, tenant],
-    )
-    if (!pj[0]) { res.status(400).json({ error: 'unknown project' }); return }
-  }
-
   const id = `g-${randomUUID().slice(0, 8)}`
-  await pool.query(
-    `INSERT INTO conversations (id, kind, title, topic, members, pinned, tag, pulled_by, company_id, project_id)
-     VALUES ($1, 'group', $2, $3, $4::jsonb, FALSE, NULL, NULL, $5, $6)`,
-    [id, title, topic, JSON.stringify(members), tenant, projectId],
-  )
-  await pool.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('SELECT id FROM companies WHERE id = $1 FOR UPDATE', [tenant])
+    if (projectId) await validateNewProjectBinding(client, tenant, me, projectId)
+    await client.query(
+      `INSERT INTO conversations (id, kind, title, topic, members, pinned, tag, pulled_by, company_id, project_id)
+       VALUES ($1, 'group', $2, $3, $4::jsonb, FALSE, NULL, NULL, $5, $6)`,
+      [id, title, topic, JSON.stringify(members), tenant, projectId])
+    await client.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    if (error instanceof ProjectFileError) { res.status(error.status).json({ code: error.code, error: error.message }); return }
+    throw error
+  } finally { client.release() }
   res.status(201).json({ id, members, projectId })
 })
 
@@ -3041,6 +3040,10 @@ api.post('/conversations', async (req, res) => {
 api.delete('/conversations/:id', safe(async (req, res) => {
   const { userId: me, companyId } = await requireCompanyRole(req)
   const id = String(req.params.id)
+  try { await prepareGroupProjectStop(companyId, me, id) } catch (error) {
+    if (error instanceof ProjectFileError) throw new HttpError(error.status, error.message)
+    throw error
+  }
   let members: string[] = []
   let calendarIds: string[] = []
   const client = await pool.connect()
@@ -3592,7 +3595,9 @@ api.post('/conversations/:id/messages', async (req, res) => {
   let attachment: AttachmentPayload | null = null
   if (rawAttachment && typeof rawAttachment === 'object') {
     const a = rawAttachment as Record<string, unknown>
-    if (typeof a.url === 'string' && typeof a.name === 'string') {
+    if (a.projectFile) {
+      attachment = await projectAttachment({ kind: 'human', id: me, companyId: tenant }, String(id), a.projectFile)
+    } else if (typeof a.url === 'string' && typeof a.name === 'string') {
       attachment = {
         url: a.url,
         name: a.name,

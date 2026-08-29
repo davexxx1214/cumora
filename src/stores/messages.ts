@@ -707,6 +707,7 @@ export async function sendUserMessage(
           kind: attachment.kind,
           url: attachment.url,
           key: attachment.key,
+          projectFile: attachment.projectFile,
           mime: attachment.mime,
           size: attachment.size,
         }
@@ -787,7 +788,7 @@ export async function retryFailedMessage(convoId: string, tempId: string): Promi
   const body = msg.body ?? ''
   const att = msg.attachment
   const retryAttachment: import('@/api/client').ApiAttachment | null = att
-    ? { url: att.url ?? '', name: att.name, kind: att.kind, key: att.key, mime: att.mime, size: att.size }
+    ? { url: att.url ?? '', name: att.name, kind: att.kind, key: att.key, mime: att.mime, size: att.size, projectFile: att.projectFile }
     : null
   const quotedId = msg.quotedMessageId ?? null
   const clientId = msg.clientId ?? tempId

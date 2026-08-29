@@ -4,6 +4,7 @@
  * schema exists via plain DDL so a fresh DATABASE_URL becomes a working app.
  */
 import { pool } from './pool.js'
+import { PROJECT_FILES_DDL } from '../project-files/ddl.js'
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -898,6 +899,8 @@ CREATE INDEX IF NOT EXISTS idx_projects_company ON projects(company_id, status);
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS project_id TEXT
   REFERENCES projects(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id);
+
+${PROJECT_FILES_DDL}
 
 -- ============== Company invitations =====================================
 -- Owners / admins mint short URL-safe tokens that anyone can redeem to
@@ -2194,6 +2197,11 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
         -- Shipping is the latest product-domain addition. Never take the
         -- lock-contention shortcut on a pod that has not created its core table.
         AND (SELECT count(*) FROM pg_class WHERE relname = 'shipping_features') > 0
+        AND to_regclass('project_file_spaces') IS NOT NULL
+        AND to_regclass('project_file_bindings') IS NOT NULL
+        AND to_regclass('project_file_leases') IS NOT NULL
+        AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'projects' AND column_name = 'file_binding_version')
+        AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'project_binding_guard')
         AS ok
     `)
     return rows[0]?.ok === true

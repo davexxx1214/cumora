@@ -13,6 +13,8 @@ import { TwEmoji } from './TwEmoji'
 import { cn, parseBody, parseBlocks } from '@/lib/utils'
 import { IBoard, ICalendar, IFile, IFigma, IMail } from './icons'
 import { ImageViewer } from './ImageViewer'
+import { ProjectFileCard } from './ProjectFileCard'
+import { SaveAttachmentToProject } from './SaveAttachmentToProject'
 import { useParticipants } from '@/stores/participants'
 import { useApp } from '@/stores/app'
 import { useMe } from '@/stores/auth'
@@ -946,9 +948,15 @@ function ToolCard({ msg }: { msg: Message }) {
 }
 
 function AttachmentCard({ msg }: { msg: Message }) {
+  return <><AttachmentContent msg={msg} />{msg.attachment && !msg.attachment.projectFile &&
+    <SaveAttachmentToProject conversationId={msg.conversationId} messageId={msg.id} name={msg.attachment.name} />}</>
+}
+
+function AttachmentContent({ msg }: { msg: Message }) {
   const [viewerOpen, setViewerOpen] = useState(false)
   if (!msg.attachment) return null
   const a = msg.attachment
+  if (a.projectFile) return <ProjectFileCard reference={a.projectFile} size={a.size} />
 
   // Real image with a URL: render inline; clicking opens the lightbox.
   if (a.kind === 'img' && a.url) {

@@ -1,0 +1,72 @@
+{
+  "checkedAt": "2026-08-28T15:28:50.624Z",
+  "snapshot": {
+    "platform": "linux",
+    "uid": 1000,
+    "fuse": {
+      "characterDevice": true,
+      "accessible": true,
+      "error": null
+    },
+    "namespaces": {
+      "available": true,
+      "error": null
+    },
+    "dataRoot": {
+      "path": "/home/box",
+      "exists": true,
+      "directory": true,
+      "writable": true,
+      "mount": {
+        "target": "/",
+        "filesystem": "overlay",
+        "readOnly": false
+      },
+      "availableBytes": 118539640832
+    }
+  },
+  "prototypeEligible": true,
+  "productionReady": false,
+  "checks": [
+    {
+      "id": "linux",
+      "status": "pass",
+      "detail": "The first implementation requires Linux."
+    },
+    {
+      "id": "fuse-device",
+      "status": "pass",
+      "detail": "/dev/fuse is a character device and can be opened."
+    },
+    {
+      "id": "task-namespaces",
+      "status": "pass",
+      "detail": "Unprivileged user, mount and PID namespace creation succeeded."
+    },
+    {
+      "id": "data-directory",
+      "status": "pass",
+      "detail": "The selected data root must be an existing writable directory."
+    },
+    {
+      "id": "persistent-storage",
+      "status": "fail",
+      "detail": "The selected directory is on overlay; container-replacement durability is not established."
+    },
+    {
+      "id": "real-mount-behaviour",
+      "status": "unverified",
+      "detail": "Opening /dev/fuse is not a mount or filesystem correctness test."
+    },
+    {
+      "id": "task-access-isolation",
+      "status": "unverified",
+      "detail": "Namespaces alone do not hide the backing store or revoke open handles; test the actual runner."
+    },
+    {
+      "id": "restart-recovery",
+      "status": "unverified",
+      "detail": "Verify service supervision, durable commits, backup and restore before enabling the feature."
+    }
+  ]
+}

@@ -27,6 +27,8 @@ import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
+import { controlledTasksEnabled, freshProjectHome, prepareTaskAuth, sandboxConfig, withTaskSandbox } from './task-sandbox.js'
+import { localProjectServer, projectHostRequest, projectTaskPrompt, recoverProjectStops, selectProjectTaskRows, trackProjectTask, type ProjectTaskContext, type ProjectTaskLease } from './project-task.js'
 import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
@@ -980,6 +982,7 @@ class AgentRunner {
   private readonly teardown = new AbortController()
   private token = ''
   private tokenExpiresAt = 0
+  private projectFilesMode = false
   private home: string
   private binDir: string
   private sessionFile: string
@@ -1170,9 +1173,14 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
+    const token = await this.ensureToken()
+    const capabilities = await runtimeGet<{ enabled: boolean }>(this.cfg.serverUrl, '/project-files/capabilities', token)
+    this.projectFilesMode = capabilities?.enabled === true
+    if (this.projectFilesMode && !controlledTasksEnabled()) throw new Error('This server requires controlled Linux project tasks. Configure the local project task runner before starting this computer.')
     await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
     await writeShim(this.binDir)
-    await this.loadSessionId()
+    if (!this.projectFilesMode) await this.loadSessionId()
+    else { await sandboxConfig(this.home, localProjectServer()); await recoverProjectStops(this.agent.id, token) }
     void this.streamLoop()
     // SSE-independent safety net (see INBOX_POLL_MS): drain the inbox on a slow
     // tick so a wake lost to a half-dead stream is still picked up within the
@@ -1263,6 +1271,7 @@ class AgentRunner {
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
   private ensureEngineSession(): EngineSession | null {
+    if (this.projectFilesMode) return null // no session or process crosses task/project boundaries
     if (!this.adapter.startSession) return null
     if (this.engineSession?.alive) return this.engineSession
     this.engineSession = this.adapter.startSession({
@@ -1283,6 +1292,46 @@ class AgentRunner {
       console.log(`[computer] ${this.agent.id} engine session ${this.sessionId ? `respawned (resume ${this.sessionId.slice(0, 8)})` : 'spawned fresh'} — persistent, no per-wake cold start`)
     }
     return this.engineSession
+  }
+
+  private async isolatedEngine<T>(home: string, work: () => Promise<T>): Promise<T> {
+    if (!this.projectFilesMode) return work()
+    await prepareTaskAuth(home)
+    return withTaskSandbox(await sandboxConfig(home, localProjectServer()), work)
+  }
+
+  private async runProjectTask(token: string, conversationId: string, runId: string | undefined, context: ProjectTaskContext, digest: string): Promise<EngineRunResult> {
+    if (!runId || !context.projectId || !context.bindingVersion) throw new Error('A project task requires a current binding and active run.')
+    await recoverProjectStops(this.agent.id, token)
+    const home = await freshProjectHome(this.agent.id)
+    // Persona only: do not copy the previous home, memory, engine sessions,
+    // project instructions, or skills which scan project folders at startup.
+    const persona = `You are ${this.agent.name}. Role: ${this.agent.role ?? 'teammate'}.\n${this.agent.systemPrompt ?? ''}\n\nProject task isolation applies: follow the explicit task prompt; do not scan project files or persist their contents to global memory.\n`
+    await writeFile(join(home, 'AGENTS.md'), persona, { mode: 0o600 })
+    await writeFile(join(home, 'CLAUDE.md'), persona, { mode: 0o600 })
+    await writeShim(join(home, 'bin'))
+    await prepareTaskAuth(home)
+    const lease = await projectHostRequest<ProjectTaskLease>(token, '/leases', { conversationId, runId, bindingVersion: context.bindingVersion })
+    const tracked = await trackProjectTask(this.agent.id, lease).catch(async error => {
+      // No process has started: release this lease even if registry creation fails.
+      await projectHostRequest(token, `/leases/${encodeURIComponent(lease.id)}/stopped`, {}).catch(() => {})
+      throw error
+    })
+    try {
+      const sandbox = await sandboxConfig(home, localProjectServer(), lease)
+      sandbox.onSpawn = tracked.onSpawn
+      return await withTaskSandbox(sandbox, () => this.adapter.run({
+        home, prompt: projectTaskPrompt({ conversationId, projectId: lease.projectId, digest }),
+        env: { ...this.engineEnv(), CUMORA_AGENT_RUNTIME_URL: `${localProjectServer()}/project-fs`, CUMORA_AGENT_RUNTIME_TOKEN: lease.token,
+          CUMORA_AGENT_RUNTIME_TOKEN_FILE: undefined, CUMORA_PROJECT_ID: lease.projectId, CUMORA_PROJECT_PATH: lease.path, CUMORA_CONVERSATION_ID: conversationId },
+        model: this.engineModel(), fastModel: this.engineFastModel(), resumeSessionId: null,
+        onLog: line => this.logEngineLine(line), onHopUsage: r => this.onEngineHop(r, 'agent-turn'), signal: this.teardown.signal,
+      }))
+    } finally {
+      // A lost acknowledgment is retried from the registry; never claim a
+      // running process stopped or reactivate its lease after a server restart.
+      await tracked.stopped(await this.ensureToken()).catch(error => console.warn(`[computer] project stop acknowledgment pending: ${error instanceof Error ? error.message : String(error)}`))
+    }
   }
 
   private visibleEngineError(exitCode: number, detail?: string): string {
@@ -1368,8 +1417,8 @@ class AgentRunner {
    *  engine's cheap fast model (Claude Haiku), NOT a cloud call. The server only
    *  builds the prompt (it has the DB for inbox+context); inference is 100%
    *  local: no network model hop, no sub2api quota (429/503), no big brain. */
-  private async inboxTriage(token: string): Promise<RuntimeInboxTriageResponse | null> {
-    const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, '/inbox-triage/payload', token)
+  private async inboxTriage(token: string, conversationId?: string): Promise<RuntimeInboxTriageResponse | null> {
+    const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, `/inbox-triage/payload${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`, token)
     if (!payload) return null
     if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
     if (!payload.instructions || !payload.input) return null
@@ -1385,14 +1434,15 @@ class AgentRunner {
     let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
     try {
       await mkdir(TRIAGE_DIR, { recursive: true })
-      res = await this.adapter.classify({
-        cwd: TRIAGE_DIR,
+      const triageHome = this.projectFilesMode ? await freshProjectHome(`${this.agent.id}-triage`) : TRIAGE_DIR
+      res = await this.isolatedEngine(triageHome, () => this.adapter.classify({
+        cwd: triageHome,
         prompt: `${payload.instructions}\n\n${payload.input}`,
         env: this.engineEnv(),
         // Engine picks its own cheap default; CUMORA_TRIAGE_MODEL overrides it.
         model: process.env.CUMORA_TRIAGE_MODEL,
         signal: controller.signal,
-      })
+      }))
     } catch (err) {
       res = { text: '', error: err instanceof Error ? err.message : String(err) }
     } finally {
@@ -1522,8 +1572,11 @@ class AgentRunner {
     } catch { return null }
   }
 
-  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
-    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
+  private async snapshotUnread(token: string, focus?: string | null): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
+    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, this.projectFilesMode ? '/inbox?probe=1' : '/inbox', token)
+    if (this.projectFilesMode && inbox?.rows) {
+      inbox.rows = selectProjectTaskRows(inbox.rows, focus)
+    }
     const seen = new Map<string, string>()
     // Unread grouped BY CONVERSATION (first-seen order), each with the header
     // (title + topic) the cloud agent's context also carries — so a BYOA agent
@@ -1742,8 +1795,8 @@ class AgentRunner {
       console.log(`[computer] ${this.agent.id} agenda skip: engine rate-limit cooldown, ${leftS}s left`)
       return
     }
-    const ag = await runtimeGet<{ actionable?: boolean; brief?: string; focus?: string }>(
-      this.cfg.serverUrl, '/agenda', token,
+    const ag = await runtimeGet<{ actionable?: boolean; brief?: string; focus?: string; conversationId?: string | null }>(
+      this.cfg.serverUrl, this.projectFilesMode ? '/agenda?singleConversation=1' : '/agenda', token,
     )
     if (!ag?.actionable || !ag.brief) return
     console.log(`[computer] ${this.agent.id} agenda turn START — proactive board work${ag.focus ? `: ${ag.focus.slice(0, 80)}` : ''}`)
@@ -1768,34 +1821,42 @@ class AgentRunner {
     await bigBrainSem.acquire()
     await spawnPacer.gate()
     try {
+      const projectContext = this.projectFilesMode && ag.conversationId
+        ? await projectHostRequest<ProjectTaskContext>(token, `/context/${encodeURIComponent(ag.conversationId)}`) : null
+      if (projectContext?.projectId && ag.conversationId) {
+        const result = await this.runProjectTask(token, ag.conversationId, run?.runId, projectContext, `Scheduled work, not permission to scan all files:\n${ag.brief}`)
+        exitCode = result.exitCode; turnUsage = result.usage; turnModel = result.model
+        if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
+      } else {
       const [memoryDigest, roster] = await Promise.all([
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
-      const resumeSessionId = this.sessionId
+      const resumeSessionId = this.projectFilesMode ? null : this.sessionId
       const session = this.ensureEngineSession()
       const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster))
       const result = session
         ? await session.send(prompt)
-        : await this.adapter.run({
+        : await this.isolatedEngine(this.home, () => this.adapter.run({
           home: this.home, prompt, env: this.engineEnv(),
           model: this.engineModel(), fastModel: this.engineFastModel(),
-          resumeSessionId: this.sessionId, onLog: (line) => this.logEngineLine(line),
+          resumeSessionId, onLog: (line) => this.logEngineLine(line),
           // Same trajectory hook as the persistent-session path so the
           // one-shot fallback (or codex `exec` path) also lands hops in the
           // universal ledger.
           onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
           signal: this.teardown.signal,
-        })
+        }))
       if (session?.sessionId) this.setSessionId(session.sessionId)
       if (session && !session.alive) this.engineSession = null
-      if (!session && result.sessionId) this.setSessionId(result.sessionId)
+      if (!this.projectFilesMode && !session && result.sessionId) this.setSessionId(result.sessionId)
       exitCode = result.exitCode
       turnUsage = result.usage
       turnModel = result.model
       if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
       if (engineError && this.mustResetSession(engineError, !!resumeSessionId)) {
         this.resetEngineSession(this.resetReason(engineError))
+      }
       }
     } catch (err) {
       exitCode = 1
@@ -1984,7 +2045,7 @@ class AgentRunner {
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
-        const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token)
+        const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token, wakeConvo)
         // Which conversation should show "<agent> is typing…"? Prefer the one the
         // wake named, but fall back to the unread we just snapshotted, because a
         // wake often carries no conversation at all:
@@ -1998,7 +2059,7 @@ class AgentRunner {
         // Both cases are exactly when a human IS waiting, and with no indicator
         // the agent reads as dead: it can work for minutes — engine spawned, turn
         // running — while the room shows nothing at all.
-        const convo = typingConversation(wakeConvo, seen)
+        const convo = typingConversation(this.projectFilesMode ? null : wakeConvo, seen)
         // HARD COST GATE (content-blind, fail-closed): if nothing unread is a
         // real human/agent message — empty, or system-only relays/status/
         // membership notices — NEVER run triage and NEVER spawn the big engine.
@@ -2017,7 +2078,7 @@ class AgentRunner {
           await this.maybeAgendaTurn(token)
           continue
         }
-        const triage = await this.inboxTriage(token)
+        const triage = await this.inboxTriage(token, this.projectFilesMode ? convo ?? undefined : undefined)
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
         // Triage was rate-limited → STOP. Do NOT retry, do NOT wake the big brain,
         // do NOT ack (the message is retried after the cooldown). Back off
@@ -2128,6 +2189,13 @@ class AgentRunner {
           console.log(`[computer] ${this.agent.id} big-brain sem acquired (queue depth was ${semQueueDepth + 1} including self)`)
         }
         try {
+          const projectContext = this.projectFilesMode && convo
+            ? await projectHostRequest<ProjectTaskContext>(token, `/context/${encodeURIComponent(convo)}`) : null
+          if (projectContext?.projectId && convo) {
+            const result = await this.runProjectTask(token, convo, run?.runId, projectContext, digest)
+            exitCode = result.exitCode; turnUsage = result.usage; turnModel = result.model
+            if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
+          } else {
           const [memoryDigest, triageNote, roster] = await Promise.all([
             this.memoryDigest(projectIds),
             Promise.resolve(this.formatTriageNote(triage)),
@@ -2138,7 +2206,7 @@ class AgentRunner {
             runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
-          const resumeSessionId = this.sessionId
+          const resumeSessionId = this.projectFilesMode ? null : this.sessionId
           let result: EngineRunResult
           const session = this.ensureEngineSession()
           // Standing scaffold rides the session's system-prompt file; send only the
@@ -2163,7 +2231,7 @@ class AgentRunner {
             if (!session.alive) this.engineSession = null
           } else {
             // One-shot path: Cursor, Codex fallback, or a custom args override.
-            result = await this.adapter.run({
+            result = await this.isolatedEngine(this.home, () => this.adapter.run({
               home: this.home,
               prompt,
               env: this.engineEnv(),
@@ -2173,8 +2241,8 @@ class AgentRunner {
               onLog: (line) => this.logEngineLine(line),
               onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
               signal: this.teardown.signal,
-            })
-            if (result.sessionId) this.setSessionId(result.sessionId)
+            }))
+            if (!this.projectFilesMode && result.sessionId) this.setSessionId(result.sessionId)
           }
           exitCode = result.exitCode
           turnUsage = result.usage
@@ -2185,6 +2253,7 @@ class AgentRunner {
           // the next wake starts clean (otherwise --resume re-overflows forever).
           if (engineError && this.mustResetSession(engineError, !!resumeSessionId)) {
             this.resetEngineSession(this.resetReason(engineError))
+          }
           }
         } catch (err) {
           console.error(`[computer] ${this.agent.id} engine spawn failed:`, err instanceof Error ? err.message : err)

@@ -7,9 +7,11 @@ import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
 import type { MessagesState } from '@/stores/messages'
 import { api, type ApiAttachment } from '@/api/client'
+import { uploadConversationFile } from '@/api/project-files'
 import { Avatar, AvatarStack } from '@/components/Avatar'
 import { MembersPopover } from '@/components/MembersPopover'
 import { GroupInviteButton } from '@/components/GroupInviteButton'
+import { ProjectFilesButton } from '@/components/ProjectFilesButton'
 import { PreviewText } from '@/components/PreviewText'
 import { RichInput, type RichInputHandle } from '@/components/RichInput'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
@@ -306,6 +308,7 @@ function ChatHeader({
           action in this header. */}
       <div className="flex gap-1 text-ink-500 shrink-0">
         {c.kind === 'group' && <GroupInviteButton conversationId={c.id} conversationName={c.title} />}
+        {c.kind === 'group' && <ProjectFilesButton conversationId={c.id} />}
         <button
           onClick={onToggleSearch}
           title={t('chat.search')}
@@ -760,7 +763,7 @@ export function Composer({
     setUploadingForScope(targetScope, true)
     setUploadErrorForScope(targetScope, null)
     try {
-      const a = await api.uploadFile(file)
+      const a = await uploadConversationFile(convoId, file)
       setAttachmentForScope(targetScope, a)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -1039,6 +1042,7 @@ export function Composer({
             )}
             <div className="min-w-0">
               <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[260px]">{attachment.name}</div>
+              {attachment.projectFile && <div className="text-xs text-skype-deep">{t('projectFiles.savedAttachment')}</div>}
               <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
             </div>
             <button
