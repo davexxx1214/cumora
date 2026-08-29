@@ -26,15 +26,14 @@
  *   • already_member — they already belong; just route them in.
  *   • not_found — bad link.
  */
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { api, ws, type ApiInvitationPreview } from '@/api/client'
-import { useApp } from '@/stores/app'
-import { useConversations } from '@/stores/conversations'
-import { useAuth } from '@/stores/auth'
-import { isElectron, isWebAppHost } from '@/lib/runtime'
+import { type FormEvent, useCallback, useEffect, useState } from 'react'
+import { type ApiInvitationPreview, api, ws } from '@/api/client'
 import { useT } from '@/lib/i18n'
+import { isElectron } from '@/lib/runtime'
+import { useApp } from '@/stores/app'
+import { useAuth } from '@/stores/auth'
+import { useConversations } from '@/stores/conversations'
 import { CloudLogo } from './Avatar'
-import { GetDesktopAppLink } from './GetDesktopAppLink'
 import { WindowDragStrip } from './WindowDragStrip'
 
 const INVITE_TOKEN_KEY = 'cumora.pending-invite'
@@ -122,12 +121,6 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
   const [previewErr, setPreviewErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [acceptErr, setAcceptErr] = useState<string | null>(null)
-  // After a successful accept in the WEB build, we stop on a success
-  // screen with "Open in Cumora app" + "Download" CTAs instead of
-  // dropping the user straight into the SPA. The desktop app skips
-  // this — they're already in the app, so we route them in.
-  const [joinedCompany, setJoinedCompany] = useState<{ id: string; name: string; slug: string } | null>(null)
-
   const loadPreview = useCallback(async () => {
     setPreviewErr(null)
     try {
@@ -193,10 +186,9 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
     if (preview?.status !== 'valid') return
     if (preview.invitation?.conversation) return // group join is an explicit click
     if (busy) return
-    if (joinedCompany) return  // already redeemed — don't re-POST in a loop
     if (acceptErr) return      // failed accept — show the error, don't fall into AuthedApp
     void accept()
-  }, [tokenStr, preview, busy, accept, joinedCompany, acceptErr])
+  }, [tokenStr, preview, busy, accept, acceptErr])
 
   // already_member: auto-switch into the invited workspace instead of
   // parking on "Open desktop" (self-hosted has no native app, and a
@@ -231,14 +223,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
       >
         <CloudLogo size={56} />
 
-        {joinedCompany && (
-          <JoinedSuccessBlock
-            companyName={joinedCompany.name}
-            onContinueInBrowser={() => { setJoinedCompany(null); onDone() }}
-          />
-        )}
-
-        {!joinedCompany && previewErr && (
+        {previewErr && (
           <ErrorBlock
             title={t('inviteAccept.couldntLoadTitle')}
             body={previewErr}
@@ -246,11 +231,11 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           />
         )}
 
-        {!joinedCompany && !preview && !previewErr && (
+        {!preview && !previewErr && (
           <div className="text-[13px] text-ink-400 italic font-display">{t('inviteAccept.checking')}</div>
         )}
 
-        {!joinedCompany && preview && preview.status === 'not_found' && (
+        {preview && preview.status === 'not_found' && (
           <ErrorBlock
             title={t('inviteAccept.linkBrokenTitle')}
             body={t('inviteAccept.linkBrokenBody')}
@@ -258,7 +243,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           />
         )}
 
-        {!joinedCompany && preview && preview.status === 'revoked' && (
+        {preview && preview.status === 'revoked' && (
           <ErrorBlock
             title={t('inviteAccept.revokedTitle')}
             body={t('inviteAccept.revokedBody', { name: companyName })}
@@ -266,7 +251,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           />
         )}
 
-        {!joinedCompany && preview && preview.status === 'expired' && (
+        {preview && preview.status === 'expired' && (
           <ErrorBlock
             title={t('inviteAccept.expiredTitle')}
             body={t('inviteAccept.expiredBody', { name: companyName })}
@@ -274,7 +259,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           />
         )}
 
-        {!joinedCompany && preview && preview.status === 'consumed' && (
+        {preview && preview.status === 'consumed' && (
           <ErrorBlock
             title={t('inviteAccept.usedTitle')}
             body={t('inviteAccept.usedBody', { name: companyName })}
@@ -282,7 +267,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           />
         )}
 
-        {!joinedCompany && preview && preview.status === 'wrong_email' && inv && (
+        {preview && preview.status === 'wrong_email' && inv && (
           <div className="flex flex-col items-center gap-4 text-center">
             <h1 className="font-display text-[20px] text-ink-900">{t('inviteAccept.wrongAccount')}</h1>
             <p className="text-[13px] text-ink-500 font-display italic leading-relaxed">
@@ -300,7 +285,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           </div>
         )}
 
-        {!joinedCompany && preview && preview.status === 'already_member' && (
+        {preview && preview.status === 'already_member' && (
           <AlreadyMemberBlock
             companyName={companyName}
             onSwitchInBrowser={() => {
@@ -311,7 +296,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           />
         )}
 
-        {!joinedCompany && preview && preview.status === 'valid' && inv && (
+        {preview && preview.status === 'valid' && inv && (
           <div className="flex flex-col items-center gap-5 text-center w-full">
             <div className="space-y-1">
               <div className="text-[12.5px] text-ink-400 font-display italic">
@@ -365,68 +350,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
   )
 }
 
-/** Best-effort cumora:// deep link. If the OS protocol handler isn't
- *  registered, browsers fail silently (no broken-page) and the user just
- *  stays put — at which point the visible Download button below is the
- *  next thing they reach for. */
-function tryOpenDesktopApp() {
-  try { location.href = 'cumora://open' } catch { /* swallow */ }
-}
-
-/** Success state shown after a successful accept in the WEB build. Offers
- *  "Open in Cumora app" (best-effort cumora:// deep link) and a download
- *  CTA, with "continue in browser" as the soft fallback. */
-function JoinedSuccessBlock({ companyName, onContinueInBrowser }: {
-  companyName: string
-  onContinueInBrowser: () => void
-}) {
-  const t = useT()
-  return (
-    <div className="flex flex-col items-center gap-5 text-center w-full">
-      <div
-        className="w-12 h-12 rounded-full grid place-items-center"
-        style={{ background: 'var(--sky-100)', color: 'var(--skype-deep)' }}
-        aria-hidden
-      >
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="20 6 9 17 4 12"/>
-        </svg>
-      </div>
-      <div className="space-y-1">
-        <h1 className="font-display text-[22px] tracking-tight text-ink-900">
-          {t('inviteAccept.welcomeTo', { name: companyName })}
-        </h1>
-        <p className="text-[12.5px] text-ink-500 font-display italic">
-          {t('inviteAccept.welcomeBody')}
-        </p>
-      </div>
-      <div className="w-full flex flex-col gap-2.5">
-        <button
-          onClick={tryOpenDesktopApp}
-          className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-white transition"
-          style={{
-            background: 'var(--skype)',
-            boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
-          }}
-        >{t('inviteAccept.openApp')}</button>
-        <GetDesktopAppLink variant="button-secondary" />
-        {!isWebAppHost && (
-          <button
-            onClick={onContinueInBrowser}
-            className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
-          >{t('inviteAccept.continueInBrowser')}</button>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/** Shown when the preview reports `already_member` — the signed-in user
- *  is already in the target workspace, so accepting is a no-op. The
- *  practical reason they hit this screen is usually "I clicked the
- *  invite link on a new device / fresh browser" — so we lead with
- *  "Open in desktop" + "Download" to cover the install case, and keep
- *  the "switch in browser" path as a soft tertiary. */
+/** Shown when the signed-in user already belongs to the workspace. */
 function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
   companyName: string
   onSwitchInBrowser: () => void
@@ -440,20 +364,13 @@ function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
       </p>
       <div className="w-full flex flex-col gap-2.5">
         <button
-          onClick={tryOpenDesktopApp}
+          onClick={onSwitchInBrowser}
           className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-white transition"
           style={{
             background: 'var(--skype)',
             boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
           }}
-        >{t('inviteAccept.openDesktop')}</button>
-        <GetDesktopAppLink variant="button-secondary" />
-        {!isWebAppHost && (
-          <button
-            onClick={onSwitchInBrowser}
-            className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
-          >{t('inviteAccept.continueInBrowser')}</button>
-        )}
+        >{t('inviteAccept.continueInBrowser')}</button>
       </div>
     </div>
   )
@@ -477,12 +394,24 @@ function ErrorBlock({ title, body, onDismiss }: { title: string; body: string; o
   )
 }
 
-function SignInToAccept({ token }: { token: string }) {
+export function SignInToAccept({ token }: { token: string }) {
   const t = useT()
   const [busy, setBusy] = useState<'google' | 'github' | 'password' | null>(null)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [displayName, setDisplayName] = useState('')
+  const [oauthProviders, setOauthProviders] = useState<Array<'google' | 'github'>>([])
+  useEffect(() => {
+    let cancelled = false
+    void api.authMethods()
+      .then((methods) => {
+        if (!cancelled) setOauthProviders(methods.oauthProviders ?? [])
+      })
+      .catch(() => {
+        if (!cancelled) setOauthProviders([])
+      })
+    return () => { cancelled = true }
+  }, [])
   const [mode, setMode] = useState<'login' | 'signup'>('login')
   const [err, setErr] = useState<string | null>(null)
   const goPassword = async (e: FormEvent) => {
@@ -548,7 +477,7 @@ function SignInToAccept({ token }: { token: string }) {
             onChange={(e) => setDisplayName(e.target.value)}
             placeholder={t('auth.displayNamePlaceholder')}
             disabled={busy !== null}
-            className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+            className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-ink-300 disabled:opacity-60"
           />
         )}
         <input
@@ -559,7 +488,7 @@ function SignInToAccept({ token }: { token: string }) {
           onChange={(e) => setEmail(e.target.value)}
           placeholder={t('auth.emailPlaceholder')}
           disabled={busy !== null}
-          className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+          className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-ink-300 disabled:opacity-60"
         />
         <input
           type="password"
@@ -570,12 +499,12 @@ function SignInToAccept({ token }: { token: string }) {
           onChange={(e) => setPassword(e.target.value)}
           placeholder={t('auth.passwordPlaceholder')}
           disabled={busy !== null}
-          className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+          className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-ink-300 disabled:opacity-60"
         />
         <button
           type="submit"
           disabled={busy !== null || !email.trim() || !password}
-          className="h-11 rounded-[10px] bg-ink-800 text-white text-[14px] disabled:opacity-60"
+          className="h-11 rounded-[10px] bg-ink-700 hover:bg-ink-900 text-white font-semibold transition-colors text-[14px] disabled:opacity-60"
         >
           {mode === 'signup'
             ? (busy === 'password' ? t('auth.creatingAccount') : t('auth.createAccount'))
@@ -591,36 +520,40 @@ function SignInToAccept({ token }: { token: string }) {
         </button>
       </form>
       {err && <div className="text-[12px] text-red-600 text-center">{err}</div>}
-      <div className="flex items-center gap-2 py-0.5">
-        <div className="flex-1 h-px bg-ink-200" />
-        <div className="text-[11px] text-ink-300 font-display italic">{t('auth.or')}</div>
-        <div className="flex-1 h-px bg-ink-200" />
-      </div>
-      <button
-        type="button"
-        onClick={() => go('google')}
-        disabled={busy !== null}
-        className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
-      >
-        <GoogleMark />
-        {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
-      </button>
-      <button
-        type="button"
-        onClick={() => go('github')}
-        disabled={busy !== null}
-        className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
-      >
-        <GitHubMark />
-        {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
-      </button>
-      <div className="text-[10.5px] text-ink-300 text-center font-display italic">
-        {t('auth.providerNote')}
-      </div>
-      <div className="text-[11.5px] text-ink-400 text-center font-display italic pt-1">
-        {t('inviteAccept.getCumoraPre')}
-        <GetDesktopAppLink variant="text" label={t('inviteAccept.getCumora')} />
-      </div>
+      {oauthProviders.length > 0 && (
+        <>
+          <div className="flex items-center gap-2 py-0.5">
+            <div className="flex-1 h-px bg-ink-200" />
+            <div className="text-[11px] text-ink-300 font-display italic">{t('auth.or')}</div>
+            <div className="flex-1 h-px bg-ink-200" />
+          </div>
+          {oauthProviders.includes('google') && (
+            <button
+              type="button"
+              onClick={() => go('google')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-900 disabled:opacity-60"
+            >
+              <GoogleMark />
+              {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
+            </button>
+          )}
+          {oauthProviders.includes('github') && (
+            <button
+              type="button"
+              onClick={() => go('github')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
+            >
+              <GitHubMark />
+              {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
+            </button>
+          )}
+          <div className="text-[10.5px] text-ink-300 text-center font-display italic">
+            {t('auth.providerNote')}
+          </div>
+        </>
+      )}
     </div>
   )
 }

@@ -14,14 +14,14 @@
  * picking the server is a sign-in-time decision — the auth token is
  * per-server.
  */
-import { useState, useEffect, type FormEvent } from 'react'
+import { type FormEvent, useEffect, useState } from 'react'
 import { api, getPairingServerOrigin, getServerOrigin, setServerOrigin } from '@/api/client'
-import { isCapacitorIOS, isElectron } from '@/lib/runtime'
+import { type MessageKey, translate, useLocaleStore, useT } from '@/lib/i18n'
 import { isNativePlatform, nativePlatform, runAppleSignIn, runOAuth } from '@/lib/native'
+import { isCapacitorIOS, isElectron } from '@/lib/runtime'
 import { useAuth } from '@/stores/auth'
 import { CloudLogo } from './Avatar'
 import { WindowDragStrip } from './WindowDragStrip'
-import { translate, useLocaleStore, useT, type MessageKey } from '@/lib/i18n'
 
 interface ServerPreset { label: string; origin: string }
 const PRESETS: ServerPreset[] = [
@@ -61,10 +61,9 @@ export function AuthScreen() {
         oauthProviders: r.oauthProviders ?? [],
       })
     }).catch(() => {
-      // Probe failed — still offer password, and keep OAuth buttons as a
-      // fallback so a production deploy whose /auth/methods is briefly
-      // unreachable doesn't lock people out of Google/GitHub.
-      if (!cancelled) setMethods({ passwordLogin: true, passwordSignup: true, oauthProviders: ['google', 'github'] })
+      // Keep the local password path available, but never advertise OAuth
+      // unless the server explicitly reports a configured provider.
+      if (!cancelled) setMethods({ passwordLogin: true, passwordSignup: true, oauthProviders: [] })
     })
     return () => { cancelled = true }
   }, [])
@@ -275,7 +274,7 @@ export function AuthScreen() {
                   onChange={(e) => setDisplayName(e.target.value)}
                   placeholder={t('auth.displayNamePlaceholder')}
                   disabled={busy !== null}
-                  className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+                  className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-ink-300 disabled:opacity-60"
                 />
               )}
               <input
@@ -286,7 +285,7 @@ export function AuthScreen() {
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder={t('auth.emailPlaceholder')}
                 disabled={busy !== null}
-                className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+                className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-ink-300 disabled:opacity-60"
               />
               <input
                 type="password"
@@ -297,12 +296,12 @@ export function AuthScreen() {
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder={t('auth.passwordPlaceholder')}
                 disabled={busy !== null}
-                className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-800 placeholder:text-ink-300 focus:outline-none focus:border-ink-400 disabled:opacity-60"
+                className="h-11 px-3 rounded-[10px] border border-ink-200 bg-white text-[14px] text-ink-900 placeholder:text-ink-300 focus:outline-none focus:border-ink-300 disabled:opacity-60"
               />
               <button
                 type="submit"
                 disabled={busy !== null || !email.trim() || !password}
-                className="h-11 rounded-[10px] bg-ink-800 hover:bg-ink-900 text-white transition-colors text-[14px] disabled:opacity-60"
+                className="h-11 rounded-[10px] bg-ink-700 hover:bg-ink-900 text-white font-semibold transition-colors text-[14px] disabled:opacity-60"
               >
                 {mode === 'signup'
                   ? (busy === 'password' ? t('auth.creatingAccount') : t('auth.createAccount'))
@@ -349,7 +348,7 @@ export function AuthScreen() {
               type="button"
               onClick={() => go('google')}
               disabled={busy !== null}
-              className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
+              className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-900 disabled:opacity-60"
             >
               <GoogleMark />
               {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
@@ -427,7 +426,7 @@ function ServerSwitch({ open, onToggle }: { open: boolean; onToggle: () => void 
           onClick={() => apply(p.origin)}
           className={`text-left h-9 px-2 rounded-[6px] text-[12px] flex items-center justify-between hover:bg-cloud transition-colors ${current === p.origin ? 'bg-cloud' : ''}`}
         >
-          <span className="font-display text-ink-800">{PRESET_LABEL_KEY[p.label] ? t(PRESET_LABEL_KEY[p.label]) : p.label}</span>
+          <span className="font-display text-ink-900">{PRESET_LABEL_KEY[p.label] ? t(PRESET_LABEL_KEY[p.label]) : p.label}</span>
           <span className="text-[10px] text-ink-400">{p.origin}</span>
         </button>
       ))}
@@ -437,13 +436,13 @@ function ServerSwitch({ open, onToggle }: { open: boolean; onToggle: () => void 
           value={custom}
           onChange={(e) => setCustom(e.target.value)}
           placeholder="https://your-server"
-          className="flex-1 h-9 px-2 rounded-[6px] border border-ink-200 text-[12px] focus:outline-none focus:border-ink-400"
+          className="flex-1 h-9 px-2 rounded-[6px] border border-ink-200 text-[12px] focus:outline-none focus:border-ink-300"
         />
         <button
           type="button"
           disabled={!custom.trim()}
           onClick={() => apply(custom.trim())}
-          className="h-9 px-3 rounded-[6px] bg-ink-800 text-white text-[12px] disabled:opacity-40"
+          className="h-9 px-3 rounded-[6px] bg-ink-700 hover:bg-ink-900 text-white text-[12px] disabled:opacity-40"
         >
           {t('common.use')}
         </button>
