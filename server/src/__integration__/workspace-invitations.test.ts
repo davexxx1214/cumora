@@ -76,7 +76,7 @@ function request(user: User, path: string, method = 'GET', body?: object) {
 async function invite(input: object = {}, user: User = 'owner') {
   const response = await request(user, '/companies/co-main/invitations','POST', { conversationId:'g-easyar', multiUse:true, ...input })
   assert.equal(response.status,201,await response.clone().text())
-  return await response.json() as { id:string; token:string; maxUses:number; conversation:{id:string;title:string} }
+  return await response.json() as { id:string; token:string; url:string; maxUses:number; conversation:{id:string;title:string} }
 }
 
 async function countMembers() {
@@ -227,6 +227,37 @@ test('[integration] invitations are listed and replaced per target group', async
   assert.deepEqual(list.map((row)=>row.id),[other.id])
   const adminList=await (await request('admin','/companies/co-main/invitations')).json() as Array<{id:string}>
   assert.equal(adminList.some((row)=>row.id===other.id),false)
+})
+
+test('[integration] active invitation URLs can be re-copied without storing plaintext tokens', async () => {
+  const created = await invite()
+  const list = await (await request('owner','/companies/co-main/invitations?conversationId=g-easyar')).json() as Array<{id:string;url:string|null}>
+  assert.equal(list.find((row) => row.id === created.id)?.url, created.url)
+  const stored = (await pool.query<{ token_ciphertext:string|null }>(
+    'SELECT token_ciphertext FROM company_invitations WHERE token_hash=$1', [created.id],
+  )).rows[0]?.token_ciphertext
+  assert.ok(stored)
+  assert.equal(stored.includes(created.token), false)
+  assert.equal((await request('colleague','/companies/co-main/invitations?conversationId=g-easyar')).status,403)
+})
+
+test('[integration] a legacy invitation can be explicitly rotated into a re-copyable link', async () => {
+  const created = await invite()
+  await pool.query('UPDATE company_invitations SET token_ciphertext=NULL WHERE token_hash=$1', [created.id])
+  const before = await (await request('owner','/companies/co-main/invitations?conversationId=g-easyar')).json() as Array<{id:string;url:string|null}>
+  assert.equal(before.find((row) => row.id === created.id)?.url, null)
+
+  assert.equal((await request('colleague',`/companies/co-main/invitations/${created.id}/rotate-link`,'POST')).status,403)
+  const rotatedResponse = await request('owner',`/companies/co-main/invitations/${created.id}/rotate-link`,'POST')
+  assert.equal(rotatedResponse.status,200,await rotatedResponse.clone().text())
+  const rotated = await rotatedResponse.json() as {id:string;token:string;url:string}
+  assert.notEqual(rotated.id, created.id)
+  assert.notEqual(rotated.token, created.token)
+  assert.equal(await invitationStatus('newcomer',created.token),'not_found')
+  assert.equal(await invitationStatus('newcomer',rotated.token),'valid')
+
+  const after = await (await request('owner','/companies/co-main/invitations?conversationId=g-easyar')).json() as Array<{id:string;url:string|null}>
+  assert.equal(after.find((row) => row.id === rotated.id)?.url, rotated.url)
 })
 
 test('[integration] concurrent group invitations cannot exceed the workspace seat limit', async () => {

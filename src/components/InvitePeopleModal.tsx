@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, type ApiInvitation, type ApiInvitationWithToken } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { useT } from '@/lib/i18n'
+import { copyText } from '@/lib/clipboard'
 
 interface Props {
   companyId: string
@@ -280,7 +281,7 @@ export function InvitePeopleModal({ companyId, companyName, conversation, onClos
             )}
             <div className="flex flex-col gap-1.5">
               {activeInvitations.map((inv) => (
-                <InvitationRow key={inv.id} inv={inv} onRevoke={() => void revoke(inv.id)} />
+                <InvitationRow key={inv.id} companyId={companyId} inv={inv} onRevoke={(id) => void revoke(id)} />
               ))}
             </div>
             {historicalInvitations.length > 0 && (
@@ -290,7 +291,7 @@ export function InvitePeopleModal({ companyId, companyName, conversation, onClos
                 </summary>
                 <div className="flex flex-col gap-1.5 mt-2">
                   {historicalInvitations.map((inv) => (
-                    <InvitationRow key={inv.id} inv={inv} historical />
+                    <InvitationRow key={inv.id} companyId={companyId} inv={inv} historical />
                   ))}
                 </div>
               </details>
@@ -338,12 +339,17 @@ export function InvitePeopleModal({ companyId, companyName, conversation, onClos
 function CreatedInviteCard({ invite, onDone }: { invite: ApiInvitationWithToken; onDone: () => void }) {
   const t = useT()
   const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState(false)
   const copy = async () => {
+    setCopyError(false)
     try {
-      await navigator.clipboard.writeText(invite.url)
+      await copyText(invite.url)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
-    } catch { /* swallow */ }
+    } catch {
+      setCopied(false)
+      setCopyError(true)
+    }
   }
   const delivery = invite.emailDelivery
   const headline = delivery?.attempted && delivery.ok
@@ -395,6 +401,9 @@ function CreatedInviteCard({ invite, onDone }: { invite: ApiInvitationWithToken;
           style={{ background: copied ? 'var(--leaf-700, #2d8c72)' : 'var(--ink-700)' }}
         >{copied ? t('invite.copiedBtn') : t('invite.copyBtn')}</button>
       </div>
+      {copyError && (
+        <div className="text-[11.5px] text-coral-deep">{t('invite.copyFailed')}</div>
+      )}
       <div className="flex justify-end">
         <button
           onClick={onDone}
@@ -406,15 +415,19 @@ function CreatedInviteCard({ invite, onDone }: { invite: ApiInvitationWithToken;
 }
 
 function InvitationRow({
+  companyId,
   inv,
   onRevoke,
   historical,
 }: {
+  companyId: string
   inv: ApiInvitation
-  onRevoke?: () => void
+  onRevoke?: (inviteId: string) => void
   historical?: boolean
 }) {
   const t = useT()
+  const [currentInviteId, setCurrentInviteId] = useState(inv.id)
+  const [currentUrl, setCurrentUrl] = useState(inv.url)
   const expiresDistance = useMemo(() => relativeFrom(inv.expiresAt), [inv.expiresAt])
   const statusLabel: Record<typeof inv.status, { label: string; bg: string; fg: string }> = {
     active:   { label: inv.email ? t('invite.statusAwaiting') : t('invite.statusShareable'), bg: 'var(--sky-50)', fg: 'var(--sky2-700, #2466a5)' },
@@ -452,9 +465,14 @@ function InvitationRow({
       </div>
       {inv.status === 'active' && !historical && onRevoke && (
         <div className="flex items-center gap-1.5">
-          <CopyLinkButton inviteId={inv.id} />
+          <CopyLinkButton
+            companyId={companyId}
+            inviteId={currentInviteId}
+            url={currentUrl}
+            onRotated={(nextId, nextUrl) => { setCurrentInviteId(nextId); setCurrentUrl(nextUrl) }}
+          />
           <button
-            onClick={onRevoke}
+            onClick={() => onRevoke(currentInviteId)}
             className="px-2 py-1.5 text-[11.5px] font-semibold rounded-[8px] transition"
             style={{ color: 'var(--coral-deep)', border: '1px solid var(--ink-100)' }}
           >{t('invite.revokeBtn')}</button>
@@ -464,28 +482,78 @@ function InvitationRow({
   )
 }
 
-/** The raw token is only ever returned from the create endpoint. After
- *  that the list endpoint only echoes the hash, so we can't show a
- *  copy-able URL for previously-issued invites — instead this button
- *  copies the invite's hash id as a debugging hint. (UX-wise we accept
- *  this limitation; the alternative is keeping plaintext tokens in DB,
- *  which we will not.) */
-function CopyLinkButton({ inviteId }: { inviteId: string }) {
+function CopyLinkButton({
+  companyId,
+  inviteId,
+  url,
+  onRotated,
+}: {
+  companyId: string
+  inviteId: string
+  url: string | null
+  onRotated: (inviteId: string, url: string) => void
+}) {
   const t = useT()
   const [copied, setCopied] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [manualUrl, setManualUrl] = useState<string | null>(null)
   const onClick = async () => {
+    if (busy) return
+    setBusy(true)
+    setManualUrl(null)
     try {
-      await navigator.clipboard.writeText(inviteId)
-      setCopied(true); setTimeout(() => setCopied(false), 1200)
-    } catch { /* swallow */ }
+      let copyUrl = url
+      if (!copyUrl) {
+        const rotated = await api.rotateInvitationLink(companyId, inviteId)
+        copyUrl = rotated.url
+        onRotated(rotated.id, rotated.url)
+      }
+      try {
+        await copyText(copyUrl)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1200)
+      } catch {
+        setCopied(false)
+        setManualUrl(copyUrl)
+      }
+    } catch {
+      setCopied(false)
+      setManualUrl('')
+    } finally {
+      setBusy(false)
+    }
   }
   return (
-    <button
-      onClick={onClick}
-      title={t('invite.copyRefTitle')}
-      className="px-2 py-1.5 text-[11.5px] font-semibold rounded-[8px] transition"
-      style={{ color: 'var(--ink-500)', border: '1px solid var(--ink-100)' }}
-    >{copied ? t('invite.copiedBtn') : t('invite.copyRefBtn')}</button>
+    <div className="flex flex-col items-end gap-1">
+      <button
+        onClick={onClick}
+        disabled={busy}
+        title={url ? t('invite.copyLinkTitle') : t('invite.rotateCopyTitle')}
+        className="px-2 py-1.5 text-[11.5px] font-semibold rounded-[8px] transition disabled:opacity-60"
+        style={{ color: 'var(--ink-500)', border: '1px solid var(--ink-100)' }}
+      >{copied
+          ? t('invite.copiedBtn')
+          : busy
+            ? t('invite.copyingBtn')
+            : url ? t('invite.copyLinkBtn') : t('invite.rotateCopyBtn')}</button>
+      {manualUrl !== null && (
+        <div className="w-[260px] max-w-[50vw]">
+          <div className="text-[10.5px] text-coral-deep mb-1 text-right">
+            {manualUrl ? t('invite.copyFailedManual') : t('invite.rotateFailed')}
+          </div>
+          {manualUrl && (
+            <input
+              readOnly
+              autoFocus
+              value={manualUrl}
+              onFocus={(event) => event.currentTarget.select()}
+              className="w-full px-2 py-1 text-[10px] rounded-[6px] font-mono"
+              style={{ background: 'var(--cloud)', border: '1px solid var(--ink-100)' }}
+            />
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 

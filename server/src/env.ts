@@ -187,6 +187,13 @@ export const env = {
    * JWTs and impersonate any agent/tenant.
    */
   AGENT_RUNTIME_SECRET: process.env.AGENT_RUNTIME_SECRET ?? DEV_AGENT_RUNTIME_SECRET,
+  /** AES-GCM key material for the recoverable copy of invitation tokens.
+   *  A domain-separated derivative of AGENT_RUNTIME_SECRET is the fallback
+   *  so existing deployments work without a second mandatory secret. */
+  INVITE_TOKEN_ENCRYPTION_SECRET:
+    process.env.INVITE_TOKEN_ENCRYPTION_SECRET
+    ?? process.env.AGENT_RUNTIME_SECRET
+    ?? DEV_AGENT_RUNTIME_SECRET,
   /**
    * Full URL the agent-runner pod uses to reach the cumora server's
    * `/runtime` API (note the trailing path). From OrbStack K8s a pod

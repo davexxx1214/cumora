@@ -910,9 +910,10 @@ ${PROJECT_FILES_DDL}
 
 -- ============== Company invitations =====================================
 -- Owners / admins mint short URL-safe tokens that anyone can redeem to
--- join the company. The raw token is hashed at rest (same sha256 b64url
--- shape as sessions / ws_tickets) — a DB leak doesn't yield usable invite
--- URLs. Each invite has:
+-- join the company. The lookup token is hashed at rest (same sha256 b64url
+-- shape as sessions / ws_tickets); a separate AES-GCM ciphertext lets an
+-- authorized admin re-copy the link without making a DB-only leak usable.
+-- Each invite has:
 --   • role               — role the joiner gets ('member' | 'admin')
 --   • email              — optional lowercased email. When set, only that
 --                          authenticated email can redeem; when NULL the
@@ -949,6 +950,11 @@ CREATE INDEX IF NOT EXISTS idx_company_invitations_email
 -- workspace-wide links. NULL preserves legacy workspace invitations.
 ALTER TABLE company_invitations ADD COLUMN IF NOT EXISTS conversation_id TEXT
   REFERENCES conversations(id) ON DELETE CASCADE;
+-- Recoverable copy for owner/admin re-copy. AES-256-GCM encrypted with server
+-- key material; NULL marks invites created before this feature. The hash stays
+-- the acceptance lookup key, so losing/changing the encryption key does not
+-- invalidate links that have already been shared.
+ALTER TABLE company_invitations ADD COLUMN IF NOT EXISTS token_ciphertext TEXT;
 CREATE INDEX IF NOT EXISTS idx_company_invitations_conversation
   ON company_invitations(conversation_id) WHERE conversation_id IS NOT NULL;
 
@@ -2179,6 +2185,10 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
         AND (SELECT count(*) FROM pg_class WHERE relname = 'participants_agent_id_unique') > 0
         AND (SELECT count(*) FROM information_schema.columns
                WHERE table_name = 'messages' AND column_name = 'client_id') > 0
+        AND (SELECT count(*) FROM information_schema.columns
+               WHERE table_name = 'messages' AND column_name = 'agent_recipient_ids') > 0
+        AND (SELECT count(*) FROM information_schema.columns
+               WHERE table_name = 'company_invitations' AND column_name = 'token_ciphertext') > 0
         AND EXISTS (
           SELECT 1 FROM pg_class c
           JOIN pg_index i ON i.indexrelid = c.oid

@@ -37,6 +37,7 @@ import { archiveProject, attachGroupProject, prepareGroupProjectStop, validateNe
 import { ProjectFileError } from '../project-files/model.js'
 import { projectAttachment } from '../project-files/references.js'
 import { resolveAgentRecipientIds } from '../agents/message-routing.js'
+import { openInviteToken, sealInviteToken } from '../invitations/token-vault.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -1410,6 +1411,7 @@ function generateInviteToken(): string {
 
 interface InvitationRow {
   token_hash: string
+  token_ciphertext: string | null
   company_id: string
   conversation_id: string | null
   invited_by: string
@@ -1526,22 +1528,22 @@ function buildInviteUrl(token: string): string {
 
 /** List invitations for a company. Owners / admins only. Returns the
  *  most-recent first; includes both active and historical (revoked / expired
- *  / consumed) so the UI can show "X people redeemed this link". The raw
- *  token is never re-returned after creation — only the URL once at create
- *  time. */
+ *  / consumed) so the UI can show "X people redeemed this link". Active
+ *  post-migration rows include a URL decrypted with the server-held key;
+ *  legacy rows return url=null and can be explicitly rotated. */
 api.get('/companies/:id/invitations', safe(async (req, res) => {
   const companyId = String(req.params.id)
   const { userId: me } = await requireCompanyAdmin(req, companyId)
   const conversationId = typeof req.query.conversationId === 'string' ? req.query.conversationId : null
   const { rows } = await pool.query<{
-    token_hash: string; email: string | null; role: string; note: string | null
+    token_hash: string; token_ciphertext: string | null; email: string | null; role: string; note: string | null
     max_uses: number; use_count: number; created_at: string; expires_at: string
     revoked_at: string | null; last_accepted_at: string | null
     last_accepted_by: string | null; invited_by: string
     inviter_name: string | null
     conversation_id: string | null; conversation_title: string | null
   }>(
-    `SELECT i.token_hash, i.email, i.role, i.note, i.max_uses, i.use_count,
+    `SELECT i.token_hash, i.token_ciphertext, i.email, i.role, i.note, i.max_uses, i.use_count,
             i.conversation_id, g.title AS conversation_title,
             i.created_at, i.expires_at, i.revoked_at,
             i.last_accepted_at, i.last_accepted_by, i.invited_by,
@@ -1564,11 +1566,18 @@ api.get('/companies/:id/invitations', safe(async (req, res) => {
       : expired ? 'expired'
       : consumed ? 'consumed'
       : 'active'
+    const rawToken = status === 'active'
+      ? openInviteToken({
+          sealed: r.token_ciphertext,
+          companyId,
+          tokenHash: r.token_hash,
+          secret: env.INVITE_TOKEN_ENCRYPTION_SECRET,
+        })
+      : null
     return {
-      // Stable, non-secret identifier the UI uses to revoke. Truncated hash
-      // is fine here — we look invites up by the full hash, which the
-      // revoke endpoint accepts.
+      // Stable, non-secret full token hash used by revoke / link rotation.
       id: r.token_hash,
+      url: rawToken ? buildInviteUrl(rawToken) : null,
       conversation: r.conversation_id ? { id: r.conversation_id, title: r.conversation_title ?? '' } : null,
       email: r.email,
       role: r.role,
@@ -1591,8 +1600,8 @@ api.get('/companies/:id/invitations', safe(async (req, res) => {
  *  When `email` is provided the invite is single-use and locked to that
  *  email (case-insensitive). When omitted (or `multiUse: true`), a
  *  shareable link is minted with max_uses = 100 by default.
- *  Returns the RAW token + URL exactly ONCE — the server stores only the
- *  hash, so this is the only chance to copy the link. */
+ *  Returns the raw token + URL. A server-key-encrypted copy is stored so an
+ *  authorized owner/admin can copy the same active link again later. */
 api.post('/companies/:id/invitations', safe(async (req, res) => {
   const companyId = String(req.params.id)
   const { userId: me } = await requireCompanyAdmin(req, companyId)
@@ -1672,12 +1681,18 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
 
   const token = generateInviteToken()
   const tokenHash = hashInviteToken(token)
+  const tokenCiphertext = sealInviteToken({
+    token,
+    companyId,
+    tokenHash,
+    secret: env.INVITE_TOKEN_ENCRYPTION_SECRET,
+  })
   const expiresAt = new Date(Date.now() + INVITE_TTL_MS)
   await pool.query(
     `INSERT INTO company_invitations
-       (token_hash, company_id, invited_by, email, role, note, max_uses, expires_at, conversation_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [tokenHash, companyId, me, email, role, note, maxUses, expiresAt, conversationId],
+       (token_hash, token_ciphertext, company_id, invited_by, email, role, note, max_uses, expires_at, conversation_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [tokenHash, tokenCiphertext, companyId, me, email, role, note, maxUses, expiresAt, conversationId],
   )
   const ip = req.socket.remoteAddress ?? null
   const ua = (req.headers['user-agent'] as string | undefined) ?? null
@@ -1733,6 +1748,84 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
     expiresAt: expiresAt.toISOString(),
     status: 'active',
     emailDelivery,
+  })
+}))
+
+/** Rotate an active invitation that predates encrypted token retention (or
+ * whose encryption key changed). Rotation is explicit because the previous
+ * URL becomes invalid. The remaining use count, expiry, target, role and note
+ * stay unchanged. */
+api.post('/companies/:id/invitations/:inviteId/rotate-link', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  const inviteId = String(req.params.inviteId)
+  const { userId: me } = await requireCompanyAdmin(req, companyId)
+  const token = generateInviteToken()
+  const tokenHash = hashInviteToken(token)
+  const tokenCiphertext = sealInviteToken({
+    token,
+    companyId,
+    tokenHash,
+    secret: env.INVITE_TOKEN_ENCRYPTION_SECRET,
+  })
+  const { rows } = await pool.query<InvitationRow>(
+    `UPDATE company_invitations i
+        SET token_hash = $3, token_ciphertext = $4
+      WHERE i.token_hash = $1 AND i.company_id = $2
+        AND i.revoked_at IS NULL AND i.expires_at > NOW()
+        AND i.use_count < i.max_uses
+        AND (
+          i.conversation_id IS NULL OR EXISTS (
+            SELECT 1 FROM conversations g
+             WHERE g.id = i.conversation_id AND g.company_id = i.company_id
+               AND g.members @> to_jsonb(ARRAY[$5::text])
+          )
+        )
+      RETURNING i.*`,
+    [inviteId, companyId, tokenHash, tokenCiphertext, me],
+  )
+  const rotated = rows[0]
+  if (!rotated) {
+    const { rows: visible } = await pool.query(
+      `SELECT 1 FROM company_invitations i
+        WHERE i.token_hash = $1 AND i.company_id = $2
+          AND (
+            i.conversation_id IS NULL OR EXISTS (
+              SELECT 1 FROM conversations g
+               WHERE g.id = i.conversation_id AND g.company_id = i.company_id
+                 AND g.members @> to_jsonb(ARRAY[$3::text])
+            )
+          )`,
+      [inviteId, companyId, me],
+    )
+    if (!visible[0]) throw new HttpError(404, 'invitation not found')
+    throw new HttpError(409, 'invitation is no longer active')
+  }
+  const conversation = rotated.conversation_id
+    ? (await pool.query<{ id: string; title: string }>(
+        `SELECT id, title FROM conversations WHERE id = $1 AND company_id = $2`,
+        [rotated.conversation_id, companyId],
+      )).rows[0] ?? null
+    : null
+  await audit({
+    kind: 'invitation_rotate_link',
+    userId: me,
+    companyId,
+    detail: { previousInviteId: inviteId, inviteId: tokenHash, conversationId: rotated.conversation_id },
+  })
+  res.json({
+    id: tokenHash,
+    token,
+    url: buildInviteUrl(token),
+    conversation,
+    email: rotated.email,
+    role: rotated.role,
+    note: rotated.note,
+    maxUses: rotated.max_uses,
+    useCount: rotated.use_count,
+    createdAt: new Date(rotated.created_at).toISOString(),
+    expiresAt: new Date(rotated.expires_at).toISOString(),
+    status: 'active',
+    emailDelivery: null,
   })
 }))
 

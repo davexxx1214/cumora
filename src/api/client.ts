@@ -569,9 +569,11 @@ export type ApiInvitationStatus = 'active' | 'revoked' | 'expired' | 'consumed'
 export interface ApiInvitation {
   conversation: { id: string; title: string } | null
   /** Stable identifier (= server-side token_hash). Used by the revoke
-   *  endpoint. The raw token itself is ONLY returned on create — never
-   *  re-exposed. */
+   *  and link-rotation endpoints. */
   id: string
+  /** Re-copyable active URL. Null only for legacy rows created before
+   * encrypted token retention (or after server key rotation). */
+  url: string | null
   email: string | null
   role: 'member' | 'admin'
   note: string | null
@@ -587,9 +589,8 @@ export interface ApiInvitation {
   status: ApiInvitationStatus
 }
 
-/** Returned exactly ONCE from the create endpoint. Embeds the freshly-minted
- *  raw token + the public accept URL — the server keeps only the hash, so
- *  the UI must surface this immediately for the user to copy / send. */
+/** Returned from create and explicit legacy-link rotation. Embeds the raw
+ * token + public accept URL; list responses expose only the decrypted URL. */
 export interface ApiInvitationWithToken {
   conversation: { id: string; title: string } | null
   id: string
@@ -913,8 +914,8 @@ export const api = {
     http<ApiInvitation[]>(`/companies/${encodeURIComponent(companyId)}/invitations${conversationId ? `?conversationId=${encodeURIComponent(conversationId)}` : ''}`),
   /** Owner/admin-only: mint a fresh invite. Pass `email` for a single-use
    *  email-locked invite, omit (or set `multiUse: true`) for a shareable
-   *  link. The returned `url` + `token` are the ONLY copy — the server
-   *  stores just the hash. */
+   *  link. The server stores a server-key-encrypted token copy so admins
+   *  can retrieve the active URL again. */
   createInvitation: (companyId: string, input: {
     conversationId?: string
     email?: string | null
@@ -935,6 +936,13 @@ export const api = {
     http<{ ok: boolean; revoked: boolean }>(
       `/companies/${encodeURIComponent(companyId)}/invitations/${encodeURIComponent(inviteId)}`,
       { method: 'DELETE' },
+    ),
+  /** Replace an unrecoverable legacy invite token and return the new URL.
+   *  The old URL is invalidated, while target/role/expiry/usage stay put. */
+  rotateInvitationLink: (companyId: string, inviteId: string) =>
+    http<ApiInvitationWithToken>(
+      `/companies/${encodeURIComponent(companyId)}/invitations/${encodeURIComponent(inviteId)}/rotate-link`,
+      { method: 'POST' },
     ),
   /** Public: preview an invitation by its raw token. Returns the company
    *  + inviter so the accept screen can show "<X> invited you to <Y>"
