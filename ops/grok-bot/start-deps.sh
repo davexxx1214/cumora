@@ -7,8 +7,31 @@ RUN_DIR="$STACK/run"
 SECRETS_DIR="$STACK/secrets"
 PGDATA=/workspace/data/postgres
 REDIS_DIR=/workspace/data/redis
+REPO_ENV=/workspace/cumora/.env
 
 install -d -m 700 "$LOG_DIR" "$RUN_DIR" "$SECRETS_DIR" /workspace/data "$PGDATA" "$REDIS_DIR"
+
+# Project objects must survive a Grok Bot computer rebuild. The /projects/<id>
+# path visible inside a task is only a controlled FUSE mount; the backing store
+# must resolve beneath /workspace. Fail closed instead of silently writing to a
+# container-local path when the feature is enabled.
+if [ -f "$REPO_ENV" ] && grep -Eq '^CUMORA_PROJECT_FILES_ENABLED=(1|true)$' "$REPO_ENV"; then
+  project_root=$(sed -n 's/^CUMORA_PROJECT_FILES_ROOT=//p' "$REPO_ENV" | tail -n 1 | tr -d '\r')
+  if [ -z "$project_root" ]; then
+    echo "CUMORA_PROJECT_FILES_ROOT is required when project files are enabled" >&2
+    exit 1
+  fi
+  project_root=$(realpath -m -- "$project_root")
+  case "$project_root" in
+    /workspace/*) ;;
+    *)
+      echo "project file root must resolve beneath /workspace" >&2
+      exit 1
+      ;;
+  esac
+  install -d -m 700 "$project_root"
+fi
+
 "$STACK/bin/ensure-packages.sh"
 
 exec 9>"$RUN_DIR/start-deps.lock"

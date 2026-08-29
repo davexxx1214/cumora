@@ -72,6 +72,7 @@ API 重启生成新的服务实例标识，旧租约立即失效。租约过期�
 - 持久化数据库：PostgreSQL `/workspace/data/postgres`；Redis `/workspace/data/redis`，启用 AOF `everysec`。
 - 启动栈：`/workspace/cumora-stack`。私密配置在 `secrets/`，目录 0700，密钥文件 0600；包含 Cloudflare token、SSH 主机密钥、authorized keys 和当前数据库配对的 Computer 配置，禁止打印或提交。
 - 启动/恢复：`/workspace/cumora-stack/bin/ensure-running.sh`。命令幂等，负责依赖、PostgreSQL、Redis、sshd、Cumora、cloudflared 和项目 daemon。
+- 启动脚本会解析 `CUMORA_PROJECT_FILES_ROOT`；功能开启时，真实路径不在 `/workspace` 下会拒绝启动，避免重建后误写容器临时层。Agent 看到的 `/projects/<projectId>` 只是任务期间的受控 FUSE 挂载点，不是正文存储目录。
 - 日志：`/workspace/cumora-stack/logs`；排障时不得把环境、访问令牌或文件正文写入日志。
 - 健康检查：本机 API `http://127.0.0.1:5181/api/health`，公网 `https://cumora.myawesomeai.top/api/health`。
 

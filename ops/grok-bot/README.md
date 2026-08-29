@@ -24,6 +24,11 @@ Persistent state is kept outside the container image:
 - project objects: `/workspace/cumora-data/project-files`
 - host bootstrap: `/workspace/cumora-stack`
 
+When project files are enabled, `start-deps.sh` resolves
+`CUMORA_PROJECT_FILES_ROOT` and refuses to start if it is outside `/workspace`.
+The `/projects/<projectId>` path seen by an Agent task is an ephemeral,
+controlled FUSE mount; it is not the backing storage location.
+
 `/workspace/cumora-stack/secrets` is mode 0700. It contains the Cloudflare
 connector token, persistent SSH host key, SSH authorized keys, and (after a new
 Cumora computer is paired) its `computer.json` plus the project-daemon
