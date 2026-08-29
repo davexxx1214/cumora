@@ -71,4 +71,5 @@ server/k8s/*.prod.yaml
 docs/HANDOFF.md
 android/app/google-services.json
 /agent.md
+/grok_bot.md
 /grok.pem
