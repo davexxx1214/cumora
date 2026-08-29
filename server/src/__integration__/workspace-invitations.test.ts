@@ -105,6 +105,34 @@ test('[integration] admin removes a colleague only from this workspace, preservi
   assert.equal((await broadcastRecipients('co-main')).has('colleague'),false)
 })
 
+test('[integration] admin lists and removes a preset colleague without a user account', async () => {
+  await pool.query(`INSERT INTO participants (id,company_id,kind,name,initial,avatar_bg,status)
+    VALUES ('preset-colleague','co-main','human','Preset colleague','P','#abcdef','avail'),
+           ('preset-agent','co-main','agent','Preset agent','A','#abcdef','avail')`)
+  await pool.query(`INSERT INTO conversations (id,kind,title,company_id,members)
+    VALUES ('direct-preset','direct','Preset colleague','co-main','["owner","preset-colleague"]'::jsonb)`)
+  await pool.query(`INSERT INTO messages (id,company_id,conversation_id,author_id,kind,body,sequence)
+    VALUES ('preset-history','co-main','direct-preset','preset-colleague','text','kept preset history',1)`)
+
+  const listed = await (await request('admin','/companies/co-main/members')).json() as Array<{
+    id: string; email: string | null; role: string; isOwner: boolean; isPreset: boolean
+  }>
+  assert.deepEqual(listed.find((member) => member.id === 'preset-colleague'), {
+    id: 'preset-colleague', email: null, role: 'member', isOwner: false, isPreset: true, name: 'Preset colleague',
+  })
+  assert.equal((await request('colleague','/companies/co-main/members/preset-colleague','DELETE')).status,403)
+  assert.equal((await request('admin','/companies/co-main/members/preset-agent','DELETE')).status,404)
+  assert.equal((await request('admin','/companies/co-main/members/preset-colleague','DELETE')).status,200)
+  assert.equal(await countMembers(),3,'preset removal must not consume or delete a real workspace seat')
+  assert.equal((await pool.query("SELECT 1 FROM users WHERE id='preset-colleague'")).rowCount,0)
+  assert.ok((await pool.query("SELECT departed_at FROM participants WHERE company_id='co-main' AND id='preset-colleague'")).rows[0].departed_at)
+  assert.deepEqual((await pool.query("SELECT members FROM conversations WHERE id='direct-preset'")).rows[0].members,['owner'])
+  assert.equal((await pool.query("SELECT body FROM messages WHERE id='preset-history'")).rows[0].body,'kept preset history')
+  const conversations = await (await request('owner','/conversations')).json() as Array<{id:string}>
+  assert.equal(conversations.some((conversation) => conversation.id === 'direct-preset'),false)
+  assert.equal((await request('admin','/companies/co-main/members/preset-colleague','DELETE')).status,404)
+})
+
 test('[integration] owners, self, unrelated workspaces and ordinary-member permissions are protected', async () => {
   assert.equal((await request('admin','/companies/co-main/members/owner','DELETE')).status,403)
   assert.equal((await request('admin','/companies/co-main/members/admin','DELETE')).status,400)

@@ -901,7 +901,7 @@ export const api = {
       method: 'POST', body: JSON.stringify({ name }),
     }),
   listWorkspaceMembers: (companyId: string) =>
-    http<Array<{ id: string; name: string; email: string; role: string; isOwner: boolean }>>(
+    http<Array<{ id: string; name: string; email: string | null; role: string; isOwner: boolean; isPreset: boolean }>>(
       `/companies/${encodeURIComponent(companyId)}/members`,
     ),
   removeWorkspaceMember: (companyId: string, memberId: string) =>

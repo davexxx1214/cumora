@@ -1336,13 +1336,34 @@ api.get('/companies/:id/members', safe(async (req, res) => {
   const companyId = String(req.params.id)
   await requireCompanyAdmin(req, companyId)
   const { rows } = await pool.query(
-    `SELECT cm.user_id AS id, u.display_name AS name, u.email, cm.role,
-            (cm.role = 'owner' OR c.owner_user_id = cm.user_id) AS "isOwner"
-       FROM company_members cm
-       JOIN users u ON u.id = cm.user_id
-       JOIN companies c ON c.id = cm.company_id
-      WHERE cm.company_id = $1
-      ORDER BY cm.joined_at, cm.user_id`, [companyId],
+    `WITH listed AS (
+       SELECT cm.user_id AS id,
+              COALESCE(p.name, u.display_name) AS name,
+              u.email,
+              cm.role,
+              (cm.role = 'owner' OR c.owner_user_id = cm.user_id) AS is_owner,
+              FALSE AS is_preset,
+              cm.joined_at AS sort_at
+         FROM company_members cm
+         JOIN users u ON u.id = cm.user_id
+         JOIN companies c ON c.id = cm.company_id
+         LEFT JOIN participants p
+                ON p.company_id = cm.company_id AND p.id = cm.user_id AND p.kind = 'human'
+        WHERE cm.company_id = $1
+       UNION ALL
+       SELECT p.id, p.name, NULL::text, 'member', FALSE, TRUE, NULL::timestamptz
+         FROM participants p
+        WHERE p.company_id = $1
+          AND p.kind = 'human'
+          AND p.departed_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM company_members cm
+             WHERE cm.company_id = p.company_id AND cm.user_id = p.id
+          )
+     )
+     SELECT id, name, email, role, is_owner AS "isOwner", is_preset AS "isPreset"
+       FROM listed
+      ORDER BY sort_at NULLS LAST, LOWER(name), id`, [companyId],
   )
   res.json(rows)
 }))
@@ -1363,11 +1384,23 @@ api.delete('/companies/:id/members/:memberId', safe(async (req, res) => {
     const { rows: members } = await client.query<{ role: string }>(
       'SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2', [companyId, memberId],
     )
-    if (!members[0]) throw new HttpError(404, 'workspace member not found')
-    if (members[0].role === 'owner' || companies[0]?.owner_user_id === memberId) {
+    // Dev/demo presets such as Wei and Maya are human participants without a
+    // users/company_members row. Treat an active preset as a removable
+    // colleague, while continuing to reject agents, departed presets and
+    // arbitrary IDs. The company lock serializes this with other removals.
+    const { rows: participants } = await client.query<{ kind: string; departed_at: string | null }>(
+      `SELECT kind, departed_at FROM participants
+        WHERE company_id = $1 AND id = $2
+        FOR UPDATE`, [companyId, memberId],
+    )
+    const preset = !members[0] && participants[0]?.kind === 'human' && participants[0].departed_at === null
+    if (!members[0] && !preset) throw new HttpError(404, 'workspace member not found')
+    if (members[0]?.role === 'owner' || companies[0]?.owner_user_id === memberId) {
       throw new HttpError(403, 'cannot remove the workspace owner')
     }
-    await client.query('DELETE FROM company_members WHERE company_id = $1 AND user_id = $2', [companyId, memberId])
+    if (members[0]) {
+      await client.query('DELETE FROM company_members WHERE company_id = $1 AND user_id = $2', [companyId, memberId])
+    }
     await client.query(
       `UPDATE conversations SET members = members - $2::text, updated_at = NOW()
         WHERE company_id = $1 AND members @> to_jsonb(ARRAY[$2::text])`, [companyId, memberId],
@@ -3074,6 +3107,11 @@ api.get('/conversations', async (req, res) => {
         -- — those are private to the agents and surfaced only via the
         -- "Whispers" peek tab.
         AND c.members @> to_jsonb(ARRAY[$1::text])
+        -- Removing a colleague preserves direct-message history but leaves the
+        -- caller as the only member. Keep that orphaned history in the DB
+        -- without continuing to show a fake self-DM titled after the removed
+        -- preset or account.
+        AND (c.kind <> 'direct' OR jsonb_array_length(c.members) > 1)
       ORDER BY c.pinned DESC, c.updated_at DESC`,
     [me, tenant],
   )
