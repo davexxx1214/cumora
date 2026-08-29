@@ -2,7 +2,7 @@
 
 更新日期：2026-08-29
 
-状态：共享文件服务、Linux 挂载、Agent 任务边界和文件面板已部署到远程 `dev` 并启用；隔离回归、真实引擎和进程恢复已通过，线上测试项目已挂载并完成文件服务写入/读回，完整浏览器上传→在线 Agent 修改→浏览器下载点击验收仍待完成。
+状态：共享文件服务、Linux 挂载、Agent 任务边界和文件面板已部署到远程 `dev` 并启用。2026-08-29 主机重建后旧业务库未保留，原线上测试项目和文件元数据已丢失；服务已基于 `/workspace` 持久化目录恢复并重新通过隔离 Linux 全链路验证。需要在新库重新完成浏览器上传→在线 Agent 修改→浏览器下载点击验收。
 
 实施提交：`5a9fd90`（`feat: add phase-one shared project files`）。提交已推送到 `origin/codex/project-files-phase-one`，并快进合入及推送 `origin/dev`；远程部署 checkout 同步到该提交。阶段状态及验证记录见第 16 节。
 
@@ -405,3 +405,8 @@ cd agent-fuse && go test ./...
 - 正式文件服务以当前管理员身份写入并读回 `cumora-online-check.txt`，内容为 31 bytes；网页显示 `31 B / 5.00 GB`、修改人和文件操作。当前浏览器沙箱拒绝把本机文件交给上传控件，也没有捕获网页下载事件；没有绕过限制冒充浏览器上传/下载，更没有在业务群触发 Agent 消息。完整浏览器上传→在线 Agent 修改→浏览器下载点击闭环仍是剩余灰度项。
 - 管理员操作、能力边界、恢复命令和部署路径见 `docs/project-files.md`。
 - 2026-08-29 较早一次收尾曾因 `bore.pub:3444` 无法返回 SSH banner、Cloudflare 公网入口 530 而暂停，没有在断连状态下改动远程。SSH Cloudflare 域名恢复后从该安全点继续，完成了上述同步、迁移、启用和验证；`bore.pub` 不再作为默认部署入口。
+- 同日 Grok Bot 主机约在 UTC 07:14 重建。源码、`.env`、隧道 token 与项目对象目录仍在 `/workspace`，但原 PostgreSQL/Redis、运行进程和系统包消失；重新安装 PostgreSQL 时创建的是全新业务库。旧消息、会话、自定义成员/群组、Computer 和 `project_file_spaces` 元数据没有迁移，磁盘上三个残留对象因无元数据而不在当前列表显示，不能描述为业务数据恢复。
+- 新增仓库内 `ops/grok-bot/` 验证主机恢复栈，并部署到 `/workspace/cumora-stack`。PostgreSQL 改用 `/workspace/data/postgres`，Redis 使用 `/workspace/data/redis` 且开启 AOF；Cloudflare token、SSH authorized keys、持久 SSH 主机密钥和当前数据库配对的 Computer 配置保存在权限受控的 `secrets/`，不进入仓库。
+- 恢复栈用用户态监督器拉起 Cumora、cloudflared 和项目 daemon，并在子进程退出后重启。`ensure-running.sh` 修复了锁文件描述符继承问题，已验证重复执行不会启动第二个监督器；项目 daemon 也使用独占文件锁，避免重复运行。应用子进程被终止后自动恢复，公网和 SSH 隧道未随之重启。
+- 当前容器 PID 1 为 `tini`，没有 systemd 或 cron，仓库脚本不能自行跨越整机重建。仍需 Grok Routine 或人工调用 `/workspace/cumora-stack/bin/ensure-running.sh`；Routine 可能因长期无活动暂停，因此该方案仍只适合验证环境。
+- 新库已重新配对当前主机，六个种子 Agent 统一使用 Codex 引擎且 Computer 在线。重建后的隔离 Linux 验证使用临时 PostgreSQL、Redis 和文件目录，预检 5/5、领域测试 10/10、集成测试 20 项通过；默认未调用真实外部引擎的两项测试按设计跳过，业务库和线上目录未被测试修改。

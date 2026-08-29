@@ -1,6 +1,6 @@
 # 项目共享文件：验证版说明
 
-更新：2026-08-29。**功能已在当前远程主机启用，仍是验证版，不是生产就绪声明。** 隔离回归、真实 Codex/Grok 任务和进程恢复已通过；“测试群组”已挂载“共享文件验收”项目并完成正式文件服务写入、网页列表及鉴权读回，完整浏览器上传→在线 Agent 修改→浏览器下载点击闭环仍待完成。当前检查结果及未完成项见 [实施计划](../plan.md#16-执行记录共享文件实现2026-08-29)。
+更新：2026-08-29。**功能已在当前远程主机启用，仍是验证版，不是生产就绪声明。** 主机在同日重建后，旧 PostgreSQL 业务数据没有保留下来；原项目对象仍在磁盘，但元数据已经丢失，因此不会出现在当前文件列表，也不能视为已恢复。现已把 PostgreSQL、Redis、启动栈、SSH 主机密钥和新配对的 Computer 配置移到 `/workspace`，并重新通过隔离 Linux 全链路测试。完整浏览器上传→在线 Agent 修改→浏览器下载点击闭环仍待重新验收。当前检查结果及未完成项见 [实施计划](../plan.md#16-执行记录共享文件实现2026-08-29)。
 
 ## 使用规则
 
@@ -65,19 +65,21 @@ API 重启生成新的服务实例标识，旧租约立即失效。租约过期�
 
 ## 当前远程部署
 
-- 源码：`/workspace/cumora`，`dev` / `5a9fd90`。
+- 源码：`/workspace/cumora`，跟随 `origin/dev`。
 - 私有数据根：`/workspace/cumora-data/project-files`，权限 0700；不映射到公网静态目录。
 - 项目任务程序：`/home/box/.local/lib/cumora-project/project-task` 与 `task-enter`。
 - 文档依赖：`/home/box/.local/lib/cumora-project-python`。
-- 私密运行配置与守护器：`/home/box/.config/cumora-project-files`，目录 0700；环境和密钥文件 0600。不要打印或复制其中的密钥。
-- 启动：`/home/box/.config/cumora-project-files/start-services.sh`。
-- 停止：`/home/box/.config/cumora-project-files/stop-services.sh`。停止前应先处理活动项目任务和未提交内容。
-- 日志：同一配置目录下的 `app-supervisor.log` 与 `daemon-supervisor.log`；排障时不得把环境、访问令牌或文件正文写入日志。
+- 持久化数据库：PostgreSQL `/workspace/data/postgres`；Redis `/workspace/data/redis`，启用 AOF `everysec`。
+- 启动栈：`/workspace/cumora-stack`。私密配置在 `secrets/`，目录 0700，密钥文件 0600；包含 Cloudflare token、SSH 主机密钥、authorized keys 和当前数据库配对的 Computer 配置，禁止打印或提交。
+- 启动/恢复：`/workspace/cumora-stack/bin/ensure-running.sh`。命令幂等，负责依赖、PostgreSQL、Redis、sshd、Cumora、cloudflared 和项目 daemon。
+- 日志：`/workspace/cumora-stack/logs`；排障时不得把环境、访问令牌或文件正文写入日志。
 - 健康检查：本机 API `http://127.0.0.1:5181/api/health`，公网 `https://cumora.myawesomeai.top/api/health`。
 
-当前主机没有 systemd，也没有正在运行的 cron daemon。守护器会在应用或 daemon 子进程崩溃后自动拉起，但整台主机或容器重启后仍需要平台启动钩子或人工执行启动脚本。这是现阶段已知运维边界，不应描述为开机自启。
+当前主机 PID 1 是 `tini`，没有 systemd，也没有 cron daemon。守护器会在应用、隧道或 daemon 子进程崩溃后自动拉起，但整台主机或容器重建后仍需要 Grok Routine 或人工执行上述命令。Routine 长期无活动时也可能暂停；这是已知运维边界，不应描述为系统级开机自启。
 
-本次部署已执行兼容迁移和正式目录预检。应用子进程退出后约 4 秒恢复，daemon 子进程退出后约 2 秒恢复；重新启动的 daemon 确认加载正式数据根、本机 API、任务程序和项目模式。功能关闭或代码回滚前，先停止新项目任务、撤销租约并保留新增表和项目数据。
+2026-08-29 主机重建产生了全新业务库，旧消息、会话、自定义成员、群组、Computer 及项目文件元数据没有迁移。磁盘上残留的三个对象文件没有对应元数据，按既定规则不会自动恢复为当前文件。新库已重新配对一台 Computer，六个种子 Agent 使用 Codex 引擎在线。功能关闭或代码回滚前，先停止新项目任务、撤销租约并保留新增表和项目数据。
+
+重建后已用独立 PostgreSQL、Redis 和文件目录运行 Linux 验证：预检 5/5、项目文件领域测试 10/10、集成测试 20 项通过，真实 Codex/Grok 外部引擎两项按默认测试模式跳过；业务库和线上目录没有被测试修改。应用子进程退出后由守护器成功恢复，`ensure-running.sh` 重复执行保持同一监督器进程。
 
 Grok 的私有 home、自动更新与跨会话记忆开关依据 [官方设置参考](https://docs.x.ai/build/settings/reference)。受控任务不继承原账号的全局配置。
 
@@ -95,4 +97,4 @@ python scripts/test-project-files-linux.py --host HOST --port PORT --user USER -
 
 ## 当前边界
 
-不是完整 POSIX/协同编辑系统；不自动合并 Office 文件、不自动索引、不接 Git、不提供跨群共享或公开下载。FUSE 文件内容使用有上限的直接 I/O 缓冲；最大目录与版本规模的性能尚未完成测量。先前重复运行问题已经定位并完成 20 轮真实挂载复测；daemon 消失、25MiB HTTP 边界以及真实 Codex/Grok 引擎集成项已在 Linux 隔离环境通过。线上验证项目当前保留 31-byte 的 `cumora-online-check.txt` 供管理员查看。当前剩余验收项是在线测试群中的浏览器上传、Agent 修改与浏览器下载点击闭环。
+不是完整 POSIX/协同编辑系统；不自动合并 Office 文件、不自动索引、不接 Git、不提供跨群共享或公开下载。FUSE 文件内容使用有上限的直接 I/O 缓冲；最大目录与版本规模的性能尚未完成测量。先前重复运行问题已经定位并完成 20 轮真实挂载复测；daemon 消失、25MiB HTTP 边界以及真实 Codex/Grok 引擎集成项已在 Linux 隔离环境通过。主机重建后旧验证项目及其文件元数据已丢失，当前列表不再展示原 `cumora-online-check.txt`。剩余验收项是新建测试群/项目后重新完成浏览器上传、Agent 修改与浏览器下载点击闭环。
