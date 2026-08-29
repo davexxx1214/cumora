@@ -414,6 +414,39 @@ function failurePreview(args: {
   return detail ? `${prefix}\n${detail}`.slice(0, MAX_FAILURE_CHARS) : prefix
 }
 
+/** Write to an engine's stdin without letting a dead pipe crash the process.
+ *
+ *  Every stdin write in this file was wrapped in a try/catch whose comment said
+ *  the child's own error/close path would report the failure. That is not what
+ *  happens. A failed pipe write — EPIPE, when the engine died or was killed
+ *  mid-write — is delivered ASYNCHRONOUSLY as an 'error' event on the stdin
+ *  stream (`afterWriteDispatched`, a tick later), so the try/catch has already
+ *  returned and cannot catch it. With no listener on the stream, Node turns it
+ *  into an uncaught exception. It surfaced as a flaky `write EPIPE` failure in
+ *  PiAdapter.probeWake on CI, but every adapter had the same hole.
+ *
+ *  A dead engine is ordinary: the operator quit the CLI, a turn was aborted,
+ *  doctor tore its probe down. The child's own 'error'/'close' handlers already
+ *  report it, so the stream error is noise — it just must not be UNHANDLED.
+ *
+ *  Returns false when the write could not even be attempted, so callers that
+ *  care can bail; the ones that don't already fall through to their close path. */
+function writeStdin(child: ChildProcess, text: string, opts: { end?: boolean } = {}): boolean {
+  const stdin = child.stdin
+  if (!stdin) return false
+  // Attach once per stream — repeated writes must not stack listeners.
+  if (stdin.listenerCount('error') === 0) {
+    stdin.on('error', () => { /* reported by the child's own close/error path */ })
+  }
+  try {
+    stdin.write(text)
+    if (opts.end) stdin.end()
+    return true
+  } catch {
+    return false
+  }
+}
+
 function spawnEngine(
   bin: string,
   args: string[],
@@ -427,7 +460,7 @@ function spawnEngine(
       shell: spawnOpts.shell ?? false,
     })
     if (spawnOpts.stdinText != null) {
-      try { child.stdin?.write(spawnOpts.stdinText); child.stdin?.end() } catch { /* the 'error' handler resolves */ }
+      writeStdin(child, spawnOpts.stdinText, { end: true })
     }
     const onAbort = (): void => { child.kill('SIGTERM') }
     signal.addEventListener('abort', onAbort, { once: true })
@@ -551,7 +584,7 @@ function spawnCapture(
       shell: shell ?? false,
     })
     if (stdinText != null) {
-      try { child.stdin?.write(stdinText); child.stdin?.end() } catch { /* the 'error' handler resolves */ }
+      writeStdin(child, stdinText, { end: true })
     }
     const onAbort = (): void => { child.kill('SIGTERM') }
     signal.addEventListener('abort', onAbort, { once: true })
@@ -706,10 +739,8 @@ class ClaudeSession implements EngineSession {
         this.pendingTimer.unref?.()
       }
       const msg = JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: stripLoneSurrogates(prompt) }] } }) + '\n'
-      try {
-        this.child.stdin!.write(msg)
-      } catch (err) {
-        this.settle({ exitCode: 1, error: `failed to write turn to engine: ${err instanceof Error ? err.message : String(err)}`, sessionId: this.sid })
+      if (!writeStdin(this.child, msg)) {
+        this.settle({ exitCode: 1, error: 'failed to write turn to engine (stdin closed)', sessionId: this.sid })
       }
     })
   }
@@ -732,9 +763,7 @@ class ClaudeSession implements EngineSession {
     if (!this.pending || !this.alive) return
     while (this.steerQueue.length > 0) {
       const text = this.steerQueue.shift()!
-      try {
-        this.child.stdin!.write(JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: stripLoneSurrogates(text) }] } }) + '\n')
-      } catch { break }
+      if (!writeStdin(this.child, JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: stripLoneSurrogates(text) }] } }) + '\n')) break
     }
   }
 
@@ -1125,10 +1154,8 @@ class CodexSession implements EngineSession {
 
   steer(text: string): void {
     if (!this.alive || !text.trim() || !this.threadId || !this.activeTurnId || this.steerGate) return
-    try {
-      this.child.stdin!.write(JSON.stringify({ jsonrpc: '2.0', id: this.nextId(), method: 'turn/steer',
-        params: { threadId: this.threadId, expectedTurnId: this.activeTurnId, input: [{ type: 'text', text: stripLoneSurrogates(text) }] } }) + '\n')
-    } catch { /* best-effort */ }
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id: this.nextId(), method: 'turn/steer',
+      params: { threadId: this.threadId, expectedTurnId: this.activeTurnId, input: [{ type: 'text', text: stripLoneSurrogates(text) }] } }) + '\n')
   }
 
   stop(): void {
@@ -1140,11 +1167,11 @@ class CodexSession implements EngineSession {
   private nextId(): number { this.reqId += 1; return this.reqId }
   private req(method: string, params: Record<string, unknown>): number {
     const id = this.nextId()
-    try { this.child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n') } catch { /* die() handles */ }
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
     return id
   }
   private notify(method: string, params: Record<string, unknown>): void {
-    try { this.child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n') } catch { /* die() handles */ }
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n')
   }
   private startTurn(prompt: string): void {
     if (this.threadId) {
@@ -1401,7 +1428,7 @@ class CodexAdapter implements EngineAdapter {
       let initialized = false
       let threadAcked = false
       const writeRpc = (msg: object) => {
-        try { child.stdin?.write(JSON.stringify(msg) + '\n') } catch { /* die path handles */ }
+        writeStdin(child, JSON.stringify(msg) + '\n')
       }
       // Kick off the handshake once the process is up. spawn() emits stdout
       // 'data' lazily — that's the point at which we know the child is alive
@@ -1603,7 +1630,7 @@ class GrokSession implements EngineSession {
   private nextId(): number { this.reqId += 1; return this.reqId }
   private req(method: string, params: Record<string, unknown>): number {
     const id = this.nextId()
-    try { this.child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n') } catch { /* die() */ }
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
     return id
   }
 
@@ -1838,7 +1865,7 @@ class GrokAdapter implements EngineAdapter {
       const sessionId = 2
       let initialized = false
       const writeRpc = (msg: object) => {
-        try { child.stdin?.write(JSON.stringify(msg) + '\n') } catch { /* die */ }
+        writeStdin(child, JSON.stringify(msg) + '\n')
       }
       writeRpc({
         jsonrpc: '2.0', id: initId, method: 'initialize',
@@ -2087,7 +2114,7 @@ function spawnCursorStream(
       shell: opts.shell,
     })
     if (opts.stdinText != null) {
-      try { child.stdin?.write(opts.stdinText); child.stdin?.end() } catch { /* the 'error' handler resolves */ }
+      writeStdin(child, opts.stdinText, { end: true })
     }
     const onAbort = (): void => { child.kill('SIGTERM') }
     opts.signal.addEventListener('abort', onAbort, { once: true })
