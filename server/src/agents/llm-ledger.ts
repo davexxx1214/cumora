@@ -59,6 +59,9 @@ export type LlmCallPurpose =
   | 'completion-verify'
   | 'steer-summary'
   | 'convene-decision'
+  // One decision per MESSAGE rather than per agent — it exists to avoid N
+  // big-brain turns, so its own cost belongs next to theirs in the rollup.
+  | 'message-routing'
   // One-shot utilities (rare per call, but unaccounted before this ledger).
   | 'palette'
   | 'gender'

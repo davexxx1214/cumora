@@ -32,6 +32,7 @@ import { deliver as deliverWake, deliverSteer, type PollWakeBrief } from './runt
 import { inprocClient, isAgentBusy } from './runtime/inproc-client.js'
 import { classifyInboxTriage, type InboxTriageVerdict } from './inbox-triage.js'
 import type { AgentTurnOptions } from './turn.js'
+import { recipientsForRoute, routeMessage } from './routing.js'
 import { Semaphore } from '../concurrency.js'
 import { hasExactMention } from './message-routing.js'
 
@@ -607,6 +608,40 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     const dropped = agentRecipients.length - recipients.length
     if (dropped > 0) {
       console.warn(`[scheduler] turn-rate floor: dropped ${dropped} agent-driven wake(s) in ${conversationId} (over ${AGENT_TURN_RATE_PER_MINUTE}/min)`)
+    }
+  }
+
+  // ROUTING (#70). A human message that explicitly NAMES agents is usually for
+  // them, and waking the rest of the room costs a full big-brain turn each to
+  // reach "not mine" — production measures ~26% of group wakes replying with
+  // nothing. Ask the cerebellum ONCE per message (not once per agent) whether the
+  // named agents are the intended audience, and narrow only then.
+  //
+  // Deliberately conservative, because narrowing is the one mistake that is
+  // SILENT — a agent that should have answered and was never woken leaves no
+  // reply, no typing indicator, no agent_runs row. So this only ever runs for a
+  // human-authored group message with a real named subset, and every uncertainty
+  // (@all, no targets, a model error, an unparseable answer) keeps today's full
+  // fan-out. See routing.ts.
+  if (!authorIsAgent && (conversation?.kind ?? 'group') !== 'direct' && recipients.length > 1) {
+    const targets = [
+      ...mentionedAgentIds(messageBody, recipients),
+      ...(quotedAuthorId && recipients.includes(quotedAuthorId) ? [quotedAuthorId] : []),
+    ]
+    const uniqueTargets = [...new Set(targets)]
+    if (uniqueTargets.length > 0) {
+      const mode = await routeMessage({
+        companyId: payload.companyId ?? null,
+        body: messageBody,
+        conversationKind: conversation?.kind ?? 'group',
+        candidates: recipients,
+        targets: uniqueTargets,
+      })
+      const routed = recipientsForRoute(mode, recipients, uniqueTargets)
+      if (routed.length !== recipients.length) {
+        console.log(`[scheduler] routed ${conversationId} to ${routed.join(', ')} (mode=${mode}, ${recipients.length - routed.length} wake(s) avoided)`)
+      }
+      recipients = routed
     }
   }
 

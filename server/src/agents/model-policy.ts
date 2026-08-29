@@ -26,6 +26,7 @@ export type ModelPurpose =
   | 'agenda'
   | 'palette'
   | 'gender'
+  | 'message-routing'
 
 const REAL_TASK_PURPOSES: ReadonlySet<ModelPurpose> = new Set<ModelPurpose>([
   'agent-turn',
