@@ -409,4 +409,4 @@ cd agent-fuse && go test ./...
 - 新增仓库内 `ops/grok-bot/` 验证主机恢复栈，并部署到 `/workspace/cumora-stack`。PostgreSQL 改用 `/workspace/data/postgres`，Redis 使用 `/workspace/data/redis` 且开启 AOF；Cloudflare token、SSH authorized keys、持久 SSH 主机密钥和当前数据库配对的 Computer 配置保存在权限受控的 `secrets/`，不进入仓库。
 - 恢复栈用用户态监督器拉起 Cumora、cloudflared 和项目 daemon，并在子进程退出后重启。`ensure-running.sh` 修复了锁文件描述符继承问题，已验证重复执行不会启动第二个监督器；项目 daemon 也使用独占文件锁，避免重复运行。应用子进程被终止后自动恢复，公网和 SSH 隧道未随之重启。
 - 当前容器 PID 1 为 `tini`，没有 systemd 或 cron，仓库脚本不能自行跨越整机重建。仍需 Grok Routine 或人工调用 `/workspace/cumora-stack/bin/ensure-running.sh`；Routine 可能因长期无活动暂停，因此该方案仍只适合验证环境。
-- 新库已重新配对当前主机，六个种子 Agent 统一使用 Codex 引擎且 Computer 在线。重建后的隔离 Linux 验证使用临时 PostgreSQL、Redis 和文件目录，预检 5/5、领域测试 10/10、集成测试 20 项通过；默认未调用真实外部引擎的两项测试按设计跳过，业务库和线上目录未被测试修改。
+- 新库已重新配对当前主机，六个种子 Agent 及重新创建的 `codex` Agent 统一使用 Codex 引擎且 Computer 在线。重建后的隔离 Linux 验证使用临时 PostgreSQL、Redis 和文件目录，预检 5/5、领域测试 10/10、集成测试 20 项通过；默认未调用真实外部引擎的两项测试按设计跳过，业务库和线上目录未被测试修改。
