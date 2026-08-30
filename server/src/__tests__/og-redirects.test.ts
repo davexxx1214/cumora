@@ -1,36 +1,41 @@
 /**
- * Open Graph redirect SSRF regression tests.
+ * Open Graph SSRF and redirect regression tests.
  *
  * Run: node --import tsx --test server/src/__tests__/og-redirects.test.ts
  */
-import { after, afterEach, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { after, afterEach, beforeEach, test } from 'node:test'
 
 // Keep Redis lazy during this focused unit test. ogPreview's cache methods are
 // stubbed below, so no external service is required.
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
+process.env.OPENAI_API_KEY ??= 'test-key'
 
-const { OgError, ogPreview } = await import('../og.js')
+const { OgError, ogPreview, __setOgFetchDependenciesForTesting } = await import('../og.js')
 const { redis, sub } = await import('../redis.js')
 
-const savedFetch = globalThis.fetch
+type Dependencies = Exclude<Parameters<typeof __setOgFetchDependenciesForTesting>[0], null>
+type RequestTarget = Parameters<Dependencies['request']>[0]
+type OgResponse = Awaited<ReturnType<Dependencies['request']>>
+
 const savedWarn = console.warn
 const savedRedisGet = redis.get.bind(redis)
 const savedRedisSet = redis.set.bind(redis)
 
-type FetchCall = { url: string; redirect: RequestInit['redirect'] }
-
-function href(input: string | URL | Request): string {
-  return typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-}
-
-function htmlResponse(url: string, html: string): Response {
-  const response = new Response(html, {
-    status: 200,
-    headers: { 'content-type': 'text/html; charset=utf-8' },
-  })
-  Object.defineProperty(response, 'url', { value: url })
-  return response
+function response(
+  status: number,
+  headers: Record<string, string> = {},
+  chunks: Array<string | Buffer> = [],
+  onCancel?: () => void,
+): OgResponse {
+  return {
+    status,
+    headers,
+    body: (async function* () {
+      for (const chunk of chunks) yield Buffer.from(chunk)
+    })(),
+    cancel: () => onCancel?.(),
+  }
 }
 
 beforeEach(() => {
@@ -41,7 +46,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  globalThis.fetch = savedFetch
+  __setOgFetchDependenciesForTesting(null)
   console.warn = savedWarn
   ;(redis as unknown as { get: typeof savedRedisGet }).get = savedRedisGet
   ;(redis as unknown as { set: typeof savedRedisSet }).set = savedRedisSet
@@ -52,119 +57,165 @@ after(() => {
   sub.disconnect()
 })
 
-test('ogPreview follows a validated public redirect manually', async () => {
-  const calls: FetchCall[] = []
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = href(input)
-    calls.push({ url, redirect: init?.redirect })
-    if (url === 'https://8.8.8.8/start') {
-      return new Response(null, {
-        status: 302,
-        headers: { location: '/article' },
-      })
-    }
-    if (url === 'https://8.8.8.8/article') {
-      return htmlResponse(url, '<html><head><title>Public article</title></head></html>')
-    }
-    throw new Error(`unexpected fetch: ${url}`)
-  }) as typeof fetch
+test('ogPreview pins the connection to the exact public DNS answer it validated', async () => {
+  let lookupCalls = 0
+  const connected: Array<Pick<RequestTarget, 'hostname' | 'address' | 'family'>> = []
+  __setOgFetchDependenciesForTesting({
+    lookup: async hostname => {
+      assert.equal(hostname, 'rebind.example')
+      lookupCalls += 1
+      // A second resolution would simulate a rebound private answer. The
+      // request layer must receive the first address directly instead.
+      return lookupCalls === 1
+        ? [{ address: '93.184.216.34', family: 4 }]
+        : [{ address: '127.0.0.1', family: 4 }]
+    },
+    request: async target => {
+      connected.push({ hostname: target.hostname, address: target.address, family: target.family })
+      return response(200, { 'content-type': 'text/html' }, [
+        '<html><head><title>Pinned article</title></head></html>',
+      ])
+    },
+  })
 
-  const result = await ogPreview('https://8.8.8.8/start')
+  const result = await ogPreview('https://rebind.example/article')
+
+  assert.equal(result?.title, 'Pinned article')
+  assert.equal(lookupCalls, 1)
+  assert.deepEqual(connected, [
+    { hostname: 'rebind.example', address: '93.184.216.34', family: 4 },
+  ])
+})
+
+test('ogPreview rejects a hostname when any DNS answer is private', async () => {
+  let requests = 0
+  __setOgFetchDependenciesForTesting({
+    lookup: async () => [
+      { address: '93.184.216.34', family: 4 },
+      { address: '10.0.0.8', family: 4 },
+    ],
+    request: async () => {
+      requests += 1
+      return response(500)
+    },
+  })
+
+  await assert.rejects(
+    () => ogPreview('https://mixed.example/article'),
+    (error: unknown) => error instanceof OgError && error.status === 403,
+  )
+  assert.equal(requests, 0)
+})
+
+test('ogPreview revalidates and pins every public redirect hop', async () => {
+  const lookedUp: string[] = []
+  const connected: Array<Pick<RequestTarget, 'hostname' | 'address'>> = []
+  let cancelled = 0
+  __setOgFetchDependenciesForTesting({
+    lookup: async hostname => {
+      lookedUp.push(hostname)
+      return hostname === 'start.example'
+        ? [{ address: '93.184.216.34', family: 4 }]
+        : [{ address: '1.1.1.1', family: 4 }]
+    },
+    request: async target => {
+      connected.push({ hostname: target.hostname, address: target.address })
+      if (target.hostname === 'start.example') {
+        return response(302, { location: 'https://cdn.example/article' }, [], () => { cancelled += 1 })
+      }
+      return response(200, { 'content-type': 'text/html' }, [
+        '<html><head><title>Public article</title></head></html>',
+      ])
+    },
+  })
+
+  const result = await ogPreview('https://start.example/short')
 
   assert.equal(result?.title, 'Public article')
-  assert.equal(result?.finalUrl, 'https://8.8.8.8/article')
-  assert.deepEqual(calls, [
-    { url: 'https://8.8.8.8/start', redirect: 'manual' },
-    { url: 'https://8.8.8.8/article', redirect: 'manual' },
+  assert.equal(result?.finalUrl, 'https://cdn.example/article')
+  assert.deepEqual(lookedUp, ['start.example', 'cdn.example'])
+  assert.deepEqual(connected, [
+    { hostname: 'start.example', address: '93.184.216.34' },
+    { hostname: 'cdn.example', address: '1.1.1.1' },
   ])
+  assert.equal(cancelled, 1)
 })
 
 test('ogPreview rejects a redirect to cloud metadata before the second request', async () => {
-  const calls: FetchCall[] = []
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = href(input)
-    calls.push({ url, redirect: init?.redirect })
-    if (url === 'https://8.8.8.8/redirect-private') {
-      return new Response(null, {
-        status: 302,
-        headers: { location: 'http://169.254.169.254/latest/meta-data/' },
-      })
-    }
-    throw new Error(`private redirect target was fetched: ${url}`)
-  }) as typeof fetch
+  const connected: string[] = []
+  __setOgFetchDependenciesForTesting({
+    lookup: async hostname => hostname === 'start.example'
+      ? [{ address: '93.184.216.34', family: 4 }]
+      : [{ address: '169.254.169.254', family: 4 }],
+    request: async target => {
+      connected.push(target.address)
+      return response(302, { location: 'http://metadata.internal/latest' })
+    },
+  })
 
   await assert.rejects(
-    () => ogPreview('https://8.8.8.8/redirect-private'),
+    () => ogPreview('https://start.example/redirect-private'),
     (error: unknown) => error instanceof OgError && error.status === 403,
   )
-
-  assert.deepEqual(calls, [
-    { url: 'https://8.8.8.8/redirect-private', redirect: 'manual' },
-  ])
+  assert.deepEqual(connected, ['93.184.216.34'])
 })
 
-test('ogPreview rejects a redirect to an RFC1918 host before the second request', async () => {
-  const calls: FetchCall[] = []
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = href(input)
-    calls.push({ url, redirect: init?.redirect })
-    if (url === 'https://8.8.8.8/redirect-rfc1918') {
-      return new Response(null, {
-        status: 307,
-        headers: { location: 'http://10.0.0.1/internal' },
-      })
-    }
-    throw new Error(`private redirect target was fetched: ${url}`)
-  }) as typeof fetch
+test('ogPreview blocks alternate private IP literals before DNS or connect', async () => {
+  for (const url of [
+    'http://127.0.0.1/article',
+    'http://2130706433/article',
+    'http://[::1]/article',
+    'http://[::ffff:7f00:1]/article',
+    'http://[64:ff9b::7f00:1]/article',
+  ]) {
+    let lookups = 0
+    let requests = 0
+    __setOgFetchDependenciesForTesting({
+      lookup: async () => { lookups += 1; return [] },
+      request: async () => { requests += 1; return response(500) },
+    })
 
-  await assert.rejects(
-    () => ogPreview('https://8.8.8.8/redirect-rfc1918'),
-    (error: unknown) => error instanceof OgError && error.status === 403,
-  )
-
-  assert.deepEqual(calls, [
-    { url: 'https://8.8.8.8/redirect-rfc1918', redirect: 'manual' },
-  ])
+    await assert.rejects(
+      () => ogPreview(url),
+      (error: unknown) => error instanceof OgError && error.status === 403,
+      url,
+    )
+    assert.equal(lookups, 0, url)
+    assert.equal(requests, 0, url)
+  }
 })
 
 test('ogPreview rejects a redirect to a non-http protocol', async () => {
-  const calls: FetchCall[] = []
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = href(input)
-    calls.push({ url, redirect: init?.redirect })
-    if (url === 'https://8.8.8.8/redirect-file') {
-      return new Response(null, {
-        status: 302,
-        headers: { location: 'file:///etc/passwd' },
-      })
-    }
-    throw new Error(`non-http redirect target was fetched: ${url}`)
-  }) as typeof fetch
+  let requests = 0
+  __setOgFetchDependenciesForTesting({
+    lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+    request: async () => {
+      requests += 1
+      return response(302, { location: 'file:///etc/passwd' })
+    },
+  })
 
   await assert.rejects(
-    () => ogPreview('https://8.8.8.8/redirect-file'),
+    () => ogPreview('https://start.example/redirect-file'),
     (error: unknown) => error instanceof OgError && error.status === 400,
   )
-
-  assert.deepEqual(calls, [
-    { url: 'https://8.8.8.8/redirect-file', redirect: 'manual' },
-  ])
+  assert.equal(requests, 1)
 })
 
 test('ogPreview stops after the bounded redirect limit', async () => {
-  const calls: FetchCall[] = []
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = href(input)
-    calls.push({ url, redirect: init?.redirect })
-    return new Response(null, {
-      status: 302,
-      headers: { location: `/loop/${calls.length}` },
-    })
-  }) as typeof fetch
+  let requests = 0
+  let cancelled = 0
+  __setOgFetchDependenciesForTesting({
+    lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+    request: async () => {
+      requests += 1
+      return response(302, { location: `/loop/${requests}` }, [], () => { cancelled += 1 })
+    },
+  })
 
-  const result = await ogPreview('https://8.8.8.8/loop/0')
+  const result = await ogPreview('https://loop.example/loop/0')
 
   assert.equal(result, null)
-  assert.equal(calls.length, 6)
-  assert.ok(calls.every(({ redirect }) => redirect === 'manual'))
+  assert.equal(requests, 6)
+  assert.equal(cancelled, 6)
 })
