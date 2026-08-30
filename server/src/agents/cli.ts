@@ -1404,7 +1404,7 @@ async function cmdShip(parsed: ParsedArgs): Promise<CliResult> {
 // `agents/membership.ts` so the HTTP endpoints (POST /members,
 // POST /leave) and the agent CLI share one implementation. Importing
 // here re-exposes the names this file already used.
-import { postMembershipSystemMessage } from './membership.js'
+import { addConversationMember, postMembershipSystemMessage, removeConversationMember } from './membership.js'
 
 async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
@@ -1436,11 +1436,7 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
     participantId: me,
   })
 
-  const next = c.members.filter((m) => m !== me)
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1`,
-    [convoId, JSON.stringify(next)],
-  )
+  const next = await removeConversationMember({ conversationId: convoId, memberId: me }) ?? []
 
   return ok(`left "${c.title}" (${convoId}); ${next.length} member(s) remain`, [{
     event: 'conversation.membership_changed',
@@ -1487,11 +1483,7 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
     if (!pp[0]) return err(`${target} is not a participant in this workspace`)
   }
 
-  const next = [...c.members, target]
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1`,
-    [convoId, JSON.stringify(next)],
-  )
+  const next = await addConversationMember({ conversationId: convoId, memberId: target }) ?? []
 
   const systemMessage = await postMembershipSystemMessage({
     conversationId: convoId,
@@ -1557,12 +1549,12 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
     participantId: target,
   })
 
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1`,
-    [convoId, JSON.stringify(next)],
-  )
+  // Report what the row actually holds now, not the array we predicted from a
+  // read taken before the guards above — a concurrent join or leave lands in
+  // between, and the count is user-visible.
+  const remaining = await removeConversationMember({ conversationId: convoId, memberId: target }) ?? []
 
-  return ok(`kicked ${target} from "${c.title}" (${convoId}); ${next.length} member(s) remain`, [{
+  return ok(`kicked ${target} from "${c.title}" (${convoId}); ${remaining.length} member(s) remain`, [{
     event: 'conversation.membership_changed',
     command: 'kick',
     action: 'kicked',
@@ -1571,7 +1563,7 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
     participantId: target,
     companyId: c.company_id ?? undefined,
     systemMessageId: systemMessage.messageId,
-    memberCount: next.length,
+    memberCount: remaining.length,
     visibleToUser: true,
   }])
 }

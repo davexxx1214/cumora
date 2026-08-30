@@ -21,6 +21,82 @@ import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, publish } from '../redis.js'
 
+/**
+ * Add `memberId` to a conversation's member list and return the list as it
+ * stands AFTER the write.
+ *
+ * The array is edited by Postgres, not by us. Every caller used to SELECT
+ * `members`, splice it in JavaScript and write the whole array back, which
+ * makes two overlapping membership changes a last-write-wins race: the second
+ * write is computed from a snapshot taken before the first, so the first one
+ * is erased with no error anywhere.
+ *
+ * That is not a rare interleaving here. The scheduler wakes several agents for
+ * the same message, and `invite` / `leave` / `kick` are what those agents do
+ * next. And the damage is silent in the worst way: the `joined` system row is
+ * posted regardless, so the transcript records a join that did not happen,
+ * while the agent's mailbox query (`members @> [agentId]`) never matches, so
+ * they are simply never woken for that conversation again.
+ *
+ * `companyId` is the tenant guard the HTTP paths already applied; omit it on
+ * the agent CLI paths, which resolve the conversation by id.
+ *
+ * Returns null when the conversation does not exist (or is not in that tenant).
+ */
+export async function addConversationMember(args: {
+  conversationId: string
+  memberId: string
+  companyId?: string | null
+}): Promise<string[] | null> {
+  const tenant = args.companyId ? ' AND company_id = $3' : ''
+  const params = args.companyId
+    ? [args.conversationId, args.memberId, args.companyId]
+    : [args.conversationId, args.memberId]
+  const { rows } = await pool.query<{ members: string[] }>(
+    `UPDATE conversations
+        SET members = members || to_jsonb(ARRAY[$2::text]), updated_at = NOW()
+      WHERE id = $1 AND NOT (members @> to_jsonb(ARRAY[$2::text]))${tenant}
+      RETURNING members`,
+    params,
+  )
+  if (rows[0]) return rows[0].members
+  // No row updated: either they were already a member — which is the outcome
+  // the caller wanted, and the reason the guard is in the WHERE rather than
+  // only in JavaScript — or the conversation is gone. Read back to tell those
+  // apart, and to answer with a current list rather than a stale one.
+  const { rows: current } = await pool.query<{ members: string[] }>(
+    `SELECT members FROM conversations WHERE id = $1${args.companyId ? ' AND company_id = $2' : ''}`,
+    args.companyId ? [args.conversationId, args.companyId] : [args.conversationId],
+  )
+  return current[0]?.members ?? null
+}
+
+/**
+ * Remove `memberId` from a conversation's member list, returning the list as
+ * it stands after the write. Same reasoning as addConversationMember.
+ *
+ * `jsonb - text` deletes every matching element, so this is idempotent and
+ * also cleans up a duplicate left behind by the old racy path.
+ */
+export async function removeConversationMember(args: {
+  conversationId: string
+  memberId: string
+  companyId?: string | null
+}): Promise<string[] | null> {
+  const tenant = args.companyId ? ' AND company_id = $3' : ''
+  const params = args.companyId
+    ? [args.conversationId, args.memberId, args.companyId]
+    : [args.conversationId, args.memberId]
+  const { rows } = await pool.query<{ members: string[] }>(
+    `UPDATE conversations
+        SET members = members - $2::text, updated_at = NOW()
+      WHERE id = $1${tenant}
+      RETURNING members`,
+    params,
+  )
+  return rows[0]?.members ?? null
+}
+
 /** Atomically claim the next sequence number for a conversation.
  *  Same UPSERT pattern as the human reply path and `cumora reply`. */
 export async function nextConversationSequence(conversationId: string): Promise<number> {
