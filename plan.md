@@ -427,3 +427,4 @@ cd agent-fuse && go test ./...
 - 项目文件正文根已确认是 `/workspace/cumora-data/project-files`（0700）。任务内 `/projects/<projectId>` 仅是受控 FUSE 挂载，不承载持久化正文；恢复脚本新增真实路径校验，功能开启时若 `CUMORA_PROJECT_FILES_ROOT` 不在 `/workspace` 下则拒绝启动，防止以后误写容器临时层。
 - 2026-08-30 二阶段多仓库实现以 `7e75be5` 推送至 `origin/dev` 并部署到 `/workspace/cumora`。隔离 Linux 验证预检 5/5、项目工作区单元测试 12/12、项目集成测试 22/22；覆盖一套加密项目凭据服务多个仓库、真实 GitHub HTTPS clone、共享配额、真人写入拒绝、Agent 编辑和受控 commit、真实 FUSE、撤权隔离及常用文档程序访问。两项需要真实外部模型的测试按设计跳过，未接触业务库。
 - 远程数据库已创建 `project_git_access` 与 `project_git_repositories`，部署核验时均为 0 行；没有为验收写入假凭据。功能根为 `/workspace/cumora-data/project-git`（0700，`box:box`），`.env` 已启用项目 Git 并设置独立加密密钥。恢复栈的 `start-deps.sh` 同步了 `/workspace` 路径守卫；公网和本机 `/api/health` 均返回 200。剩余线上点击验收需要真实目标仓库和管理员凭据。
+- 2026-08-30 针对主监督器退出后 Cloudflare 1033，恢复栈增加独立 `watchdog.py`：检查监督器、本机 API 和 Cloudflare `/ready`，连续失败时清理登记过的孤儿进程组并调用幂等恢复脚本。监督器同时改为观察仍存活的项目 daemon 单实例，避免父进程被杀后每 5 秒启动一次锁失败的副本。整台 Grok Bot computer 重建仍需外部 Routine 或人工唤醒，不把用户态看门狗描述为系统级开机自启。

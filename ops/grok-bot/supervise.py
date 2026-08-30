@@ -20,6 +20,7 @@ import time
 
 STACK = pathlib.Path("/workspace/cumora-stack")
 RUN_DIR = STACK / "run"
+CHILD_DIR = RUN_DIR / "children"
 LOG_DIR = STACK / "logs"
 BIN_DIR = STACK / "bin"
 SECRETS_DIR = STACK / "secrets"
@@ -27,7 +28,7 @@ REPO = pathlib.Path("/workspace/cumora")
 TOKEN_FILE = SECRETS_DIR / "cloudflared-token"
 START_DEPS = BIN_DIR / "start-deps.sh"
 
-for directory in (RUN_DIR, LOG_DIR):
+for directory in (RUN_DIR, CHILD_DIR, LOG_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 os.umask(0o077)
@@ -56,6 +57,31 @@ def runtime_env() -> dict[str, str]:
             parts.insert(0, extra)
     env["PATH"] = ":".join(parts)
     return env
+
+
+def read_matching_pid(path: pathlib.Path, marker: str) -> int | None:
+    try:
+        pid = int(path.read_text().strip())
+        cmdline = (pathlib.Path("/proc") / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", errors="replace"
+        )
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+        return None
+    return pid if marker in cmdline else None
+
+
+def record_child(name: str, pid: int) -> pathlib.Path:
+    path = CHILD_DIR / f"{name}.pid"
+    path.write_text(str(pid))
+    return path
+
+
+def forget_child(path: pathlib.Path, pid: int) -> None:
+    try:
+        if int(path.read_text().strip()) == pid:
+            path.unlink(missing_ok=True)
+    except (FileNotFoundError, ValueError, OSError):
+        pass
 
 
 def ensure_dependencies() -> bool:
@@ -122,11 +148,52 @@ def supervise(name: str, command: list[str], cwd: pathlib.Path | None, log_file:
             )
             with children_lock:
                 children[name] = proc
+            child_pid_file = record_child(name, proc.pid)
             code = proc.wait()
             with children_lock:
                 children.pop(name, None)
+            forget_child(child_pid_file, proc.pid)
         if not stopping:
             log(f"{name} exited with {code}; restarting in 5 seconds")
+            time.sleep(5)
+
+
+def supervise_project_daemon(command: list[str], log_file: pathlib.Path) -> None:
+    """Run the paired daemon once, or observe an orphan left by a killed parent."""
+
+    pid_file = RUN_DIR / "project-daemon.pid"
+    observed_pid: int | None = None
+    while not stopping:
+        existing_pid = read_matching_pid(pid_file, "project-daemon-supervisor.py")
+        if existing_pid is not None:
+            if observed_pid != existing_pid:
+                log(f"observing existing project-daemon {existing_pid}")
+                observed_pid = existing_pid
+            time.sleep(2)
+            continue
+        observed_pid = None
+        if not ensure_dependencies():
+            time.sleep(15)
+            continue
+        with log_file.open("ab", buffering=0) as output:
+            log("starting project-daemon")
+            proc = subprocess.Popen(
+                command,
+                env=runtime_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            with children_lock:
+                children["project-daemon"] = proc
+            child_pid_file = record_child("project-daemon", proc.pid)
+            code = proc.wait()
+            with children_lock:
+                children.pop("project-daemon", None)
+            forget_child(child_pid_file, proc.pid)
+        if not stopping:
+            log(f"project-daemon exited with {code}; restarting in 5 seconds")
             time.sleep(5)
 
 
@@ -152,23 +219,27 @@ specs: list[tuple[str, list[str], pathlib.Path | None, pathlib.Path]] = [
     ),
 ]
 
-# Pairing belongs to the current Cumora database. Enable this marker only after
-# a fresh computer.json has been stored in the durable secret directory and the
-# reviewed runtime settings have been written to project-daemon.env.
-if (SECRETS_DIR / "project-daemon.enabled").exists():
-    specs.append(
-        (
-            "project-daemon",
-            ["/usr/bin/python3", str(BIN_DIR / "project-daemon-supervisor.py"), "daemon"],
-            None,
-            LOG_DIR / "project-daemon.log",
-        )
-    )
-
 threads = [
     threading.Thread(target=supervise, name=name, args=(name, command, cwd, log_file), daemon=False)
     for name, command, cwd, log_file in specs
 ]
+# Pairing belongs to the current Cumora database. Enable this marker only after
+# a fresh computer.json has been stored in the durable secret directory and the
+# reviewed runtime settings have been written to project-daemon.env. A daemon
+# orphaned by a killed main supervisor remains valid; observe that singleton
+# until it exits instead of starting a lock-failing process every five seconds.
+if (SECRETS_DIR / "project-daemon.enabled").exists():
+    threads.append(
+        threading.Thread(
+            target=supervise_project_daemon,
+            name="project-daemon",
+            args=(
+                ["/usr/bin/python3", str(BIN_DIR / "project-daemon-supervisor.py"), "daemon"],
+                LOG_DIR / "project-daemon.log",
+            ),
+            daemon=False,
+        )
+    )
 for thread in threads:
     thread.start()
 

@@ -4,9 +4,14 @@ These scripts keep the Cumora validation stack alive inside the current Grok
 Bot computer. They are not a production init system.
 
 The host uses `tini` as PID 1 and does not run systemd or a cron daemon. The
-supervisor restarts child processes, but something outside the container still
-has to call `ensure-running.sh` after a full computer rebuild. Use a Grok Bot
-routine for that platform-level wake-up, or run the command manually:
+supervisor restarts child processes. A separate `watchdog.py` checks the
+supervisor, the local API, and the Cloudflare connector every 15 seconds and
+recovers the stack after four consecutive health failures. It also cleans up
+recorded orphan process groups before replacing a killed supervisor.
+
+Something outside the container still has to call `ensure-running.sh` after a
+full computer rebuild. Use a Grok Bot routine for that platform-level wake-up,
+or run the command manually:
 
 ```sh
 /workspace/cumora-stack/bin/ensure-running.sh
@@ -16,6 +21,11 @@ The routine should call only that idempotent command and report a failure when
 the public health endpoint is not HTTP 200. Grok routines can be paused after a
 long period of inactivity, so this remains a validation setup. Move the service
 to a normal VPS with systemd before treating it as production.
+
+`ensure-running.sh` ensures exactly one main supervisor and one independent
+watchdog. If a killed main supervisor leaves the project daemon alive, the
+replacement observes that singleton instead of spawning a new process every
+five seconds.
 
 Persistent state is kept outside the container image:
 
