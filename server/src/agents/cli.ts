@@ -380,7 +380,7 @@ SKILLS  (progressive-disclosure capability packs in your own workspace):
   skills read <name> [<sub-path>]                  load full SKILL.md (or a bundled file)
   skills create <name> "<description>"             scaffold a new skill
   skills search <query>                            search SkillHub (requires SKILLHUB_URL)
-  skills install <id_or_url>                       install from SkillHub or any compatible URL
+  skills install <id>                              install from the configured SkillHub
   skills delete <name>                             remove a skill
   react <message_id> <emoji>                       toggle an emoji reaction on any message
   palette "<brief>"                                generate a 5-color hex palette
@@ -2513,8 +2513,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
       // verbatim so the agent can paste/run it without thinking.
       return ok(hits.map((h) => {
         const meta = [h.version && `v${h.version}`, h.author && `by ${h.author}`].filter(Boolean).join(' · ')
-        const tag = h.install_url ?? h.name
-        return `  ${h.name}${meta ? `  (${meta})` : ''}\n    ${h.description}\n    → cumora skills install ${tag}`
+        return `  ${h.name}${meta ? `  (${meta})` : ''}\n    ${h.description}\n    → cumora skills install ${h.name}`
       }).join('\n\n'))
     } catch (e) {
       return err(`skills search failed: ${e instanceof Error ? e.message : String(e)}`)
@@ -2522,12 +2521,12 @@ on demand via \`cumora skills read ${name} references/<file>\`._
   }
 
   if (op === 'install') {
-    const idOrUrl = parsed.positional[1]
-    if (!idOrUrl) return err('usage: skills install <skill_id_or_install_url>')
+    const skillId = parsed.positional[1]
+    if (!skillId) return err('usage: skills install <skill_id>')
     try {
       const { env } = await import('../env.js')
       const { fetchSkillManifest, installSkillFromManifest } = await import('./skills.js')
-      const manifest = await fetchSkillManifest(idOrUrl, env.SKILLHUB_URL)
+      const manifest = await fetchSkillManifest(skillId, env.SKILLHUB_URL)
       const result = await installSkillFromManifest({ agentId: me, manifest })
       return ok(
         `installed skill "${result.name}" (${result.files} file${result.files === 1 ? '' : 's'})\n` +
@@ -2538,7 +2537,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
           agentId: me,
           skillName: result.name,
           fileCount: result.files,
-          source: idOrUrl,
+          source: skillId,
         }],
       )
     } catch (e) {
@@ -2552,7 +2551,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
     '  skills read <name> [<sub-path>]             load full SKILL.md (or a bundled file)\n' +
     '  skills create <name> "<description>"        scaffold a new skill\n' +
     '  skills search <query>                       search the configured SkillHub\n' +
-    '  skills install <id_or_url>                  install a skill from SkillHub (or any compatible URL)\n' +
+    '  skills install <id>                         install a skill from the configured SkillHub\n' +
     '  skills delete <name>                        remove a skill and all its files',
   )
 }

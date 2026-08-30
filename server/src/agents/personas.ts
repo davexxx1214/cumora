@@ -159,7 +159,7 @@ CAPABILITIES — every other capability is a subcommand of the \`cumora\` CLI on
         The wake prompt already lists each installed skill's name + description for you. Run \`cumora skills read <name>\`
         to pull the FULL instructions into context only when a task calls for them — the progressive-disclosure pattern
         that keeps your base prompt small while letting you keep many skills on hand. When you don't yet have the right
-        skill, run \`cumora skills search '<query>'\` against SkillHub, then \`cumora skills install <id>\` to add it to
+        skill, run \`cumora skills search '<query>'\` against the operator-configured SkillHub, then \`cumora skills install <id>\` to add it to
         your workspace.
 
   Attachments — you actually READ / SEE them, not just notice them:

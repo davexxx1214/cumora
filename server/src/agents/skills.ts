@@ -108,8 +108,10 @@ export interface SkillHubSearchHit {
   description: string
   version?: string
   author?: string
-  /** Full URL to fetch the install manifest. Optional — if absent we
-   *  fall back to `<hub>/skills/<name>`. */
+  /** Optional hub metadata. Cumora deliberately does not fetch this URL:
+   *  install requests are always rebuilt from the operator-configured hub
+   *  plus the skill id, so an agent or a compromised search response cannot
+   *  turn the server into an arbitrary HTTP client. */
   install_url?: string
 }
 
@@ -134,24 +136,32 @@ const MAX_FILE_BODY_BYTES = 256 * 1024  // 256KB per file
 export async function searchSkillHub(query: string, hubUrl: string): Promise<SkillHubSearchHit[]> {
   if (!hubUrl) throw new Error('SkillHub URL not configured — set SKILLHUB_URL on the server')
   const url = `${hubUrl.replace(/\/+$/, '')}/search?q=${encodeURIComponent(query)}`
-  const r = await fetch(url, { signal: AbortSignal.timeout(HUB_TIMEOUT_MS) })
+  const r = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(HUB_TIMEOUT_MS),
+  })
   if (!r.ok) throw new Error(`hub search failed: HTTP ${r.status}`)
   const json = await r.json()
   if (!Array.isArray(json)) throw new Error('hub search returned non-array')
   return json as SkillHubSearchHit[]
 }
 
-/** Resolve a skill id (or full install URL) to a manifest. When called
- *  with a bare id we look it up on the configured hub; with an http(s)
- *  URL we fetch directly (lets agents install from non-hub sources). */
-export async function fetchSkillManifest(idOrUrl: string, hubUrl: string): Promise<SkillManifest> {
-  const url = /^https?:\/\//.test(idOrUrl)
-    ? idOrUrl
-    : (() => {
-        if (!hubUrl) throw new Error('SkillHub URL not configured — set SKILLHUB_URL or pass a full install URL')
-        return `${hubUrl.replace(/\/+$/, '')}/skills/${encodeURIComponent(idOrUrl)}`
-      })()
-  const r = await fetch(url, { signal: AbortSignal.timeout(HUB_TIMEOUT_MS) })
+/** Resolve a skill id to a manifest on the operator-configured hub.
+ *
+ * Agent-controlled URLs are intentionally rejected. The server owns the
+ * network destination; the agent controls only an encoded path segment.
+ * Redirects are disabled as well, so a trusted-looking hub response cannot
+ * pivot the request to metadata, loopback, or another internal service. */
+export async function fetchSkillManifest(skillId: string, hubUrl: string): Promise<SkillManifest> {
+  if (/^https?:\/\//i.test(skillId) || skillId.startsWith('//')) {
+    throw new Error('explicit install URLs are not allowed — install by skill id from the configured SkillHub')
+  }
+  if (!hubUrl) throw new Error('SkillHub URL not configured — set SKILLHUB_URL')
+  const url = `${hubUrl.replace(/\/+$/, '')}/skills/${encodeURIComponent(skillId)}`
+  const r = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(HUB_TIMEOUT_MS),
+  })
   if (!r.ok) throw new Error(`hub install failed: HTTP ${r.status}`)
   const json = await r.json() as Partial<SkillManifest>
   if (!json || typeof json !== 'object') throw new Error('manifest is not an object')

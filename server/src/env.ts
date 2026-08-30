@@ -165,7 +165,7 @@ export const env = {
    *   GET  <hub>/search?q=<query>
    *     → [{ name, description, version?, author?, install_url }]
    *
-   *   GET  <hub>/skills/<name>   (also any explicit install_url)
+   *   GET  <hub>/skills/<name>
    *     → { name, description, version?, author?, files: [
    *           { path: 'SKILL.md', body: '...' },
    *           { path: 'scripts/foo.py', body: '...' },
