@@ -13,25 +13,34 @@ flock 9
 
 process_matches() {
   local pid_file=$1
-  local marker=$2
+  local expected_arg=$2
   [ -s "$pid_file" ] || return 1
   local pid
   pid=$(cat "$pid_file")
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   [ -r "/proc/$pid/cmdline" ] || return 1
-  grep -Fqa -- "$marker" "/proc/$pid/cmdline"
+  cmdline_has_arg "$pid" "$expected_arg"
+}
+
+cmdline_has_arg() {
+  local pid=$1
+  local expected_arg=$2
+  local arg
+  while IFS= read -r -d '' arg; do
+    [ "$arg" = "$expected_arg" ] && return 0
+  done <"/proc/$pid/cmdline"
+  return 1
 }
 
 find_process() {
   local pid_file=$1
-  local marker=$2
-  local cmdline pid
-  for cmdline in /proc/[0-9]*/cmdline; do
-    pid=${cmdline#/proc/}
-    pid=${pid%/cmdline}
+  local expected_arg=$2
+  local proc_dir pid
+  for proc_dir in /proc/[0-9]*; do
+    pid=${proc_dir#/proc/}
     [ "$pid" != "$$" ] || continue
-    if grep -Fqa -- "$marker" "$cmdline" 2>/dev/null; then
+    if [ -r "$proc_dir/cmdline" ] && cmdline_has_arg "$pid" "$expected_arg" 2>/dev/null; then
       printf '%s\n' "$pid" >"$pid_file"
       return 0
     fi
