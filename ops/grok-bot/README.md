@@ -22,12 +22,18 @@ Persistent state is kept outside the container image:
 - PostgreSQL: `/workspace/data/postgres`
 - Redis: `/workspace/data/redis`
 - project objects: `/workspace/cumora-data/project-files`
+- private Git mirrors: `/workspace/cumora-data/project-git`
 - host bootstrap: `/workspace/cumora-stack`
 
 When project files are enabled, `start-deps.sh` resolves
 `CUMORA_PROJECT_FILES_ROOT` and refuses to start if it is outside `/workspace`.
 The `/projects/<projectId>` path seen by an Agent task is an ephemeral,
 controlled FUSE mount; it is not the backing storage location.
+
+When project Git is enabled, the same check applies to
+`CUMORA_PROJECT_GIT_ROOT`. Git tokens stay encrypted in PostgreSQL; mirrors
+contain token-free remote URLs and are not mounted into Agent tasks. Each task
+receives a fresh checkout under its isolated `/home/agent/repository`.
 
 `/workspace/cumora-stack/secrets` is mode 0700. It contains the Cloudflare
 connector token, persistent SSH host key, SSH authorized keys, and (after a new

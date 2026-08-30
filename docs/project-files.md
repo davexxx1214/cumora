@@ -52,6 +52,9 @@ API 重启生成新的服务实例标识，旧租约立即失效。租约过期�
 | --- | --- |
 | `CUMORA_PROJECT_FILES_ENABLED=1` | API 功能开关，默认关闭 |
 | `CUMORA_PROJECT_FILES_ROOT` | API 私有文件根的绝对路径 |
+| `CUMORA_PROJECT_GIT_ENABLED=1` | 二阶段项目 Git 功能开关，默认关闭 |
+| `CUMORA_PROJECT_GIT_ROOT` | 私有 Git mirror 根；Grok Bot 使用 `/workspace/cumora-data/project-git` |
+| `CUMORA_GIT_CREDENTIAL_ENCRYPTION_SECRET` | 可选的 Git token 专用加密密钥；未设时从 Agent runtime secret 做域隔离派生 |
 | `CUMORA_PROJECT_HOST_SECRET` | API/可信 daemon 共享的宿主机控制密钥 |
 | `CUMORA_PROJECT_TASKS_ENABLED=1` | daemon 允许受控 Linux 任务 |
 | `CUMORA_PROJECT_LOCAL_API=http://127.0.0.1:5181` | 本机 API，不能填公网隧道 URL |
@@ -98,4 +101,10 @@ python scripts/test-project-files-linux.py --host HOST --port PORT --user USER -
 
 ## 当前边界
 
-不是完整 POSIX/协同编辑系统；不自动合并 Office 文件、不自动索引、不接 Git、不提供跨群共享或公开下载。FUSE 文件内容使用有上限的直接 I/O 缓冲；最大目录与版本规模的性能尚未完成测量。先前重复运行问题已经定位并完成 20 轮真实挂载复测；daemon 消失、25MiB HTTP 边界以及真实 Codex/Grok 引擎集成项已在 Linux 隔离环境通过。主机重建后旧验证项目及其文件元数据已丢失，当前列表不再展示原 `cumora-online-check.txt`。剩余验收项是新建测试群/项目后重新完成浏览器上传、Agent 修改与浏览器下载点击闭环。
+不是完整 POSIX/协同编辑系统；不自动合并 Office 文件、不自动索引、不把 Git checkout 混入共享文档、不提供跨群共享或公开下载。FUSE 文件内容使用有上限的直接 I/O 缓冲；最大目录与版本规模的性能尚未完成测量。先前重复运行问题已经定位并完成 20 轮真实挂载复测；daemon 消失、25MiB HTTP 边界以及真实 Codex/Grok 引擎集成项已在 Linux 隔离环境通过。主机重建后旧验证项目及其文件元数据已丢失，当前列表不再展示原 `cumora-online-check.txt`。剩余验收项是新建测试群/项目后重新完成浏览器上传、Agent 修改与浏览器下载点击闭环。
+
+## 二阶段 Git（2026-08-30）
+
+项目 Git 与共享文档是两个独立空间。管理员在“项目文件”面板配置 HTTPS 仓库、默认分支和工作区 Git 凭据；多个凭据中同一时间只能启用一个，且凭据只用于匹配的 Git Host。服务端同步的私有 mirror 和 token 都不会挂给 Agent。
+
+新项目任务会获得 `/home/agent/repository` 独立 checkout，并从已同步默认分支开始。用户可要求 Agent 在该任务内切换已有分支。任务 checkout 没有 token，首批不提供 fetch/push；管理员重新同步后，后续任务使用新提交。共享文档仍位于 `/projects/<projectId>`，不自动进入模型上下文，Git 仓库也不因挂载或任务启动而自动扫描。

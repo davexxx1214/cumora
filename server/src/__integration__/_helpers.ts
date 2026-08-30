@@ -57,6 +57,8 @@ const TABLES_TO_WIPE: readonly string[] = [
   'conversation_reads',
   'conversation_counters',
   'messages',
+  'project_git_settings',
+  'company_git_credentials',
   'conversations',
   'agent_climate',
   'agent_workspace',

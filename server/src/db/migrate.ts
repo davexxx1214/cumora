@@ -5,6 +5,7 @@
  */
 import { pool } from './pool.js'
 import { PROJECT_FILES_DDL } from '../project-files/ddl.js'
+import { PROJECT_GIT_DDL } from '../project-git/ddl.js'
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -907,6 +908,7 @@ ALTER TABLE conversations ADD COLUMN IF NOT EXISTS project_id TEXT
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id);
 
 ${PROJECT_FILES_DDL}
+${PROJECT_GIT_DDL}
 
 -- ============== Company invitations =====================================
 -- Owners / admins mint short URL-safe tokens that anyone can redeem to

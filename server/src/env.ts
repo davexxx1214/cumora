@@ -194,6 +194,11 @@ export const env = {
     process.env.INVITE_TOKEN_ENCRYPTION_SECRET
     ?? process.env.AGENT_RUNTIME_SECRET
     ?? DEV_AGENT_RUNTIME_SECRET,
+  /** AES-GCM key material for administrator-managed Git access tokens. */
+  GIT_CREDENTIAL_ENCRYPTION_SECRET:
+    process.env.CUMORA_GIT_CREDENTIAL_ENCRYPTION_SECRET
+    ?? process.env.AGENT_RUNTIME_SECRET
+    ?? DEV_AGENT_RUNTIME_SECRET,
   /**
    * Full URL the agent-runner pod uses to reach the cumora server's
    * `/runtime` API (note the trailing path). From OrbStack K8s a pod
@@ -326,6 +331,8 @@ export const env = {
   /** Phase-one project files stay disabled until the isolated runner is configured. */
   PROJECT_FILES_ENABLED: process.env.CUMORA_PROJECT_FILES_ENABLED === '1',
   PROJECT_FILES_ROOT: process.env.CUMORA_PROJECT_FILES_ROOT ?? '',
+  PROJECT_GIT_ENABLED: process.env.CUMORA_PROJECT_GIT_ENABLED === '1',
+  PROJECT_GIT_ROOT: process.env.CUMORA_PROJECT_GIT_ROOT ?? '',
   /**
    * sub2api LLM quota gateway. When SUB2API_ADMIN_KEY is set, OAuth
    * signup provisions a per-user sub2api account + API key, and every

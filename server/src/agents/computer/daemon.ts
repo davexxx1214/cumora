@@ -28,7 +28,7 @@ import { promisify } from 'node:util'
 const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { controlledTasksEnabled, freshProjectHome, prepareTaskAuth, sandboxConfig, withTaskSandbox } from './task-sandbox.js'
-import { localProjectServer, projectHostRequest, projectTaskPrompt, recoverProjectStops, selectProjectTaskRows, trackProjectTask, type ProjectTaskContext, type ProjectTaskLease } from './project-task.js'
+import { localProjectServer, prepareTaskRepository, projectHostRequest, projectTaskPrompt, recoverProjectStops, selectProjectTaskRows, trackProjectTask, type ProjectTaskContext, type ProjectTaskLease } from './project-task.js'
 import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
@@ -1311,6 +1311,12 @@ class AgentRunner {
     await writeFile(join(home, 'CLAUDE.md'), persona, { mode: 0o600 })
     await writeShim(join(home, 'bin'))
     await prepareTaskAuth(home)
+    let taskGit: { path: string; branch: string } | null = null
+    let gitWarning: string | null = null
+    if (context.git) {
+      try { taskGit = await prepareTaskRepository(home, context.git) }
+      catch (error) { gitWarning = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300) }
+    }
     const lease = await projectHostRequest<ProjectTaskLease>(token, '/leases', { conversationId, runId, bindingVersion: context.bindingVersion })
     const tracked = await trackProjectTask(this.agent.id, lease).catch(async error => {
       // No process has started: release this lease even if registry creation fails.
@@ -1321,7 +1327,7 @@ class AgentRunner {
       const sandbox = await sandboxConfig(home, localProjectServer(), lease)
       sandbox.onSpawn = tracked.onSpawn
       return await withTaskSandbox(sandbox, () => this.adapter.run({
-        home, prompt: projectTaskPrompt({ conversationId, projectId: lease.projectId, digest }),
+        home, prompt: projectTaskPrompt({ conversationId, projectId: lease.projectId, digest, git: taskGit, gitWarning }),
         env: { ...this.engineEnv(), CUMORA_AGENT_RUNTIME_URL: `${localProjectServer()}/project-fs`, CUMORA_AGENT_RUNTIME_TOKEN: lease.token,
           CUMORA_AGENT_RUNTIME_TOKEN_FILE: undefined, CUMORA_PROJECT_ID: lease.projectId, CUMORA_PROJECT_PATH: lease.path, CUMORA_CONVERSATION_ID: conversationId },
         model: this.engineModel(), fastModel: this.engineFastModel(), resumeSessionId: null,

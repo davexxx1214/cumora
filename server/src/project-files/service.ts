@@ -6,6 +6,7 @@ import { CH_CONVO_UPDATED, publish } from '../redis.js'
 import { emptyProjectState, fail, type FileActor, type ProjectFileState } from './model.js'
 import { LocalProjectObjects } from './objects.js'
 import { ProjectFileWorkspace, type FileScope, type FileTransaction } from './workspace.js'
+import { readyProjectGit } from '../project-git/service.js'
 
 const SERVER_INSTANCE = randomUUID()
 export const filesEnabled = () => env.PROJECT_FILES_ENABLED
@@ -48,7 +49,9 @@ export async function currentAgentProject(agentId: string, companyId: string, co
        WHERE c.id = $2 AND c.company_id = $3 AND c.members @> $4::jsonb`,
     [agentId, conversationId, companyId, JSON.stringify([agentId])])
   if (!rows[0]) fail('NOT_FOUND', 404, 'Conversation not found.')
-  return { projectId: rows[0].project_id, bindingVersion: rows[0].project_id ? `${rows[0].project_id}:${rows[0].file_binding_version}` : null }
+  const projectId = rows[0].project_id
+  return { projectId, bindingVersion: projectId ? `${projectId}:${rows[0].file_binding_version}` : null,
+    git: projectId ? await readyProjectGit(companyId, projectId) : null }
 }
 
 async function authorize(client: PoolClient, project: ProjectRow, identity: ProjectFileIdentity): Promise<FileScope> {

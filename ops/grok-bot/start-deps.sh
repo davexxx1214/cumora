@@ -32,6 +32,26 @@ if [ -f "$REPO_ENV" ] && grep -Eq '^CUMORA_PROJECT_FILES_ENABLED=(1|true)$' "$RE
   install -d -m 700 "$project_root"
 fi
 
+# Git mirrors hold persistent, token-free repository objects. They are never
+# mounted into an Agent task; each task gets a separate checkout copied from
+# this root. Keep the mirror beside project objects under /workspace.
+if [ -f "$REPO_ENV" ] && grep -Eq '^CUMORA_PROJECT_GIT_ENABLED=(1|true)$' "$REPO_ENV"; then
+  git_root=$(sed -n 's/^CUMORA_PROJECT_GIT_ROOT=//p' "$REPO_ENV" | tail -n 1 | tr -d '\r')
+  if [ -z "$git_root" ]; then
+    echo "CUMORA_PROJECT_GIT_ROOT is required when project Git is enabled" >&2
+    exit 1
+  fi
+  git_root=$(realpath -m -- "$git_root")
+  case "$git_root" in
+    /workspace/*) ;;
+    *)
+      echo "project Git root must resolve beneath /workspace" >&2
+      exit 1
+      ;;
+  esac
+  install -d -m 700 "$git_root"
+fi
+
 "$STACK/bin/ensure-packages.sh"
 
 exec 9>"$RUN_DIR/start-deps.lock"

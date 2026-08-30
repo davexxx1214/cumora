@@ -344,15 +344,25 @@ cd agent-fuse && go test ./...
 
 ## 13. 二阶段：关联 Git 仓库
 
-用户已同意以下内容留到二阶段，不作为一阶段上线前提：
+2026-08-30 开始实施二阶段首批范围：每个项目可配置一个 HTTPS Git 地址和可选默认分支；工作区管理员可保存多个 Git 用户名/token，但数据库约束同一工作区同时最多启用一个。token 使用服务端 AES-256-GCM 加密，只在受信服务同步私有 mirror 时通过一次性 `GIT_ASKPASS` 环境使用，不进入 URL、参数、日志、浏览器响应、Agent 环境或仓库配置。凭据绑定 Git Host，防止把一个站点的 token 发给另一个站点。
 
-- 项目可选关联 Git 仓库、授权与凭证管理、固定提交的代码参考。
-- 克隆/更新仓库、每任务独立开发目录和分支；并行修改不共用一份 checkout。
-- 评估独立 clone 与 worktree，分别处理权限边界、空间占用及共同 Git 元数据。
-- 对代码运行目录单独定义容量、依赖、缓存、生命周期和允许执行的操作，不静默放宽共享文档的 25MiB、5GB、禁止链接及不自动执行规则。
-- 变更审查、测试结果、合并、推送与成果回存；不自动将仓库变成 Agent 常驻上下文。
+实现边界如下：
 
-一阶段只保留清晰的项目 ID、文件引用、任务绑定及存储边界，不预先实现仓库同步或代码运行功能。
+- 私有 mirror 位于 `CUMORA_PROJECT_GIT_ROOT`，Grok Bot 主机固定为 `/workspace/cumora-data/project-git`；启动脚本与项目正文相同，拒绝 `/workspace` 外的配置。
+- Agent 不共享 checkout。每个受控项目任务从已同步 mirror 复制新的 `/home/agent/repository`，remote URL 不含凭据；共享文档继续挂载在 `/projects/<projectId>`，两者互不替代。
+- 任务从管理员配置或远端解析出的默认分支开始。用户明确要求后，Agent 可在自己的 checkout 内执行 `git switch <branch>`；切换不改变其他任务，也不把旧任务目录改指向新项目。
+- 首批不向 Agent 提供 token，因此任务内 fetch/pull/push 默认不可用；管理员在界面显式“同步仓库”后，新任务才使用新的 mirror 快照。push、提交审查、成果回存继续作为后续增量。
+- Git 仓库不是常驻上下文。Agent 只在用户任务明确要求查看代码或某个范围时读取，不因存在 `AGENTS.md`、脚本、hook 或其他指令文件就自动执行。
+- 代码 checkout 的空间和依赖不计入共享文档 5GB/25MiB 配额；首版需继续测量 mirror 与每任务完整 clone 的磁盘成本，再决定对象池、partial clone 或安全 worktree 优化。
+
+实施清单：
+
+- [x] 添加 Git 凭据加密存储、Host 绑定、多个凭据和单一启用约束。
+- [x] 添加项目 Git 地址/默认分支、同步状态、固定提交和管理员 API/界面。
+- [x] 添加私有 mirror 同步及 token-free remote 配置；拒绝含凭据 URL、非 HTTPS、直接本地/私网目标和重定向。
+- [x] 添加每任务独立 checkout、默认分支和任务内分支切换能力；mirror 不挂入任务。
+- [ ] 在远程 Linux 隔离环境完成迁移、权限、mirror、checkout、分支切换和 token 不泄漏验证。
+- [ ] 部署 `dev`，配置持久 Git root，完成线上管理员界面和新任务验收。
 
 ## 14. 开始实施时的第一步
 

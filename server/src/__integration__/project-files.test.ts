@@ -16,7 +16,7 @@ import { PROJECT_FILE_MAX_BYTES, type ProjectFileState } from '../project-files/
 import { projectMountRouter } from '../project-files/mount-router.js'
 import { runtimeRouter } from '../agents/runtime/server.js'
 import { signAgentToken } from '../agents/runtime/jwt.js'
-import { taskEnvironment, withTaskSandbox, spawnTaskProcess } from '../agents/computer/task-sandbox.js'
+import { withTaskSandbox, spawnTaskProcess } from '../agents/computer/task-sandbox.js'
 import { prepareTaskAuth } from '../agents/computer/task-sandbox.js'
 import { getAdapter } from '../agents/computer/engine.js'
 import { storage } from '../storage.js'
@@ -29,6 +29,7 @@ let root = ''
 before(async () => {
   root = await mkdtemp(join(tmpdir(), 'cumora-project-integration-'))
   env.PROJECT_FILES_ENABLED = true; env.PROJECT_FILES_ROOT = root
+  env.PROJECT_GIT_ENABLED = true; env.PROJECT_GIT_ROOT = join(root, 'git')
   await ensureSchemaOnce()
   for (const user of users) {
     const app = await buildApiTestApp(user)
@@ -141,6 +142,42 @@ test('[integration] members manage files but cannot create, switch, purge or dis
   const purge = await request('member', '/project-files/p-files/operations', 'POST', { requestId: randomUUID(), bindingVersion: await binding(),
     command: { type: 'purge', entryId: file.id, expectedRevision: trash.entries[0].revision, confirm: true } })
   assert.equal(purge.status, 403)
+})
+
+test('[integration] administrators configure encrypted Git credentials and projects while members can only read project Git status', async () => {
+  assert.equal((await request('member', '/git/credentials')).status, 403)
+  assert.equal((await request('member', '/projects/p-files/git', 'PUT', { repositoryUrl: 'https://github.com/acme/repo.git' })).status, 403)
+  const first = await request('owner', '/git/credentials', 'POST', {
+    name: 'GitHub primary', host: 'github.com', username: 'owner', token: 'github_pat_first_secret', active: true,
+  })
+  assert.equal(first.status, 201, await first.clone().text())
+  const firstBody = await first.json() as Record<string, unknown>
+  assert.equal(firstBody.active, true)
+  assert.equal('token' in firstBody, false)
+  assert.equal('tokenEncrypted' in firstBody, false)
+  const stored = (await pool.query<{ token_encrypted: string }>('SELECT token_encrypted FROM company_git_credentials WHERE id=$1', [firstBody.id])).rows[0]
+  assert.ok(stored.token_encrypted && !stored.token_encrypted.includes('github_pat_first_secret'))
+
+  const second = await request('owner', '/git/credentials', 'POST', {
+    name: 'GitHub rotated', host: 'github.com', username: 'owner', token: 'github_pat_second_secret', active: true,
+  })
+  assert.equal(second.status, 201, await second.clone().text())
+  const active = await pool.query<{ count: number }>('SELECT COUNT(*)::int AS count FROM company_git_credentials WHERE company_id=$1 AND active', ['co-files'])
+  assert.equal(active.rows[0].count, 1)
+  const listed = await (await request('owner', '/git/credentials')).json() as Array<Record<string, unknown>>
+  assert.equal(listed.length, 2)
+  assert.equal(listed.filter(item => item.active).length, 1)
+  assert.ok(listed.every(item => !('token' in item) && !('tokenEncrypted' in item)))
+
+  const saved = await request('owner', '/projects/p-files/git', 'PUT', {
+    repositoryUrl: 'https://github.com/acme/repo.git', defaultBranch: 'dev',
+  })
+  assert.equal(saved.status, 200, await saved.clone().text())
+  assert.equal((await saved.json() as { syncStatus: string }).syncStatus, 'not_synced')
+  const memberView = await request('member', '/projects/p-files/git')
+  assert.equal(memberView.status, 200)
+  assert.equal((await memberView.json() as { repositoryUrl: string }).repositoryUrl, 'https://github.com/acme/repo.git')
+  assert.equal((await request('outsider', '/projects/p-files/git')).status, 404)
 })
 
 test('[integration] project binding is exclusive, including direct SQL and group creation', async () => {

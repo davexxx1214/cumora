@@ -5,6 +5,7 @@ import { useAuth, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations } from '@/stores/conversations'
 import { useT } from '@/lib/i18n'
 import type { Conversation } from '@/types'
+import { ProjectGitPanel } from './ProjectGitPanel'
 
 const button = 'rounded-lg border border-ink-100 px-3 py-2 text-sm font-semibold hover:bg-sky2-50 disabled:opacity-40 disabled:cursor-not-allowed'
 function bytes(value: number): string { return value >= 1e9 ? `${(value / 1e9).toFixed(2)} GB` : value >= 1e6 ? `${(value / 1e6).toFixed(1)} MB` : `${value} B` }
@@ -160,6 +161,7 @@ export function ProjectFilesDialog({ conversation, onClose }: { conversation: Co
           if (name?.trim()) { const created = await api.createProject({ name: name.trim() }); await switchProject(created.id) }
         })}>{t('projectFiles.createProject')}</button>
       </div>}
+      {canManage && projectId && <ProjectGitPanel key={projectId} projectId={projectId} />}
       {error && <p role="alert" className="m-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
       {projectId ? <>
         <div className="flex flex-wrap items-center gap-2 px-4 pt-4">

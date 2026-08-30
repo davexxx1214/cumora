@@ -91,7 +91,7 @@ export async function sandboxConfig(home: string, server: string, project?: { pr
   if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) throw new Error('Project tasks require the local Cumora API URL.')
   const runtimeDirs = (process.env.CUMORA_PROJECT_RUNTIME_DIRS ?? '').split(':').filter(Boolean)
   const operatorHomes = [homedir(), process.env.CUMORA_PROJECT_AUTH_HOME].filter((value): value is string => !!value)
-  const privatePaths = [home, process.env.CUMORA_PROJECT_FILES_ROOT].filter((value): value is string => !!value)
+  const privatePaths = [home, process.env.CUMORA_PROJECT_FILES_ROOT, process.env.CUMORA_PROJECT_GIT_ROOT].filter((value): value is string => !!value)
   for (const dir of runtimeDirs) {
     assertRuntimeDirectory(dir, operatorHomes, privatePaths)
     assertRuntimeDirectory(realpathSync(dir), operatorHomes, privatePaths)

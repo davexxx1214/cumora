@@ -38,6 +38,10 @@ import { ProjectFileError } from '../project-files/model.js'
 import { projectAttachment } from '../project-files/references.js'
 import { resolveAgentRecipientIds } from '../agents/message-routing.js'
 import { openInviteToken, sealInviteToken } from '../invitations/token-vault.js'
+import {
+  activateGitCredential, clearProjectGitSettings, createGitCredential, deleteGitCredential,
+  getProjectGitSettings, listGitCredentials, saveProjectGitSettings, syncProjectGit, updateGitCredential,
+} from '../project-git/service.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -2100,6 +2104,68 @@ api.post('/projects/:id/archive', async (req, res) => {
   const archive = req.body?.archive !== false
   await archiveProject(tenant, me, String(id), archive)
   res.json({ ok: true, status: archive ? 'archived' : 'active' })
+})
+
+api.get('/git/credentials', async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  res.json(await listGitCredentials(companyId))
+})
+
+api.post('/git/credentials', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  const credential = await createGitCredential({ companyId, userId, name: req.body?.name, host: req.body?.host,
+    username: req.body?.username, token: req.body?.token, active: req.body?.active !== false })
+  await audit({ kind: 'git_credential_create', userId, companyId, detail: { credentialId: credential.id, host: credential.host, active: credential.active } })
+  res.status(201).json(credential)
+})
+
+api.put('/git/credentials/:id', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  const credential = await updateGitCredential({ companyId, id: String(req.params.id), name: req.body?.name,
+    host: req.body?.host, username: req.body?.username, token: req.body?.token })
+  await audit({ kind: 'git_credential_update', userId, companyId, detail: { credentialId: credential.id, host: credential.host } })
+  res.json(credential)
+})
+
+api.post('/git/credentials/:id/activate', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  await activateGitCredential(companyId, String(req.params.id))
+  await audit({ kind: 'git_credential_activate', userId, companyId, detail: { credentialId: String(req.params.id) } })
+  res.json({ ok: true })
+})
+
+api.delete('/git/credentials/:id', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  await deleteGitCredential(companyId, String(req.params.id))
+  await audit({ kind: 'git_credential_delete', userId, companyId, detail: { credentialId: String(req.params.id) } })
+  res.json({ ok: true })
+})
+
+api.get('/projects/:id/git', async (req, res) => {
+  const { userId, companyId } = await requireCompany(req)
+  res.json(await getProjectGitSettings(companyId, userId, String(req.params.id)))
+})
+
+api.put('/projects/:id/git', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  const value = await saveProjectGitSettings({ companyId, userId, projectId: String(req.params.id),
+    repositoryUrl: req.body?.repositoryUrl, defaultBranch: req.body?.defaultBranch })
+  await audit({ kind: 'project_git_configure', userId, companyId, detail: { projectId: String(req.params.id), repositoryUrl: value.repositoryUrl, defaultBranch: value.defaultBranch } })
+  res.json(value)
+})
+
+api.delete('/projects/:id/git', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  await clearProjectGitSettings(companyId, userId, String(req.params.id))
+  await audit({ kind: 'project_git_clear', userId, companyId, detail: { projectId: String(req.params.id) } })
+  res.json({ ok: true })
+})
+
+api.post('/projects/:id/git/sync', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  const value = await syncProjectGit(companyId, userId, String(req.params.id))
+  await audit({ kind: 'project_git_sync', userId, companyId, detail: { projectId: String(req.params.id), commit: value.lastCommit } })
+  res.json(value)
 })
 
 /** Attach (or detach when projectId=null) a conversation to a project. */
