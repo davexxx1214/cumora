@@ -21,7 +21,7 @@ import {
 import { joinAllHands, onboardStarterAgents } from '../onboardCompany.js'
 import {
   type Provider, providerEnabled, createState, consumeState,
-  authorizeUrl, handleCallback, errorUrl, returnUrlAllowed,
+  authorizeUrl, handleCallback, errorUrl, publicSignInError, returnUrlAllowed,
 } from '../oauth.js'
 import { adminRouter } from './admin-router.js'
 import { isWaitlistEnabled, isAllowlistedAdmin, enqueueWaitlist } from '../admin.js'
@@ -886,7 +886,13 @@ api.get('/auth/callback/:provider', safe(async (req, res) => {
     const msg = e instanceof Error ? e.message : String(e)
     console.warn(`[auth] ${provider} callback failed:`, msg)
     await audit({ kind: 'login_failed', ip, userAgent: ua, detail: { provider, error: msg } })
-    res.redirect(errorUrl(claimed?.returnUrl ?? null, msg.slice(0, 120)))
+    // The redirect carries only what we WROTE for the user to read. Everything
+    // else — a Postgres transaction error, a provider's raw token-endpoint
+    // body, a DNS failure — becomes a fixed code. The full text is already on
+    // the line above and in the audit row, so nothing is lost for diagnosis;
+    // what changes is that it stops being rendered on the sign-in screen and
+    // parked in the browser's address bar and history (#102).
+    res.redirect(errorUrl(claimed?.returnUrl ?? null, publicSignInError(e).slice(0, 120)))
   }
 }))
 
@@ -925,7 +931,9 @@ api.post('/auth/apple/native', safe(async (req, res) => {
     if (e instanceof SuspendedError) { res.status(403).json({ error: 'suspended', email: e.email, reason: e.reason }); return }
     const msg = e instanceof Error ? e.message : String(e)
     console.warn('[auth] apple native sign-in failed:', msg)
-    res.status(400).json({ error: msg })
+    // Same rule as the browser callback: the app shows this string to the
+    // user, so it must be one we wrote.
+    res.status(400).json({ error: publicSignInError(e) })
   }
 }))
 
