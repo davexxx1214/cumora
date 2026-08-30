@@ -34,12 +34,18 @@ import { pool } from './db/pool.js'
 import { redis } from './redis.js'
 import { env } from './env.js'
 import { audit, createSession, gravatarUrlForEmail } from './auth.js'
+// Re-exported so callers keep importing sign-in errors from the auth module
+// they already use; the definitions live apart so unit tests can load them
+// without the DB/redis graph.
+export { SignInError, publicSignInError } from './auth-errors.js'
+import { SignInError } from './auth-errors.js'
 import { onboardStarterAgents, joinAllHands } from './onboardCompany.js'
 import { companyTier } from './tier.js'
 import { ensureCloudComputer, cloudComputerId } from './agents/computer/registry.js'
 import { storage } from './storage.js'
 import { provisionUser as provisionSub2apiUser, sub2apiConfigured } from './sub2api.js'
 import { isWaitlistEnabled, enqueueWaitlist, isAllowlistedAdmin } from './admin.js'
+import { insertPersonalWorkspace } from './personal-workspace.js'
 
 export type Provider = 'google' | 'github' | 'apple'
 
@@ -192,7 +198,7 @@ export async function fetchProfile(p: Provider, accessToken: string): Promise<No
     const r = await fetch(cfg.userInfoUrl, { headers: { authorization: `Bearer ${accessToken}` } })
     if (!r.ok) throw new Error(`google userinfo ${r.status}`)
     const g = await r.json() as GoogleProfile
-    if (!g.email || !g.email_verified) throw new Error('google account has no verified email')
+    if (!g.email || !g.email_verified) throw new SignInError('google account has no verified email')
     return {
       providerId: g.sub,
       email: g.email.toLowerCase(),
@@ -215,7 +221,7 @@ export async function fetchProfile(p: Provider, accessToken: string): Promise<No
   const u = await userR.json() as GitHubProfile
   const emails = await emailsR.json() as GitHubEmail[]
   const verified = emails.find((e) => e.primary && e.verified) ?? emails.find((e) => e.verified)
-  if (!verified) throw new Error('github account has no verified email')
+  if (!verified) throw new SignInError('github account has no verified email')
   return {
     providerId: String(u.id),
     email: verified.email.toLowerCase(),
@@ -434,21 +440,12 @@ export async function findOrCreateUserByProfile(
     let companyId: string | null = null
     if (!inviteToken) {
       companyId = `co-${randomUUID().slice(0, 10)}`
-      const slugSeed = (profile.email.split('@')[0] || 'workspace').replace(/[^a-z0-9]+/g, '-').slice(0, 30) || 'workspace'
-      let finalSlug = slugSeed
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          await client.query(
-            `INSERT INTO companies (id, name, slug, owner_user_id) VALUES ($1, $2, $3, $4)`,
-            [companyId, `${profile.displayName}'s workspace`, finalSlug, userId],
-          )
-          break
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e)
-          if (!/duplicate key/.test(msg)) throw e
-          finalSlug = `${slugSeed}-${randomUUID().slice(0, 4)}`
-        }
-      }
+      await insertPersonalWorkspace(client, {
+        companyId,
+        name: `${profile.displayName}'s workspace`,
+        ownerUserId: userId,
+        email: profile.email,
+      })
       await client.query(
         `INSERT INTO company_members (company_id, user_id, role) VALUES ($1, $2, 'owner')`,
         [companyId, userId],

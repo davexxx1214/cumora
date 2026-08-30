@@ -27,6 +27,7 @@ import { onboardStarterAgents, joinAllHands } from './onboardCompany.js'
 import { companyTier } from './tier.js'
 import { ensureCloudComputer, cloudComputerId } from './agents/computer/registry.js'
 import { mirrorAvatar } from './oauth.js'
+import { insertPersonalWorkspace } from './personal-workspace.js'
 import { provisionUser as provisionSub2apiUser, sub2apiConfigured, setUserTier } from './sub2api.js'
 import { formatAddress, mintMessageId, sendViaProvider } from './email.js'
 
@@ -541,29 +542,12 @@ export async function approveWaitlist(waitlistId: string, decidedBy: string): Pr
     let companyId: string | null = null
     if (!skipPersonalWorkspace) {
       companyId = `co-${randomUUID().slice(0, 10)}`
-      const slugSeed = (row.email.split('@')[0] || 'workspace').replace(/[^a-z0-9]+/g, '-').slice(0, 30) || 'workspace'
-      let finalSlug = slugSeed
-      for (let attempt = 0; attempt < 5; attempt++) {
-        // SAVEPOINT per attempt: a duplicate-key error aborts the whole
-        // transaction until rolled back, so without this the *retry* INSERT
-        // fails with "current transaction is aborted". Slug collisions are
-        // common in bulk approval (short local-parts like "info"/"me" recur),
-        // so this path is hot, not theoretical.
-        await client.query('SAVEPOINT company_ins')
-        try {
-          await client.query(
-            `INSERT INTO companies (id, name, slug, owner_user_id) VALUES ($1, $2, $3, $4)`,
-            [companyId, `${row.display_name}'s workspace`, finalSlug, userId],
-          )
-          await client.query('RELEASE SAVEPOINT company_ins')
-          break
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e)
-          if (!/duplicate key/.test(msg)) throw e
-          await client.query('ROLLBACK TO SAVEPOINT company_ins')
-          finalSlug = `${slugSeed}-${randomUUID().slice(0, 4)}`
-        }
-      }
+      await insertPersonalWorkspace(client, {
+        companyId,
+        name: `${row.display_name}'s workspace`,
+        ownerUserId: userId,
+        email: row.email,
+      })
       await client.query(
         `INSERT INTO company_members (company_id, user_id, role) VALUES ($1, $2, 'owner')`,
         [companyId, userId],
