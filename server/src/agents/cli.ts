@@ -1669,6 +1669,8 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // sendViaProvider path. autoSubmitted=true because every CLI reply is
   // agent-driven by construction.
   if (cv[0].kind === 'email') {
+    const attachmentError = rejectsEmailAttachmentFlags(parsed)
+    if (attachmentError) return attachmentError
     if (!body) {
       return err('email replies require a non-empty body')
     }
@@ -2389,39 +2391,6 @@ function extToMime(ext: string): string | null {
   }
 }
 
-/** Load a local file for use as an outbound email attachment. Reads the
- *  bytes off the agent's filesystem, uploads them to object storage under
- *  the `email-attachments/` prefix (same prefix the inbound webhook uses
- *  — keeps the renderer's JOIN agnostic to direction), and returns the
- *  combined metadata. The returned `base64` is what we hand to Resend;
- *  the `storageKey` + `publicUrl` are how the recipient's UI downloads
- *  the file after the fact. */
-async function loadEmailAttachmentFromPath(path: string): Promise<{
-  filename: string; mimeType: string; sizeBytes: number;
-  base64: string; storageKey: string; publicUrl: string;
-}> {
-  const fs = await import('node:fs/promises')
-  const nodePath = await import('node:path')
-  const cryptoMod = await import('node:crypto')
-  const MAX_BYTES = 20 * 1024 * 1024  // 20MB — matches Resend's per-attachment ceiling
-  const buf = await fs.readFile(path)
-  if (buf.length === 0) throw new Error(`empty file: ${path}`)
-  if (buf.length > MAX_BYTES) {
-    throw new Error(`file too large: ${buf.length} bytes (max ${MAX_BYTES})`)
-  }
-  const filename = nodePath.basename(path)
-  const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase() : 'bin'
-  const mimeType = extToMime(ext) ?? 'application/octet-stream'
-  const id = cryptoMod.randomUUID().replace(/-/g, '')
-  const storageKey = `email-attachments/${id}${ext ? '.' + ext : ''}`
-  const publicUrl = await storage.put(storageKey, buf, mimeType)
-  return {
-    filename, mimeType, sizeBytes: buf.length,
-    base64: buf.toString('base64'),
-    storageKey, publicUrl,
-  }
-}
-
 /** Regenerate the calling agent's portrait via the image API. Composes
  *  the same prompt the HTTP endpoint uses, uploads to storage as
  *  `avatars/avatar-<id>-<rand>.png`, and stamps `participants.avatar_url`.
@@ -2950,8 +2919,8 @@ async function cmdEmail(parsed: ParsedArgs): Promise<CliResult> {
   if (!sub) {
     return err(
       'usage:\n' +
-      '  email send --to <addr|id>[,<addr|id>...] [--cc <...>] --subject "..." --body "..." [--attach <path>[,<path>...]] [--as <id>]\n' +
-      '  email reply <message_id> --body "..." [--cc <addr|id>...] [--attach <path>[,<path>...]] [--as <id>]\n' +
+      '  email send --to <addr|id>[,<addr|id>...] [--cc <...>] --subject "..." --body "..." [--as <id>]\n' +
+      '  email reply <message_id> --body "..." [--cc <addr|id>...] [--as <id>]\n' +
       '  email inbox [--unread] [--limit N] [--as <id>]\n' +
       '  email show <conversation_id> [--tail N] [--as <id>]\n' +
       '  email contacts [<query>] [--as <id>]   (or just: cumora contacts [<query>])\n' +
@@ -2972,6 +2941,21 @@ async function cmdEmail(parsed: ParsedArgs): Promise<CliResult> {
     default:
       return err(`unknown email subcommand: ${sub}`)
   }
+}
+
+const EMAIL_ATTACHMENTS_UNSUPPORTED =
+  'outbound email attachments are not supported; --attach never accepts server filesystem paths'
+
+function rejectsEmailAttachmentFlags(parsed: ParsedArgs): CliResult | null {
+  if (
+    parsed.flags.attach ||
+    parsed.flags['attach-text'] ||
+    parsed.flags['attach-bytes'] ||
+    parsed.flags['generate-image']
+  ) {
+    return err(EMAIL_ATTACHMENTS_UNSUPPORTED)
+  }
+  return null
 }
 
 async function cmdEmailWhoami(me: string): Promise<CliResult> {
@@ -3124,22 +3108,11 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
   } = await import('../email.js')
   const subject = sanitizeSubject(unescapeChat(String(parsed.flags.subject ?? '')))
   const body = unescapeChat(String(parsed.flags.body ?? '')).trim()
-  // --attach takes a comma-separated list of paths (also accepts the same
-  // flag repeated by the agent — bin/cumora collapses repeats into the
-  // last value, so comma is the supported multi-attach syntax here).
-  const attachRaw = parsed.flags.attach ? String(parsed.flags.attach) : ''
   if (!toRaw || !subject || !body) {
-    return err('usage: email send --to <addr|id>[,...] [--cc <...>] --subject "..." --body "..." [--attach <path>[,<path>...]]')
+    return err('usage: email send --to <addr|id>[,...] [--cc <...>] --subject "..." --body "..."')
   }
-  const attachPaths = attachRaw.split(',').map((s) => s.trim()).filter(Boolean)
-  const loadedAttachments: Awaited<ReturnType<typeof loadEmailAttachmentFromPath>>[] = []
-  for (const p of attachPaths) {
-    try {
-      loadedAttachments.push(await loadEmailAttachmentFromPath(p))
-    } catch (e) {
-      return err(`attachment ${p}: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
+  const attachmentError = rejectsEmailAttachmentFlags(parsed)
+  if (attachmentError) return attachmentError
   const sender = await ensureAgentAddress(me)
   if (!sender) return err('agent has no email address (EMAIL_DOMAIN unset or company missing)')
 
@@ -3190,9 +3163,6 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     text: body,
     messageId,
     autoSubmitted: 'auto-generated',
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, base64: a.base64,
-    })),
   })
 
   const persisted = await persistEmailMessage({
@@ -3211,10 +3181,6 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     ccAddrs: ccResolved.map((r) => formatAddress(r.addr, r.name)),
     body,
     autoSubmitted: true,
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
-      storageKey: a.storageKey,
-    })),
   })
 
   if (!sendRes.ok) {
@@ -3231,7 +3197,7 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     subject,
     to: toResolved.map((r) => r.addr),
     cc: ccResolved.map((r) => r.addr),
-    attachmentCount: loadedAttachments.length,
+    attachmentCount: 0,
     transportStatus: 'sent',
     mock: sendRes.mock,
     visibleToUser: true,
@@ -3241,17 +3207,9 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
 async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string): Promise<CliResult> {
   const replyTo = parsed.positional[1]
   const body = unescapeChat(String(parsed.flags.body ?? '')).trim()
-  const attachRaw = parsed.flags.attach ? String(parsed.flags.attach) : ''
-  if (!replyTo || !body) return err('usage: email reply <message_id> --body "..." [--cc <addr|id>...] [--attach <path>[,<path>...]]')
-  const attachPaths = attachRaw.split(',').map((s) => s.trim()).filter(Boolean)
-  const loadedAttachments: Awaited<ReturnType<typeof loadEmailAttachmentFromPath>>[] = []
-  for (const p of attachPaths) {
-    try {
-      loadedAttachments.push(await loadEmailAttachmentFromPath(p))
-    } catch (e) {
-      return err(`attachment ${p}: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
+  if (!replyTo || !body) return err('usage: email reply <message_id> --body "..." [--cc <addr|id>...]')
+  const attachmentError = rejectsEmailAttachmentFlags(parsed)
+  if (attachmentError) return attachmentError
   // Pull the original email row and its conversation context.
   const { rows: orig } = await pool.query<{
     conversation_id: string
@@ -3340,9 +3298,6 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     references: newReferences,
     messageId,
     autoSubmitted: 'auto-replied',
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, base64: a.base64,
-    })),
   })
 
   const persisted = await persistEmailMessage({
@@ -3361,10 +3316,6 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     ccAddrs: ccCombined,
     body,
     autoSubmitted: true,
-    attachments: loadedAttachments.map((a) => ({
-      filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
-      storageKey: a.storageKey,
-    })),
   })
 
   // Auto-ack — replying definitionally means I read the original.
@@ -3388,7 +3339,7 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     subject,
     to: toAddrs,
     cc: ccCombined,
-    attachmentCount: loadedAttachments.length,
+    attachmentCount: 0,
     transportStatus: 'sent',
     mock: sendRes.mock,
     visibleToUser: true,
