@@ -362,8 +362,9 @@ cd agent-fuse && go test ./...
 - [x] 将工作树导入共享文件版本层，共享 5GB 计量；添加 Git 来源标记和真人只读的服务端强制校验。
 - [x] 移除每任务私有 checkout；Agent 通过共享 FUSE 路径编辑，并使用受控 Git 状态、切分支和提交命令。
 - [x] 将界面改为共享文档与多个 Git 仓库分区；所有群成员可浏览/下载，只有管理员配置仓库。
-- [ ] 完成独立 PostgreSQL/Redis、真实 HTTPS clone、共享编辑/commit、分支切换、冲突、配额及 Linux FUSE 回归。
-- [ ] 推送修订后的 `dev`，配置持久 Git root，部署并完成线上管理员与 Agent 验收。
+- [x] 完成独立 PostgreSQL/Redis、真实 HTTPS clone、共享编辑/commit、分支切换、冲突、配额及 Linux FUSE 回归。
+- [x] 推送修订后的 `dev`，配置持久 Git root，并部署数据库、API 和界面。
+- [ ] 使用管理员提供的真实项目凭据和目标仓库完成线上管理员配置、真人浏览下载及在线 Agent 编辑/commit 点击验收；不为验收伪造生产 token 或仓库。
 
 旧的“一个项目一个仓库、工作区多 token 但仅一个全局生效、每任务私有 checkout”，以及短暂出现过的“每仓库独立 token”实现保留在 Git 历史中，仅作为开发过程记录；它们不再是交付行为，后续 `dev` 以本节规则为准。
 
@@ -424,3 +425,5 @@ cd agent-fuse && go test ./...
 - 当前容器 PID 1 为 `tini`，没有 systemd 或 cron，仓库脚本不能自行跨越整机重建。仍需 Grok Routine 或人工调用 `/workspace/cumora-stack/bin/ensure-running.sh`；Routine 可能因长期无活动暂停，因此该方案仍只适合验证环境。
 - 新库已重新配对当前主机，六个种子 Agent 及重新创建的 `codex` Agent 统一使用 Codex 引擎且 Computer 在线。重建后的隔离 Linux 验证使用临时 PostgreSQL、Redis 和文件目录，预检 5/5、领域测试 10/10、集成测试 20 项通过；默认未调用真实外部引擎的两项测试按设计跳过，业务库和线上目录未被测试修改。
 - 项目文件正文根已确认是 `/workspace/cumora-data/project-files`（0700）。任务内 `/projects/<projectId>` 仅是受控 FUSE 挂载，不承载持久化正文；恢复脚本新增真实路径校验，功能开启时若 `CUMORA_PROJECT_FILES_ROOT` 不在 `/workspace` 下则拒绝启动，防止以后误写容器临时层。
+- 2026-08-30 二阶段多仓库实现以 `7e75be5` 推送至 `origin/dev` 并部署到 `/workspace/cumora`。隔离 Linux 验证预检 5/5、项目工作区单元测试 12/12、项目集成测试 22/22；覆盖一套加密项目凭据服务多个仓库、真实 GitHub HTTPS clone、共享配额、真人写入拒绝、Agent 编辑和受控 commit、真实 FUSE、撤权隔离及常用文档程序访问。两项需要真实外部模型的测试按设计跳过，未接触业务库。
+- 远程数据库已创建 `project_git_access` 与 `project_git_repositories`，部署核验时均为 0 行；没有为验收写入假凭据。功能根为 `/workspace/cumora-data/project-git`（0700，`box:box`），`.env` 已启用项目 Git 并设置独立加密密钥。恢复栈的 `start-deps.sh` 同步了 `/workspace` 路径守卫；公网和本机 `/api/health` 均返回 200。剩余线上点击验收需要真实目标仓库和管理员凭据。
