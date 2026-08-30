@@ -21,17 +21,18 @@
  * require the real HTTP/JWT/runCli chain. Lower-level argv normalization
  * remains exhaustively covered in agents-runtime-cli-argv.test.ts.
  */
-import { test, before, beforeEach, after } from 'node:test'
+
 import assert from 'node:assert/strict'
-import { createServer, type Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
+import { after, before, beforeEach, test } from 'node:test'
 import { mintAgentRuntimeToken } from '../agents/computer/registry.js'
 import { signAgentToken, verifyAgentToken } from '../agents/runtime/jwt.js'
 import { pool } from '../db/pool.js'
+import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
 
 let server: Server
 let baseUrl = ''
@@ -94,6 +95,41 @@ async function callRaw(
   return { status: res.status, body: await res.text() }
 }
 
+/** The runtime endpoint now awaits one atomic batch. Still drain the pool in
+ *  zero-write checks so a future regression to the generic fire-and-forget
+ *  recorder cannot pass merely because its INSERT lands after the assertion. */
+async function waitForPoolIdle(timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let stablePasses = 0
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    if (pool.waitingCount === 0 && pool.idleCount === pool.totalCount) {
+      stablePasses += 1
+      if (stablePasses >= 3) return
+    } else {
+      stablePasses = 0
+    }
+  }
+  assert.fail('timed out waiting for queued ledger queries to drain')
+}
+
+async function waitForBlockedQuery(pattern: string, minimum = 1): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const { rows } = await pool.query<{ count: number }>(
+      `SELECT COUNT(*)::int AS count
+         FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND pid <> pg_backend_pid()
+          AND wait_event_type = 'Lock'
+          AND query ILIKE $1`,
+      [pattern],
+    )
+    if ((rows[0]?.count ?? 0) >= minimum) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`query never reached the expected row lock: ${pattern}`)
+}
+
 async function seedAgent(): Promise<{ agentId: string; companyId: string; token: string }> {
   const companyId = `c-${randomUUID().slice(0, 8)}`
   const agentId = `a-${randomUUID().slice(0, 8)}`
@@ -108,6 +144,87 @@ async function seedAgent(): Promise<{ agentId: string; companyId: string; token:
   )
   const token = signAgentToken({ agentId, companyId })
   return { agentId, companyId, token }
+}
+
+async function seedPeerAgent(companyId: string): Promise<{ agentId: string; companyId: string; token: string }> {
+  const agentId = `a-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status)
+       VALUES ($1, $2, 'agent', $3, 'tester', $4, '#abcdef', 'avail')`,
+    [agentId, companyId, agentId, agentId.slice(0, 1).toUpperCase()],
+  )
+  return { agentId, companyId, token: signAgentToken({ agentId, companyId }) }
+}
+
+async function assertCannotMutateForeignRun(args: {
+  ownerToken: string
+  attackerToken: string
+}): Promise<string> {
+  const created = await call('/runtime/runs', {
+    token: args.ownerToken,
+    body: { trigger: { kind: 'ownership-test' }, inboxCount: 0 },
+  })
+  assert.equal(created.status, 200)
+  assert.equal(typeof created.body?.runId, 'string')
+  const runId = created.body.runId as string
+  assert.match(runId, /^run-/)
+  await pool.query(
+    `UPDATE agent_runs SET updated_at = '2000-01-01T00:00:00Z'::timestamptz WHERE id = $1`,
+    [runId],
+  )
+
+  const snapshot = async () => {
+    const { rows } = await pool.query(
+      `SELECT status, stage, summary, error, tool_call_count, token_count,
+              updated_at::text, finished_at::text
+         FROM agent_runs WHERE id = $1`,
+      [runId],
+    )
+    return rows[0]
+  }
+  const before = await snapshot()
+  assert.ok(before, 'owner run fixture must exist before the attack')
+
+  const attempts = [
+    await call('/runtime/events', {
+      token: args.attackerToken,
+      body: {
+        runId,
+        kind: 'forged.event',
+        title: 'must not land',
+        stage: 'forged',
+      },
+    }),
+    await call(`/runtime/runs/${runId}/heartbeat`, {
+      token: args.attackerToken,
+      body: {},
+    }),
+    await call(`/runtime/runs/${runId}/finish`, {
+      token: args.attackerToken,
+      body: { status: 'failed', summary: 'forged finish', tokenCount: 999 },
+    }),
+    await call('/runtime/llm-calls', {
+      token: args.attackerToken,
+      body: {
+        source: 'byoa-codex',
+        hops: [{ runId, model: 'forged-model', latencyMs: 1, status: 'ok' }],
+      },
+    }),
+  ]
+  for (const attempt of attempts) {
+    assert.equal(attempt.status, 404)
+    assert.match(String(attempt.body?.error ?? ''), /agent run not found/i)
+  }
+
+  await waitForPoolIdle()
+  assert.deepEqual(await snapshot(), before, 'foreign requests must not alter the run row')
+  const [{ rows: eventRows }, { rows: ledgerRows }] = await Promise.all([
+    pool.query(`SELECT id FROM agent_events WHERE run_id = $1`, [runId]),
+    pool.query(`SELECT id FROM llm_calls WHERE run_id = $1`, [runId]),
+  ])
+  assert.equal(eventRows.length, 0, 'foreign event must not be inserted')
+  assert.equal(ledgerRows.length, 0, 'foreign run must not be attached to an LLM ledger row')
+  return runId
 }
 
 async function mintAssignedAgentRuntimeToken(args: {
@@ -681,6 +798,159 @@ test('[integration] runtime: /events row uses JWT subject for agent_id', async (
   assert.equal(rows[0].company_id, companyId)
 })
 
+test('[integration] runtime: same-tenant agents cannot mutate each other\'s run observability', async () => {
+  const owner = await seedAgent()
+  const attacker = await seedPeerAgent(owner.companyId)
+  await assertCannotMutateForeignRun({
+    ownerToken: owner.token,
+    attackerToken: attacker.token,
+  })
+})
+
+test('[integration] runtime: cross-tenant agents cannot mutate another tenant\'s run observability', async () => {
+  const owner = await seedAgent()
+  const attacker = await seedAgent()
+  await assertCannotMutateForeignRun({
+    ownerToken: owner.token,
+    attackerToken: attacker.token,
+  })
+})
+
+test('[integration] runtime: /llm-calls rejects a mixed-owner batch atomically', async () => {
+  const caller = await seedAgent()
+  const foreign = await seedAgent()
+  const ownRun = await call('/runtime/runs', {
+    token: caller.token,
+    body: { trigger: { kind: 'own' }, inboxCount: 0 },
+  })
+  const foreignRun = await call('/runtime/runs', {
+    token: foreign.token,
+    body: { trigger: { kind: 'foreign' }, inboxCount: 0 },
+  })
+  assert.equal(ownRun.status, 200)
+  assert.equal(foreignRun.status, 200)
+  assert.equal(typeof ownRun.body?.runId, 'string')
+  assert.equal(typeof foreignRun.body?.runId, 'string')
+  const runIds = [ownRun.body.runId as string, foreignRun.body.runId as string]
+  assert.ok(runIds.every((runId) => runId.startsWith('run-')))
+  assert.notEqual(runIds[0], runIds[1])
+
+  const rejected = await call('/runtime/llm-calls', {
+    token: caller.token,
+    body: {
+      source: 'byoa-codex',
+      hops: runIds.map((runId) => ({ runId, model: 'test-model', latencyMs: 1, status: 'ok' })),
+    },
+  })
+  assert.equal(rejected.status, 404)
+  assert.match(String(rejected.body?.error ?? ''), /agent run not found/i)
+
+  await waitForPoolIdle()
+  const { rows } = await pool.query(
+    `SELECT id FROM llm_calls WHERE run_id = ANY($1::text[])`,
+    [runIds],
+  )
+  assert.equal(rows.length, 0, 'an unauthorized hop must reject the whole batch before inserts start')
+})
+
+test('[integration] runtime: /llm-calls rejects oversized batches before scheduling inserts', async () => {
+  const caller = await seedAgent()
+  const model = `oversized-${randomUUID()}`
+  const rejected = await call('/runtime/llm-calls', {
+    token: caller.token,
+    body: {
+      source: 'byoa-codex',
+      hops: Array.from({ length: 101 }, () => ({ model, latencyMs: 1, status: 'ok' })),
+    },
+  })
+  assert.equal(rejected.status, 413)
+  assert.match(String(rejected.body?.error ?? ''), /too many hops/i)
+
+  await waitForPoolIdle()
+  const { rows } = await pool.query(
+    `SELECT id FROM llm_calls WHERE agent_id = $1 AND model = $2`,
+    [caller.agentId, model],
+  )
+  assert.equal(rows.length, 0, 'oversized batches must be rejected before fire-and-forget inserts start')
+})
+
+test('[integration] runtime: offboarding that wins the participant lock cancels every pending run mutation', async () => {
+  const owner = await seedAgent()
+  const created = await call('/runtime/runs', {
+    token: owner.token,
+    body: { trigger: { kind: 'offboard-race' }, inboxCount: 0 },
+  })
+  assert.equal(created.status, 200)
+  assert.equal(typeof created.body?.runId, 'string')
+  const runId = created.body.runId as string
+  const ledgerModel = `offboard-race-${randomUUID()}`
+  await pool.query(
+    `UPDATE agent_runs SET updated_at = '2000-01-01T00:00:00Z'::timestamptz WHERE id = $1`,
+    [runId],
+  )
+
+  const offboarder = await pool.connect()
+  let committed = false
+  let pending: Promise<Array<{ status: number; body: any }>> | undefined
+  try {
+    await offboarder.query('BEGIN')
+    await offboarder.query(
+      `UPDATE participants SET departed_at = NOW() WHERE id = $1 AND company_id = $2`,
+      [owner.agentId, owner.companyId],
+    )
+    pending = Promise.all([
+      call('/runtime/events', {
+        token: owner.token,
+        body: { runId, kind: 'must.not.land', title: 'revoked', stage: 'revoked' },
+      }),
+      call(`/runtime/runs/${runId}/heartbeat`, { token: owner.token, body: {} }),
+      call(`/runtime/runs/${runId}/finish`, {
+        token: owner.token,
+        body: { status: 'failed', summary: 'must not land' },
+      }),
+      call('/runtime/llm-calls', {
+        token: owner.token,
+        body: {
+          source: 'byoa-codex',
+          hops: [{ runId, model: ledgerModel, latencyMs: 1, status: 'ok' }],
+        },
+      }),
+    ])
+    await waitForBlockedQuery('%FROM participants%FOR SHARE%', 4)
+    await offboarder.query('COMMIT')
+    committed = true
+  } finally {
+    if (!committed) await offboarder.query('ROLLBACK').catch(() => {})
+    offboarder.release()
+  }
+
+  const results = await pending!
+  for (const result of results) {
+    assert.equal(result.status, 404)
+    assert.match(String(result.body?.error ?? ''), /agent run not found/i)
+  }
+  const { rows: runRows } = await pool.query(
+    `SELECT status, stage, summary,
+            updated_at = '2000-01-01T00:00:00Z'::timestamptz AS unchanged,
+            finished_at IS NULL AS unfinished
+       FROM agent_runs WHERE id = $1`,
+    [runId],
+  )
+  assert.deepEqual(runRows, [{
+    status: 'running',
+    stage: 'created',
+    summary: null,
+    unchanged: true,
+    unfinished: true,
+  }])
+  const [{ rowCount: eventCount }, { rowCount: ledgerCount }] = await Promise.all([
+    pool.query(`SELECT 1 FROM agent_events WHERE run_id = $1`, [runId]),
+    pool.query(`SELECT 1 FROM llm_calls WHERE run_id = $1 AND model = $2`, [runId, ledgerModel]),
+  ])
+  assert.equal(eventCount, 0)
+  assert.equal(ledgerCount, 0)
+})
+
 // ── payload validation ────────────────────────────────────────────────
 
 test('[integration] runtime: /events 400 when runId / kind / title is missing', async () => {
@@ -708,6 +978,77 @@ test('[integration] runtime: /runs/:runId/finish 400 when status missing', async
   assert.equal(r.status, 400)
 })
 
+test('[integration] runtime: malformed observability fields are rejected before writes', async () => {
+  const caller = await seedAgent()
+  const created = await call('/runtime/runs', {
+    token: caller.token,
+    body: { trigger: { kind: 'malformed' }, inboxCount: 0 },
+  })
+  assert.equal(created.status, 200)
+  assert.equal(typeof created.body?.runId, 'string')
+  const runId = created.body.runId as string
+  const model = `malformed-${randomUUID()}`
+
+  const attempts = [
+    await call('/runtime/events', {
+      token: caller.token,
+      body: { runId, kind: 'bad.event', title: 'bad', level: 'critical' },
+    }),
+    await call(`/runtime/runs/${runId}/finish`, {
+      token: caller.token,
+      body: { status: 'invented-status' },
+    }),
+    await call(`/runtime/runs/${runId}/finish`, {
+      token: caller.token,
+      body: {
+        status: 'completed',
+        usage: { inputTokens: '1', cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 0 },
+      },
+    }),
+    await call(`/runtime/runs/${runId}/finish`, {
+      token: caller.token,
+      body: { status: 'completed', tokenCount: 2_147_483_648 },
+    }),
+    await call(`/runtime/runs/${runId}/finish`, {
+      token: caller.token,
+      body: {
+        status: 'completed',
+        usage: {
+          inputTokens: 2_147_483_647,
+          cachedInputTokens: 1,
+          cacheCreationTokens: 0,
+          outputTokens: 0,
+        },
+      },
+    }),
+    await call('/runtime/llm-calls', {
+      token: caller.token,
+      body: { source: 'byoa-codex', hops: { runId, model } },
+    }),
+    await call('/runtime/llm-calls', {
+      token: caller.token,
+      body: {
+        source: 'byoa-codex',
+        hops: [{ runId, model, status: 'invented-status', error: { secret: 'must not reach a 500' } }],
+      },
+    }),
+    await call('/runtime/llm-calls', {
+      token: caller.token,
+      body: { source: 'byoa-codex', hops: [{ runId, model, status: 'ok', latencyMs: 1.5 }] },
+    }),
+  ]
+  for (const attempt of attempts) assert.equal(attempt.status, 400)
+
+  const [{ rows: runRows }, { rowCount: eventCount }, { rowCount: ledgerCount }] = await Promise.all([
+    pool.query(`SELECT status, stage, finished_at FROM agent_runs WHERE id = $1`, [runId]),
+    pool.query(`SELECT 1 FROM agent_events WHERE run_id = $1`, [runId]),
+    pool.query(`SELECT 1 FROM llm_calls WHERE run_id = $1 AND model = $2`, [runId, model]),
+  ])
+  assert.deepEqual(runRows, [{ status: 'running', stage: 'created', finished_at: null }])
+  assert.equal(eventCount, 0)
+  assert.equal(ledgerCount, 0)
+})
+
 test('[integration] runtime: /notices 400 when any of the required fields missing', async () => {
   const { token } = await seedAgent()
   const r = await call('/runtime/notices', { token, body: { conversationId: 'c-1' } })
@@ -722,6 +1063,20 @@ test('[integration] runtime: /runs + /runs/:runId/finish persists status transit
   const created = await call('/runtime/runs', { token, body: { trigger: { kind: 't' }, inboxCount: 0 } })
   assert.equal(created.status, 200)
   const runId = String(created.body.runId)
+
+  await pool.query(
+    `UPDATE agent_runs SET updated_at = '2000-01-01T00:00:00Z'::timestamptz WHERE id = $1`,
+    [runId],
+  )
+  const heartbeat = await call(`/runtime/runs/${runId}/heartbeat`, { token, body: {} })
+  assert.equal(heartbeat.status, 200)
+  assert.equal(heartbeat.body?.touched, true)
+  const { rows: heartbeatRows } = await pool.query<{ touched: boolean }>(
+    `SELECT updated_at > '2000-01-01T00:00:00Z'::timestamptz AS touched
+       FROM agent_runs WHERE id = $1`,
+    [runId],
+  )
+  assert.equal(heartbeatRows[0]?.touched, true)
 
   const done = await call(`/runtime/runs/${runId}/finish`, {
     token, body: { status: 'completed', summary: 'ok', toolCallCount: 3, tokenCount: 1234 },
@@ -738,4 +1093,86 @@ test('[integration] runtime: /runs + /runs/:runId/finish persists status transit
   assert.equal(rows[0].tool_call_count, 3)
   assert.equal(rows[0].token_count, 1234)
   assert.equal(rows[0].agent_id, agentId)
+})
+
+test('[integration] runtime: /llm-calls atomically records multiple caller-owned hops', async () => {
+  const caller = await seedAgent()
+  const created = await call('/runtime/runs', {
+    token: caller.token,
+    body: { trigger: { kind: 'llm-ledger' }, inboxCount: 0 },
+  })
+  assert.equal(created.status, 200)
+  assert.equal(typeof created.body?.runId, 'string')
+  const runId = created.body.runId as string
+  const prefix = `owned-${randomUUID()}`
+  const models = [`${prefix}-1`, `${prefix}-2`, `${prefix}-3`]
+  const recorded = await call('/runtime/llm-calls', {
+    token: caller.token,
+    body: {
+      source: 'byoa-codex',
+      daemonVersion: '9.9.9-test',
+      hops: [
+        {
+          runId,
+          purpose: 'agent-turn',
+          model: models[0],
+          usage: { inputTokens: 1, cachedInputTokens: 2, cacheCreationTokens: 3, outputTokens: 4 },
+          latencyMs: 7,
+          status: 'ok',
+          extras: { hop: 1 },
+        },
+        {
+          runId,
+          purpose: 'compaction',
+          model: models[1],
+          latencyMs: 8,
+          status: 'failed',
+          error: 'expected test failure',
+          extras: { hop: 2 },
+        },
+        {
+          runId,
+          purpose: 'completion-verify',
+          model: models[2],
+          usage: { inputTokens: 5, cachedInputTokens: 6, cacheCreationTokens: 7, outputTokens: 8 },
+          latencyMs: 9,
+          status: 'rate_limited',
+          extras: { hop: 3 },
+        },
+      ],
+    },
+  })
+  assert.equal(recorded.status, 200)
+  assert.equal(recorded.body?.inserted, 3)
+
+  await waitForPoolIdle()
+  const { rows } = await pool.query(
+    `SELECT agent_id, company_id, run_id, purpose, source, model,
+            input_tokens, cached_input_tokens, cache_creation_tokens, output_tokens,
+            measured, latency_ms, status, error, extras, daemon_version
+       FROM llm_calls
+      WHERE run_id = $1 AND model = ANY($2::text[])
+      ORDER BY model`,
+    [runId, models],
+  )
+  assert.deepEqual(rows, [
+    {
+      agent_id: caller.agentId, company_id: caller.companyId, run_id: runId,
+      purpose: 'agent-turn', source: 'byoa-codex', model: models[0],
+      input_tokens: 1, cached_input_tokens: 2, cache_creation_tokens: 3, output_tokens: 4,
+      measured: true, latency_ms: 7, status: 'ok', error: null, extras: { hop: 1 }, daemon_version: '9.9.9-test',
+    },
+    {
+      agent_id: caller.agentId, company_id: caller.companyId, run_id: runId,
+      purpose: 'compaction', source: 'byoa-codex', model: models[1],
+      input_tokens: 0, cached_input_tokens: 0, cache_creation_tokens: 0, output_tokens: 0,
+      measured: false, latency_ms: 8, status: 'failed', error: 'expected test failure', extras: { hop: 2 }, daemon_version: '9.9.9-test',
+    },
+    {
+      agent_id: caller.agentId, company_id: caller.companyId, run_id: runId,
+      purpose: 'completion-verify', source: 'byoa-codex', model: models[2],
+      input_tokens: 5, cached_input_tokens: 6, cache_creation_tokens: 7, output_tokens: 8,
+      measured: true, latency_ms: 9, status: 'rate_limited', error: null, extras: { hop: 3 }, daemon_version: '9.9.9-test',
+    },
+  ])
 })

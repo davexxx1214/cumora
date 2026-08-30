@@ -5,7 +5,7 @@ import {
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
 } from '../storage.js'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_WORKSPACE_MEMBERS, CH_STATUS, publish } from '../redis.js'
+import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_WORKSPACE_MEMBERS, CH_STATUS, publish, type MessageNewEvent } from '../redis.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
@@ -2029,6 +2029,7 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
   let conversation: { id: string; title: string } | null = null
   let alreadyMember = false
   let joinedWorkspace = false
+  let joinedGroupEvent: MessageNewEvent | null = null
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -2089,6 +2090,36 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
             WHERE id = $1 AND company_id = $3 AND NOT (members @> to_jsonb(ARRAY[$2::text]))`,
           [conversation.id, me, inv.company_id],
         )
+        const messageId = `m-${randomUUID()}`
+        const { rows: sequences } = await client.query<{ seq: number }>(
+          `INSERT INTO conversation_counters (conversation_id, next_sequence)
+           VALUES ($1, 2)
+           ON CONFLICT (conversation_id) DO UPDATE
+             SET next_sequence = conversation_counters.next_sequence + 1
+           RETURNING next_sequence - 1 AS seq`,
+          [conversation.id],
+        )
+        const sequence = sequences[0]?.seq ?? 1
+        const messageBody = JSON.stringify({ kind: 'joined', participantId: me, actorId: me })
+        await client.query(
+          `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+           VALUES ($1, $2, $3, 'system', $4, $5, $6)`,
+          [messageId, conversation.id, me, messageBody, sequence, inv.company_id],
+        )
+        joinedGroupEvent = {
+          type: 'message.new',
+          companyId: inv.company_id,
+          conversationId: conversation.id,
+          message: {
+            id: messageId,
+            conversationId: conversation.id,
+            authorId: me,
+            kind: 'system',
+            body: messageBody,
+            sequence,
+            at: new Date().toISOString(),
+          },
+        }
       }
       await client.query(
         `UPDATE company_invitations SET use_count = use_count + 1,
@@ -2114,12 +2145,10 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
       } })
     } catch (e) { console.warn('[invite] participant broadcast failed', e) }
   }
-  if (conversation && !alreadyMember) {
-    try {
-      const { postMembershipSystemMessage } = await import('../agents/membership.js')
-      await postMembershipSystemMessage({ conversationId: conversation.id, companyId: inv.company_id,
-        actorId: me, kind: 'joined', participantId: me })
-    } catch (e) { console.warn('[invite] group join broadcast failed', e) }
+  if (joinedGroupEvent) {
+    await publish(CH_MESSAGE_NEW, joinedGroupEvent).catch((error) => {
+      console.warn('[invite] durable group join message committed but publish failed', error)
+    })
   }
   const { rows: companies } = await pool.query<{ id: string; name: string; slug: string; role: string }>(
     `SELECT c.id, c.name, c.slug, cm.role FROM companies c

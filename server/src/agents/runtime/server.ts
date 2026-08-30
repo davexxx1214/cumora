@@ -16,6 +16,7 @@
  * (and we don't want pods sharing the human session cookie path).
  */
 import { json, type NextFunction, type Request, type Response, Router } from 'express'
+import { publicBodyParserError } from '../../body-parser-errors.js'
 import { ProjectFileError } from '../../project-files/model.js'
 import { requireProjectHost } from '../../project-files/runtime-host.js'
 import { createProjectLease, currentAgentProject, filesEnabled, stopProjectLease } from '../../project-files/service.js'
@@ -28,21 +29,28 @@ import {
 import { AGENDA_CLASSIFIER_ERROR, claimStallNudge, classifyAgendaActionable, gatherAgentAgenda, renderAgendaBrief } from '../agenda.js'
 import { runCli } from '../cli.js'
 import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
-import { recordTriage, touchAgentRun } from '../observability.js'
+import {
+  createAgentRun,
+  finishAgentRunForOwner,
+  recordAgentEventForOwner,
+  recordTriage,
+  touchAgentRunForOwner,
+} from '../observability.js'
 import { buildTeamRosterText, getPersona } from '../personas.js'
 import { consumeAgentTurnToken } from '../scheduler.js'
 import {
   isRuntimeAgentAuthorized,
+  withRuntimeAgentRunAuthorization,
   withRuntimeConversationAuthorization,
   withRuntimeMessageReadAuthorization,
 } from './authorization.js'
-import { buildRuntimeArgv } from './cli-argv.js'
 import { normalizeByoaSource } from './byoa-source.js'
+import { buildRuntimeArgv } from './cli-argv.js'
+import type { RuntimeTokenUsage } from './client.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
-import { publicBodyParserError } from '../../body-parser-errors.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -51,6 +59,26 @@ interface RuntimeRequest extends Request {
 }
 
 type AuthorizedAgentRuntimeClaims = AgentRuntimeClaims & { companyId: string }
+const MAX_LLM_HOPS_PER_BATCH = 100
+const MAX_PG_INTEGER = 2_147_483_647
+const RUN_STATUSES = new Set(['running', 'completed', 'failed', 'skipped'])
+const EVENT_LEVELS = new Set(['debug', 'info', 'warn', 'error'])
+const LLM_CALL_STATUSES = new Set(['ok', 'rate_limited', 'timeout', 'failed'])
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isNonNegativePgInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0 && (value as number) <= MAX_PG_INTEGER
+}
+
+function isRuntimeTokenUsage(value: unknown): value is RuntimeTokenUsage {
+  if (!isPlainRecord(value)) return false
+  const counts = [value.inputTokens, value.cachedInputTokens, value.cacheCreationTokens, value.outputTokens]
+  return counts.every(isNonNegativePgInteger)
+    && (counts as number[]).reduce((sum, count) => sum + count, 0) <= MAX_PG_INTEGER
+}
 
 async function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction): Promise<void> {
   const header = req.headers['authorization']
@@ -104,7 +132,7 @@ function withAgent(
       if (err instanceof ProjectFileError) { res.status(err.status).json({ error: err.message, code: err.code }); return }
       const msg = err instanceof Error ? err.message : String(err)
       console.error(`[runtime] ${req.method} ${req.path} failed`, msg)
-      res.status(500).json({ error: msg })
+      res.status(500).json({ error: 'runtime request failed' })
     }
   }
 }
@@ -461,18 +489,39 @@ runtimeRouter.post('/runs', withAgent(async (c, req, res) => {
     inboxCount?: number
     fingerprint?: string
   } | undefined
-  const runId = await inprocClient.createRun({
+  if ((body !== undefined && !isPlainRecord(body))
+    || (body?.trigger !== undefined && !isPlainRecord(body.trigger))
+    || (body?.inputMessageIds !== undefined
+      && (!Array.isArray(body.inputMessageIds) || body.inputMessageIds.some((id) => typeof id !== 'string')))
+    || (body?.inboxCount !== undefined && !isNonNegativePgInteger(body.inboxCount))
+    || (body?.fingerprint !== undefined && typeof body.fingerprint !== 'string')) {
+    res.status(400).json({ error: 'invalid run payload' }); return
+  }
+  const gate = await withRuntimeAgentRunAuthorization({
     agentId: c.sub,
     companyId: c.companyId,
-    trigger: body?.trigger,
-    inputMessageIds: body?.inputMessageIds,
-    inboxCount: body?.inboxCount,
-    fingerprint: body?.fingerprint,
+    runIds: [],
+    task: (client) => createAgentRun({
+      agentId: c.sub,
+      companyId: c.companyId,
+      trigger: body?.trigger,
+      inputMessageIds: body?.inputMessageIds,
+      inboxCount: body?.inboxCount,
+      fingerprint: body?.fingerprint,
+    }, client),
   })
-  if (c.companyId) {
-    await markAgentExecutionRunStarted(c.sub, c.companyId, runId,
-      Array.isArray(body?.inputMessageIds) ? body!.inputMessageIds.filter((id): id is string => typeof id === 'string') : [])
+  if (!gate.authorized || !gate.result) {
+    res.status(403).json({ error: 'agent does not belong to token tenant' }); return
   }
+  const runId = gate.result
+  await markAgentExecutionRunStarted(
+    c.sub,
+    c.companyId,
+    runId,
+    Array.isArray(body?.inputMessageIds)
+      ? body.inputMessageIds.filter((id): id is string => typeof id === 'string')
+      : [],
+  )
   res.json({ runId })
 }))
 
@@ -485,19 +534,32 @@ runtimeRouter.post('/events', withAgent(async (c, req, res) => {
     data?: Record<string, unknown>
     stage?: string
   } | undefined
-  if (!body?.runId || !body.kind || !body.title) {
+  if (typeof body?.runId !== 'string' || !body.runId
+    || typeof body.kind !== 'string' || !body.kind
+    || typeof body.title !== 'string' || !body.title) {
     res.status(400).json({ error: 'runId, kind, title required' }); return
   }
-  await inprocClient.recordEvent({
-    runId: body.runId,
+  if ((body.level !== undefined && !EVENT_LEVELS.has(body.level))
+    || (body.data !== undefined && !isPlainRecord(body.data))
+    || (body.stage !== undefined && typeof body.stage !== 'string')) {
+    res.status(400).json({ error: 'invalid event payload' }); return
+  }
+  const gate = await withRuntimeAgentRunAuthorization({
     agentId: c.sub,
     companyId: c.companyId,
-    kind: body.kind,
-    level: body.level,
-    title: body.title,
-    data: body.data,
-    stage: body.stage,
+    runIds: [body.runId],
+    task: (client) => recordAgentEventForOwner({
+      runId: body.runId!,
+      agentId: c.sub,
+      companyId: c.companyId,
+      kind: body.kind!,
+      level: body.level,
+      title: body.title!,
+      data: body.data,
+      stage: body.stage,
+    }, client),
   })
+  if (!gate.authorized || !gate.result) { res.status(404).json({ error: 'agent run not found' }); return }
   res.json({ ok: true })
 }))
 
@@ -514,6 +576,15 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
     usage?: import('./client.js').RuntimeTokenUsage | null
     daemonVersion?: string
   } | undefined
+  if ((body !== undefined && !isPlainRecord(body))
+    || (body?.source !== undefined && typeof body.source !== 'string')
+    || (body?.model !== undefined && body.model !== null && typeof body.model !== 'string')
+    || (body?.actionable !== undefined && typeof body.actionable !== 'boolean')
+    || (body?.reason !== undefined && body.reason !== null && typeof body.reason !== 'string')
+    || (body?.usage !== undefined && body.usage !== null && !isRuntimeTokenUsage(body.usage))
+    || (body?.daemonVersion !== undefined && typeof body.daemonVersion !== 'string')) {
+    res.status(400).json({ error: 'invalid triage payload' }); return
+  }
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const source = normalizeByoaSource(body?.source)
   void recordTriage({
@@ -557,7 +628,9 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 // per turn-completed (Codex) and batches them into one POST per N hops or
 // every ~250ms (whichever first). This endpoint accepts a batch + inserts
 // one llm_calls row per hop with the appropriate source ('byoa-claude' |
-// 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'). Fire-and-forget; a DB hiccup must never break the wake.
+// 'byoa-codex' | 'byoa-grok' | 'byoa-cursor').
+// The server commits the bounded batch atomically; the daemon still treats an
+// HTTP/DB failure as best-effort so observability can never break the wake.
 runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
   const body = req.body as {
     source?: string
@@ -577,11 +650,41 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       extras?: Record<string, unknown>
     }>
   } | undefined
+  if ((body !== undefined && !isPlainRecord(body))
+    || (body?.source !== undefined && typeof body.source !== 'string')
+    || (body?.daemonVersion !== undefined && typeof body.daemonVersion !== 'string')
+    || (body?.hops !== undefined && !Array.isArray(body.hops))) {
+    res.status(400).json({ error: 'invalid LLM batch payload' }); return
+  }
   const source = normalizeByoaSource(body?.source)
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []
   if (hops.length === 0) { res.json({ ok: true, inserted: 0 }); return }
-  const { recordLlmCall } = await import('../llm-ledger.js')
+  if (hops.length > MAX_LLM_HOPS_PER_BATCH) {
+    res.status(413).json({ error: `too many hops (max ${MAX_LLM_HOPS_PER_BATCH})` }); return
+  }
+  const runIds: string[] = []
+  for (const hop of hops) {
+    if (!isPlainRecord(hop)) {
+      res.status(400).json({ error: 'each hop must be an object' }); return
+    }
+    if (hop.runId !== undefined && hop.runId !== null) {
+      if (typeof hop.runId !== 'string' || !hop.runId) {
+        res.status(400).json({ error: 'runId must be a non-empty string or null' }); return
+      }
+      runIds.push(hop.runId)
+    }
+    if ((hop.purpose !== undefined && typeof hop.purpose !== 'string')
+      || (hop.conversationId !== undefined && hop.conversationId !== null && typeof hop.conversationId !== 'string')
+      || (hop.model !== undefined && typeof hop.model !== 'string')
+      || (hop.usage !== undefined && hop.usage !== null && !isRuntimeTokenUsage(hop.usage))
+      || (hop.latencyMs !== undefined && !isNonNegativePgInteger(hop.latencyMs))
+      || (hop.status !== undefined && (typeof hop.status !== 'string' || !LLM_CALL_STATUSES.has(hop.status)))
+      || (hop.error !== undefined && hop.error !== null && typeof hop.error !== 'string')
+      || (hop.extras !== undefined && !isPlainRecord(hop.extras))) {
+      res.status(400).json({ error: 'invalid hop payload' }); return
+    }
+  }
   // Whitelist purposes the daemon may declare — anything else gets coerced
   // to 'agent-turn' so a future daemon version naming an unknown purpose
   // doesn't smuggle a free-form string into the rollup.
@@ -589,10 +692,10 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
     'agent-turn', 'inbox-triage', 'synthetic-wake-gate', 'agenda',
     'compaction', 'completion-verify', 'steer-summary',
   ])
-  for (const h of hops) {
+  const records = hops.map((h) => {
     const purpose = (typeof h.purpose === 'string' && KNOWN_PURPOSES.has(h.purpose) ? h.purpose : 'agent-turn') as 'agent-turn'
     const model = typeof h.model === 'string' && h.model ? h.model : '<unknown>'
-    void recordLlmCall({
+    return {
       purpose,
       companyId: c.companyId,
       agentId: c.sub,
@@ -611,17 +714,36 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       error: h.error ?? null,
       extras: h.extras,
       daemonVersion,
-    })
-  }
+    }
+  })
+  const { recordLlmCallsBatch } = await import('../llm-ledger.js')
+  const gate = await withRuntimeAgentRunAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    runIds,
+    task: (client) => recordLlmCallsBatch(records, client),
+  })
+  if (!gate.authorized) { res.status(404).json({ error: 'agent run not found' }); return }
   res.json({ ok: true, inserted: hops.length })
 }))
 
 // Heartbeat a long engine turn so the 10-min stale-run sweeper doesn't reap it.
 // BYOA emits no mid-run events (cloud does), so its daemon pings this while the
 // engine turn is in flight. Best-effort: a DB hiccup must not break the turn.
-runtimeRouter.post('/runs/:runId/heartbeat', withAgent(async (_c, req, res) => {
-  try { await touchAgentRun(String(req.params.runId)) } catch { /* swept-or-gone is fine */ }
-  res.json({ ok: true })
+runtimeRouter.post('/runs/:runId/heartbeat', withAgent(async (c, req, res) => {
+  const runId = String(req.params.runId)
+  const gate = await withRuntimeAgentRunAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    runIds: [runId],
+    task: (client) => touchAgentRunForOwner({
+      runId,
+      agentId: c.sub,
+      companyId: c.companyId,
+    }, client),
+  })
+  if (!gate.authorized || !gate.result?.owned) { res.status(404).json({ error: 'agent run not found' }); return }
+  res.json({ ok: true, touched: gate.result.touched })
 }))
 
 runtimeRouter.post('/runs/:runId/finish', withAgent(async (c, req, res) => {
@@ -636,16 +758,33 @@ runtimeRouter.post('/runs/:runId/finish', withAgent(async (c, req, res) => {
     usage?: import('./client.js').RuntimeTokenUsage | null
   } | undefined
   if (!body?.status) { res.status(400).json({ error: 'status required' }); return }
-  await inprocClient.finishRun({
-    runId,
-    status: body.status,
-    summary: body.summary,
-    error: body.error,
-    toolCallCount: body.toolCallCount,
-    tokenCount: body.tokenCount,
-    model: body.model,
-    usage: body.usage,
+  if (typeof body.status !== 'string' || !RUN_STATUSES.has(body.status)
+    || (body.summary !== undefined && typeof body.summary !== 'string')
+    || (body.error !== undefined && body.error !== null && typeof body.error !== 'string')
+    || (body.toolCallCount !== undefined && !isNonNegativePgInteger(body.toolCallCount))
+    || (body.tokenCount !== undefined && !isNonNegativePgInteger(body.tokenCount))
+    || (body.model !== undefined && body.model !== null && typeof body.model !== 'string')
+    || (body.usage !== undefined && body.usage !== null && !isRuntimeTokenUsage(body.usage))) {
+    res.status(400).json({ error: 'invalid finish payload' }); return
+  }
+  const gate = await withRuntimeAgentRunAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    runIds: [runId],
+    task: (client) => finishAgentRunForOwner({
+      runId,
+      agentId: c.sub,
+      companyId: c.companyId,
+      status: body.status!,
+      summary: body.summary,
+      error: body.error,
+      toolCallCount: body.toolCallCount,
+      tokenCount: body.tokenCount,
+      model: body.model,
+      usage: body.usage,
+    }, client),
   })
+  if (!gate.authorized || !gate.result) { res.status(404).json({ error: 'agent run not found' }); return }
   await markAgentExecutionRunFinished(c.sub, runId, body.status)
   res.json({ ok: true })
 }))

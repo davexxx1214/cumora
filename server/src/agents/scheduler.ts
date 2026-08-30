@@ -749,6 +749,10 @@ export function shouldDeliverToMutedAgent(args: {
   return hasExactMention(args.body, args.agentId)
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /** Which of `agentMemberIds` this message explicitly @-mentions.
  *
  *  Same token rule as {@link shouldDeliverToMutedAgent} — an exact `@id`, not a

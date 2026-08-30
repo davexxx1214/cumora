@@ -387,23 +387,6 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
       return
     }
 
-    // The removed user no longer passes the live company-membership lookup,
-    // but their already-open sockets must be detached immediately. Remaining
-    // colleagues still receive the workspace change through normal routing.
-    if (event.type === 'workspace.member_removed' && typeof event.userId === 'string') {
-      for (const c of clients) {
-        if (c.userId !== event.userId) continue
-        c.companies.delete(companyId)
-        for (const [docId, subscription] of c.docSubs) docUnsubscribe(docId, subscription)
-        c.docSubs.clear()
-        sendJson(c.ws, event)
-        c.ws.close(4403, 'workspace membership removed')
-      }
-    }
-
-    const outboundPayload = event.type === 'conversation.dissolved'
-      ? JSON.stringify({ type: event.type, companyId, conversationId: event.conversationId })
-      : payload
     let outboundQueue = Promise.resolve()
     let pendingOutboundBytes = 0
     let pendingOutboundFrames = 0
@@ -921,6 +904,24 @@ export function attachWebSocket(httpServer: Server) {
       console.warn('[ws] dropping untagged event')
       return
     }
+
+    // The removed user no longer passes the live company-membership lookup,
+    // but their already-open sockets must be detached immediately. Remaining
+    // colleagues still receive the workspace change through normal routing.
+    if (event.type === 'workspace.member_removed' && typeof event.userId === 'string') {
+      for (const c of clients) {
+        if (c.userId !== event.userId) continue
+        c.companies.delete(companyId)
+        for (const [docId, subscription] of c.docSubs) docUnsubscribe(docId, subscription)
+        c.docSubs.clear()
+        sendJson(c.ws, event)
+        c.ws.close(4403, 'workspace membership removed')
+      }
+    }
+
+    const outboundPayload = event.type === 'conversation.dissolved'
+      ? JSON.stringify({ type: event.type, companyId, conversationId: event.conversationId })
+      : payload
 
     // Membership resolution is asynchronous. Serialize per conversation (or
     // company for workspace-wide frames) so a message and its delta/reaction

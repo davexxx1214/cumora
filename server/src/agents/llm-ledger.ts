@@ -40,9 +40,10 @@
 
 import { randomUUID } from 'node:crypto'
 import type OpenAI from 'openai'
+import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
 import { getLlmClient } from '../llm.js'
-import { effectiveCostUsd, priceFor, usageFromOpenAI, EMPTY_USAGE, type TokenUsage } from './cost.js'
+import { EMPTY_USAGE, effectiveCostUsd, priceFor, type TokenUsage, usageFromOpenAI } from './cost.js'
 
 /** The exhaustive set of business purposes that spend sub2api. Adding a new
  *  callsite REQUIRES adding its purpose here — that's the discipline knob that
@@ -110,41 +111,74 @@ export interface LlmCallRecord extends LlmCallContext {
   daemonVersion?: string | null
 }
 
-/** Single INSERT into `llm_calls`. Never throws — the ledger is observability,
- *  not a hard dependency of the call path. */
-export async function recordLlmCall(rec: LlmCallRecord): Promise<void> {
+const LLM_CALL_COLUMNS = `
+  id, company_id, agent_id, run_id, conversation_id,
+  purpose, source, model,
+  input_tokens, cached_input_tokens, cache_creation_tokens,
+  output_tokens, reasoning_tokens,
+  cost_usd, cost_estimated, measured,
+  latency_ms, status, error, extras, daemon_version
+`
+
+function llmCallValues(rec: LlmCallRecord): unknown[] {
   const measured = !!rec.usage
   const usage = rec.usage ?? EMPTY_USAGE
   // Cost is computed at insert time so the row is meaningful on its own.
   // A later operator price change re-prices new rows only; if we later want
   // back-fill, the breakdown is preserved so a recompute is one UPDATE away.
   const cost = effectiveCostUsd(rec.model, usage)
+  return [
+    `llm-${randomUUID()}`,
+    rec.companyId, rec.agentId ?? null, rec.runId ?? null, rec.conversationId ?? null,
+    rec.purpose, rec.source ?? 'cloud', rec.model,
+    usage.inputTokens, usage.cachedInputTokens, usage.cacheCreationTokens,
+    usage.outputTokens, rec.reasoningTokens ?? 0,
+    measured ? cost.usd : 0, cost.estimated, measured,
+    rec.latencyMs, rec.status,
+    rec.error ? rec.error.slice(0, 500) : null,
+    rec.extras ? JSON.stringify(rec.extras) : null,
+    rec.daemonVersion ?? null,
+  ]
+}
+
+async function insertLlmCall(rec: LlmCallRecord): Promise<void> {
+  await pool.query(
+    `INSERT INTO llm_calls (${LLM_CALL_COLUMNS})
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21)`,
+    llmCallValues(rec),
+  )
+}
+
+/** Single INSERT into `llm_calls`. Never throws — the ledger is observability,
+ *  not a hard dependency of the call path. */
+export async function recordLlmCall(rec: LlmCallRecord): Promise<void> {
   try {
-    await pool.query(
-      `INSERT INTO llm_calls (
-         id, company_id, agent_id, run_id, conversation_id,
-         purpose, source, model,
-         input_tokens, cached_input_tokens, cache_creation_tokens,
-         output_tokens, reasoning_tokens,
-         cost_usd, cost_estimated, measured,
-         latency_ms, status, error, extras, daemon_version
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21)`,
-      [
-        `llm-${randomUUID()}`,
-        rec.companyId, rec.agentId ?? null, rec.runId ?? null, rec.conversationId ?? null,
-        rec.purpose, rec.source ?? 'cloud', rec.model,
-        usage.inputTokens, usage.cachedInputTokens, usage.cacheCreationTokens,
-        usage.outputTokens, rec.reasoningTokens ?? 0,
-        measured ? cost.usd : 0, cost.estimated, measured,
-        rec.latencyMs, rec.status,
-        rec.error ? rec.error.slice(0, 500) : null,
-        rec.extras ? JSON.stringify(rec.extras) : null,
-        rec.daemonVersion ?? null,
-      ],
-    )
+    await insertLlmCall(rec)
   } catch (err) {
     console.warn('[llm-ledger] insert failed — dropping', err instanceof Error ? err.message : err)
   }
+}
+
+/** One atomic statement for a runtime hop batch. Unlike the best-effort public
+ *  recorder, this deliberately throws so the surrounding authorization
+ *  transaction can roll back every row together. */
+export async function recordLlmCallsBatch(
+  records: readonly LlmCallRecord[],
+  client: PoolClient,
+): Promise<void> {
+  if (records.length === 0) return
+  const values = records.flatMap(llmCallValues)
+  const rows = records.map((_, rowIndex) => {
+    const offset = rowIndex * 21
+    return `(${Array.from({ length: 21 }, (_value, columnIndex) => {
+      const placeholder = `$${offset + columnIndex + 1}`
+      return columnIndex === 19 ? `${placeholder}::jsonb` : placeholder
+    }).join(',')})`
+  })
+  await client.query(
+    `INSERT INTO llm_calls (${LLM_CALL_COLUMNS}) VALUES ${rows.join(',')}`,
+    values,
+  )
 }
 
 /** Classify a thrown LLM error into one of the ledger's `status` buckets.

@@ -1,5 +1,5 @@
-import { pool } from '../../db/pool.js'
 import type { PoolClient } from 'pg'
+import { pool } from '../../db/pool.js'
 
 /**
  * A signed runtime token captures the agent's tenant at mint time. Resolve the
@@ -19,6 +19,55 @@ export async function isRuntimeAgentAuthorized(
     [agentId, companyId],
   )
   return rowCount === 1
+}
+
+/** Hold the live runtime identity and every referenced run stable through an
+ *  observability mutation. Participant reassignment/offboarding updates
+ *  conflict with FOR SHARE; run GC and competing run mutations conflict with
+ *  FOR UPDATE. Sorted run ids give concurrent batches one lock order. */
+export async function withRuntimeAgentRunAuthorization<T>(args: {
+  agentId: string
+  companyId: string
+  runIds: readonly string[]
+  task: (client: PoolClient) => Promise<T>
+}): Promise<{ authorized: boolean; result?: T }> {
+  const runIds = [...new Set(args.runIds)].sort()
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const participant = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind = 'agent' AND departed_at IS NULL
+        FOR SHARE`,
+      [args.agentId, args.companyId],
+    )
+    if (!participant.rowCount) {
+      await client.query('ROLLBACK')
+      return { authorized: false }
+    }
+    if (runIds.length > 0) {
+      const runs = await client.query<{ id: string }>(
+        `SELECT id FROM agent_runs
+          WHERE id = ANY($1::text[])
+            AND agent_id = $2 AND company_id = $3
+          ORDER BY id FOR UPDATE`,
+        [runIds, args.agentId, args.companyId],
+      )
+      if (runs.rows.length !== runIds.length) {
+        await client.query('ROLLBACK')
+        return { authorized: false }
+      }
+    }
+    const result = await args.task(client)
+    await client.query('COMMIT')
+    return { authorized: true, result }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 /** Hold the current agent and every requested conversation membership stable

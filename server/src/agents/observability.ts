@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
-import { effectiveCostUsd, priceFor, modelPriceTable, EMPTY_USAGE, type TokenUsage } from './cost.js'
+import { EMPTY_USAGE, effectiveCostUsd, modelPriceTable, priceFor, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
 export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'
 export type AgentEventLevel = 'debug' | 'info' | 'warn' | 'error'
+
+type Queryable = Pick<PoolClient, 'query'>
 
 const MAX_STRING_CHARS = 24_000
 const MAX_JSON_CHARS = 160_000
@@ -46,9 +49,9 @@ export async function createAgentRun(args: {
   inputMessageIds?: string[]
   inboxCount?: number
   fingerprint?: string
-}): Promise<string> {
+}, db: Queryable = pool): Promise<string> {
   const id = `run-${randomUUID()}`
-  await pool.query(
+  await db.query(
     `INSERT INTO agent_runs (
        id, agent_id, company_id, trigger, status, stage,
        input_message_ids, inbox_count, fingerprint
@@ -100,27 +103,91 @@ export async function recordAgentEvent(args: {
   )
 }
 
-export async function finishAgentRun(args: {
+/** Record a daemon-supplied event only when the JWT-pinned agent still owns
+ *  the target run. The authorization predicate lives in the same statement as
+ *  the INSERT so a guessed run id can never create an event or bump another
+ *  agent's stage between a route-level check and the write itself. */
+export async function recordAgentEventForOwner(args: {
+  runId: string
+  agentId: string
+  companyId: string
+  kind: string
+  level?: AgentEventLevel
+  title: string
+  data?: Record<string, unknown>
+  stage?: string
+}, db: Queryable = pool): Promise<boolean> {
+  const result = await db.query(
+    `WITH owned_run AS MATERIALIZED (
+       SELECT ar.id
+         FROM agent_runs ar
+        WHERE ar.id = $2
+          AND ar.agent_id = $3
+          AND ar.company_id = $4
+          AND EXISTS (
+            SELECT 1 FROM participants p
+             WHERE p.id = $3 AND p.company_id = $4
+               AND p.kind = 'agent' AND p.departed_at IS NULL
+          )
+     ), inserted AS (
+       INSERT INTO agent_events (id, run_id, agent_id, company_id, kind, level, title, data)
+       SELECT $1, owned_run.id, $3, $4, $5, $6, $7, $8::jsonb
+         FROM owned_run
+       RETURNING run_id
+     )
+     UPDATE agent_runs ar
+        SET updated_at = NOW(),
+            stage = COALESCE($9, ar.stage)
+       FROM inserted
+      WHERE ar.id = inserted.run_id
+      RETURNING ar.id`,
+    [
+      `evt-${randomUUID()}`,
+      args.runId,
+      args.agentId,
+      args.companyId,
+      args.kind,
+      args.level ?? 'info',
+      args.title,
+      jsonForDb(args.data ?? {}),
+      args.stage ?? null,
+    ],
+  )
+  return result.rowCount === 1
+}
+
+interface FinishAgentRunArgs {
   runId: string
   status: AgentRunStatus
   summary?: string
   error?: string | null
   toolCallCount?: number
   tokenCount?: number
-  /** Model id (for cache-aware pricing). */
   model?: string | null
-  /** Cache-aware token breakdown. When present we also store the breakdown +
-   *  effective cost; when absent, only the legacy fields are written (COALESCE
-   *  leaves the cost columns at their defaults). */
   usage?: TokenUsage | null
-}): Promise<void> {
+}
+
+async function finishAgentRunRow(
+  args: FinishAgentRunArgs,
+  owner?: { agentId: string; companyId: string },
+  db: Queryable = pool,
+): Promise<boolean> {
   const usage = args.usage ?? null
   const cost = usage ? effectiveCostUsd(args.model, usage) : null
   // Legacy token_count = input+output sum; keep it populated for back-compat.
   const tokenCount = args.tokenCount ?? (usage
     ? usage.inputTokens + usage.cachedInputTokens + usage.cacheCreationTokens + usage.outputTokens
     : 0)
-  await pool.query(
+  const ownerPredicate = owner
+    ? `AND agent_id = $14
+       AND company_id = $15
+       AND EXISTS (
+         SELECT 1 FROM participants p
+          WHERE p.id = $14 AND p.company_id = $15
+            AND p.kind = 'agent' AND p.departed_at IS NULL
+       )`
+    : ''
+  const result = await db.query(
     `UPDATE agent_runs
         SET status = $2,
             stage = $2,
@@ -137,7 +204,9 @@ export async function finishAgentRun(args: {
             model                 = COALESCE($13, model),
             updated_at = NOW(),
             finished_at = NOW()
-      WHERE id = $1`,
+      WHERE id = $1
+        ${ownerPredicate}
+      RETURNING id`,
     [
       args.runId,
       args.status,
@@ -152,8 +221,23 @@ export async function finishAgentRun(args: {
       cost?.usd ?? null,
       cost ? cost.estimated : null,
       args.model ?? null,
+      ...(owner ? [owner.agentId, owner.companyId] : []),
     ],
   )
+  return result.rowCount === 1
+}
+
+export async function finishAgentRun(args: FinishAgentRunArgs): Promise<void> {
+  await finishAgentRunRow(args)
+}
+
+/** Finish a daemon run only when its persisted owner matches the current JWT. */
+export async function finishAgentRunForOwner(
+  args: FinishAgentRunArgs & { agentId: string; companyId: string },
+  db: Queryable = pool,
+): Promise<boolean> {
+  const { agentId, companyId, ...run } = args
+  return finishAgentRunRow(run, { agentId, companyId }, db)
 }
 
 /** Record one inbox-triage call (the small-brain gate) with its cache-aware cost.
@@ -203,6 +287,40 @@ export async function touchAgentRun(runId: string): Promise<void> {
     `UPDATE agent_runs SET updated_at = NOW() WHERE id = $1 AND status = 'running'`,
     [runId],
   )
+}
+
+/** Ownership-aware daemon heartbeat. `owned` distinguishes an already-finished
+ *  caller-owned run (valid no-op) from a missing or foreign run without leaking
+ *  which of those two cases occurred. */
+export async function touchAgentRunForOwner(args: {
+  runId: string
+  agentId: string
+  companyId: string
+}, db: Queryable = pool): Promise<{ owned: boolean; touched: boolean }> {
+  const { rows } = await db.query<{ owned: boolean; touched: boolean }>(
+    `WITH owned_run AS MATERIALIZED (
+       SELECT ar.id, ar.status
+         FROM agent_runs ar
+        WHERE ar.id = $1
+          AND ar.agent_id = $2
+          AND ar.company_id = $3
+          AND EXISTS (
+            SELECT 1 FROM participants p
+             WHERE p.id = $2 AND p.company_id = $3
+               AND p.kind = 'agent' AND p.departed_at IS NULL
+          )
+     ), touched_run AS (
+       UPDATE agent_runs ar
+          SET updated_at = NOW()
+         FROM owned_run
+        WHERE ar.id = owned_run.id AND owned_run.status = 'running'
+       RETURNING ar.id
+     )
+     SELECT EXISTS (SELECT 1 FROM owned_run) AS owned,
+            EXISTS (SELECT 1 FROM touched_run) AS touched`,
+    [args.runId, args.agentId, args.companyId],
+  )
+  return rows[0] ?? { owned: false, touched: false }
 }
 
 export async function markStaleAgentRuns(maxAgeMs: number = 10 * 60_000): Promise<Array<{ id: string; agent_id: string }>> {
