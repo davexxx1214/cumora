@@ -31,6 +31,7 @@ import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
 import { recordTriage, touchAgentRun } from '../observability.js'
 import { buildTeamRosterText, getPersona } from '../personas.js'
 import { consumeAgentTurnToken } from '../scheduler.js'
+import { isRuntimeAgentAuthorized } from './authorization.js'
 import { buildRuntimeArgv } from './cli-argv.js'
 import { normalizeByoaSource } from './byoa-source.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
@@ -44,18 +45,43 @@ interface RuntimeRequest extends Request {
   agent?: AgentRuntimeClaims
 }
 
-function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction): void {
+async function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction): Promise<void> {
   const header = req.headers['authorization']
   if (!header || typeof header !== 'string' || !header.startsWith('Bearer ')) {
     res.status(401).json({ error: 'missing bearer token' })
     return
   }
+
+  let claims: AgentRuntimeClaims
   try {
-    req.agent = verifyAgentToken(header.slice('Bearer '.length).trim())
-    next()
+    claims = verifyAgentToken(header.slice('Bearer '.length).trim())
   } catch (err) {
     res.status(401).json({ error: err instanceof Error ? err.message : 'invalid token' })
+    return
   }
+
+  if (!claims.companyId) {
+    res.status(403).json({ error: 'companyId claim required' })
+    return
+  }
+
+  try {
+    // A valid signature only proves what was true when the token was minted.
+    // Re-check the globally unique agent row on every request so tenant moves
+    // and offboarding revoke an old daemon token immediately, across the whole
+    // runtime surface rather than only on selected data-reading endpoints.
+    if (!(await isRuntimeAgentAuthorized(claims.sub, claims.companyId))) {
+      res.status(403).json({ error: 'agent does not belong to token tenant' })
+      return
+    }
+  } catch (err) {
+    console.error('[runtime] token tenant validation failed', err instanceof Error ? err.message : err)
+    res.status(503).json({ error: 'runtime authorization unavailable' })
+    return
+  }
+
+  req.agent = claims
+  next()
 }
 
 function withAgent(
@@ -99,7 +125,11 @@ runtimeRouter.post('/project-files/leases/:id/stopped', withAgent(async (c, req,
 // ─── wake stream: server pushes events to the agent's long-running pod ─
 
 runtimeRouter.get('/wake-stream', withAgent(async (c, _req, res) => {
-  await attachWakeStream(c.sub, res)
+  await attachWakeStream(c.sub, res, {
+    // The HTTP middleware validates at connection time. Re-check before every
+    // event as well because this response can remain open across a tenant move.
+    authorize: () => isRuntimeAgentAuthorized(c.sub, c.companyId),
+  })
   // Don't end — attachWakeStream keeps the response open until the
   // client disconnects.
 }))

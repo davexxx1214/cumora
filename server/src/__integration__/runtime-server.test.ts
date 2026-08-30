@@ -231,7 +231,7 @@ test('[integration] runtime: /context enforces tenant and conversation membershi
   )
 })
 
-test('[integration] runtime: /context rejects a stale production token after tenant reassignment', async () => {
+test('[integration] runtime: every route rejects a stale production token after tenant reassignment', async () => {
   const originalTenant = await seedAgent()
   const currentTenant = await seedAgent()
   const staleToken = await mintAssignedAgentRuntimeToken(originalTenant)
@@ -264,16 +264,29 @@ test('[integration] runtime: /context rejects a stale production token after ten
   )
   assert.deepEqual(currentAgentRows, [{ company_id: currentTenant.companyId }])
 
-  // The pre-fix query joined the requesting agent to the conversation's
-  // company instead of the JWT company. It therefore accepted this current
-  // tenant-B membership even though the still-valid token is pinned to A.
-  const r = await call('/runtime/context', {
-    token: staleToken,
-    body: { conversationIds: [crossTenantId] },
-  })
+  // Exercise both current-tenant reads and a mutation. The auth middleware is
+  // mounted before the entire runtime router, so each must fail before its
+  // handler can observe or alter the reassigned agent's tenant-B state.
+  for (const request of [
+    { path: '/runtime/context', body: { conversationIds: [crossTenantId] } },
+    { path: '/runtime/inbox', method: 'GET' },
+    { path: '/runtime/persona', method: 'GET' },
+    { path: '/runtime/status', body: { status: 'working' } },
+  ]) {
+    const r = await call(request.path, {
+      method: request.method,
+      token: staleToken,
+      body: request.body,
+    })
+    assert.equal(r.status, 403, request.path)
+    assert.match(String(r.body?.error ?? ''), /token tenant/i, request.path)
+  }
 
-  assert.equal(r.status, 200)
-  assert.deepEqual(r.body?.rows ?? [], [])
+  const { rows: statusRows } = await pool.query<{ status: string }>(
+    `SELECT status FROM participants WHERE id = $1`,
+    [originalTenant.agentId],
+  )
+  assert.deepEqual(statusRows, [{ status: 'avail' }])
 })
 
 test('[integration] runtime: /inbox-triage/payload rejects a stale token before loading the new tenant inbox', async () => {

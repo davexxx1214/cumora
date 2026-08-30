@@ -135,6 +135,12 @@ interface Subscriber {
   res: Response
   /** Set when the response closes — used to drop from the bus. */
   closed: boolean
+  /** Optional live authorization check for long-lived runtime streams. */
+  authorize?: () => Promise<boolean>
+  /** Preserve event order while authorization checks are asynchronous. */
+  delivery: Promise<void>
+  pendingDeliveries: number
+  revoke(): void
 }
 
 const subs = new Map<string, Set<Subscriber>>()
@@ -144,8 +150,23 @@ const subs = new Map<string, Set<Subscriber>>()
 // under a wake flood that grows unbounded → OOM. A backed-up subscriber gets
 // dropped (it reconnects and re-drains the inbox, which is durable).
 const SSE_MAX_BUFFERED_BYTES = 1 * 1024 * 1024 // 1 MB
+// An authorization database stall must not turn the per-subscriber promise
+// chain into an unbounded in-memory wake queue. The inbox is the durable queue;
+// reconnecting after this bound is safer than retaining more event payloads.
+const SSE_MAX_PENDING_DELIVERIES = 64
 
-function deliverTo(s: Subscriber, evt: WakeEvent): void {
+async function deliverTo(s: Subscriber, evt: WakeEvent): Promise<void> {
+  if (s.closed) return
+  if (s.authorize) {
+    try {
+      if (!(await s.authorize())) { s.revoke(); return }
+    } catch {
+      // Authorization is fail-closed. The durable inbox lets a newly minted,
+      // correctly scoped daemon recover the wake after it reconnects.
+      s.revoke()
+      return
+    }
+  }
   if (s.closed) return
   // Backpressure guard (OOM fix): if the socket's write queue is backed up the
   // client isn't keeping up — end the stream to reclaim the buffered memory
@@ -182,7 +203,17 @@ function installRedisSubscriber(): void {
     if (!set || set.size === 0) return
     let evt: WakeEvent
     try { evt = JSON.parse(raw) as WakeEvent } catch { return }
-    for (const s of set) deliverTo(s, evt)
+    for (const s of set) {
+      if (s.pendingDeliveries >= SSE_MAX_PENDING_DELIVERIES) {
+        s.revoke()
+        continue
+      }
+      s.pendingDeliveries += 1
+      s.delivery = s.delivery
+        .then(() => deliverTo(s, evt))
+        .catch(() => s.revoke())
+        .finally(() => { s.pendingDeliveries -= 1 })
+    }
   })
 }
 
@@ -229,7 +260,11 @@ export function listLocalSubscribedAgents(): string[] {
  * response open. Subscribes to the per-agent Redis channel iff this
  * is the first local sub for that agent.
  */
-export async function attachWakeStream(agentId: string, res: Response): Promise<void> {
+export async function attachWakeStream(
+  agentId: string,
+  res: Response,
+  options: { authorize?: () => Promise<boolean> } = {},
+): Promise<void> {
   installRedisSubscriber()
 
   res.setHeader('Content-Type', 'text/event-stream')
@@ -241,31 +276,22 @@ export async function attachWakeStream(agentId: string, res: Response): Promise<
   let set = subs.get(agentId)
   if (!set) { set = new Set(); subs.set(agentId, set) }
   const isFirst = set.size === 0
-  const s: Subscriber = { agentId, res, closed: false }
+  const s: Subscriber = {
+    agentId,
+    res,
+    closed: false,
+    authorize: options.authorize,
+    delivery: Promise.resolve(),
+    pendingDeliveries: 0,
+    revoke: () => { /* assigned below once cleanup exists */ },
+  }
   set.add(s)
 
-  // Subscribe to the Redis channel BEFORE we tell the Pod we're ready —
-  // otherwise a wake that arrives during the gap is silently dropped
-  // (the Pod's initial-drain catches it, but we'd rather not rely on
-  // that fallback when avoidable).
-  if (isFirst) {
-    await redisSub.subscribe(CH_WAKE_PREFIX + agentId)
-  }
-  console.log(`[wake-bus] +sub ${agentId} (${set.size} local · redis-subscribed=${isFirst})`)
-
-  res.write(`event: ready\ndata: {"agentId":"${agentId}","at":${Date.now()}}\n\n`)
-
-  // SSE comment ping every 25s. Clients that idle out at 30s (some
-  // proxies) stay alive.
-  const ping = setInterval(() => {
-    if (s.closed) return
-    try { res.write(`: ping ${Date.now()}\n\n`) } catch { s.closed = true }
-  }, 25_000)
-
+  let ping: ReturnType<typeof setInterval> | null = null
   const cleanup = (): void => {
     if (s.closed && set!.has(s) === false) return     // re-entrant call guard
     s.closed = true
-    clearInterval(ping)
+    if (ping) clearInterval(ping)
     set!.delete(s)
     const last = set!.size === 0
     if (last) subs.delete(agentId)
@@ -280,6 +306,41 @@ export async function attachWakeStream(agentId: string, res: Response): Promise<
       })
     }
   }
+  s.revoke = () => {
+    if (s.closed) return
+    try { res.end() } catch { /* ignore */ }
+    cleanup()
+  }
   res.on('close', cleanup)
   res.on('error', cleanup)
+
+  // Subscribe to the Redis channel BEFORE we tell the Pod we're ready —
+  // otherwise a wake that arrives during the gap is silently dropped
+  // (the Pod's initial-drain catches it, but we'd rather not rely on
+  // that fallback when avoidable).
+  if (isFirst) {
+    await redisSub.subscribe(CH_WAKE_PREFIX + agentId)
+  }
+  if (s.closed) return
+  console.log(`[wake-bus] +sub ${agentId} (${set.size} local · redis-subscribed=${isFirst})`)
+
+  res.write(`event: ready\ndata: {"agentId":"${agentId}","at":${Date.now()}}\n\n`)
+
+  // SSE comment ping every 25s. Clients that idle out at 30s (some
+  // proxies) stay alive.
+  ping = setInterval(() => {
+    if (s.closed) return
+    void (async () => {
+      if (s.authorize) {
+        try {
+          if (!(await s.authorize())) { s.revoke(); return }
+        } catch {
+          s.revoke()
+          return
+        }
+      }
+      try { res.write(`: ping ${Date.now()}\n\n`) } catch { s.closed = true }
+    })()
+  }, 25_000)
+
 }

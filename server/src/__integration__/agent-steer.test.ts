@@ -355,6 +355,7 @@ function makeFakeSseResponse(): Response & {
     setHeader: (k: string, v: string) => { headers[k] = v },
     flushHeaders: () => { /* noop */ },
     write: (s: string) => { if (!fake.closed) written.push(s); return true },
+    end: () => { if (!fake.closed) { fake.closed = true; ee.emit('close') } },
     triggerClose: () => { fake.closed = true; ee.emit('close') },
   }) as unknown as Response & { written: string[]; closed: boolean; triggerClose: () => void }
   return fake
@@ -419,6 +420,28 @@ test('[integration] wire: deliverSteer publishes via Redis pubsub → wake-bus S
   assert.equal(payload.body, 'hey @nova check the auth module')
 
   res.triggerClose()
+})
+
+test('[integration] wake stream revalidates authorization before delivering an event', async () => {
+  const agentId = `agent-${randomUUID().slice(0, 8)}`
+  const res = makeFakeSseResponse()
+  let checks = 0
+  await attachWakeStream(agentId, res, {
+    authorize: async () => { checks += 1; return false },
+  })
+  await new Promise((r) => setTimeout(r, 100))
+
+  await deliverWake(agentId, {
+    kind: 'wake',
+    reason: 'message.new',
+    conversationId: 'new-tenant-conversation',
+  })
+  await new Promise((r) => setTimeout(r, 100))
+
+  const frames = parseSseFrames(res.written)
+  assert.equal(checks, 1)
+  assert.equal(res.closed, true)
+  assert.equal(frames.some((frame) => frame.event === 'wake'), false)
 })
 
 test('[integration] wire: scheduler.wakeAgent routes BOTH wake AND steer when agent is busy', async () => {
