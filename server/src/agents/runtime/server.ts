@@ -31,7 +31,11 @@ import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
 import { recordTriage, touchAgentRun } from '../observability.js'
 import { buildTeamRosterText, getPersona } from '../personas.js'
 import { consumeAgentTurnToken } from '../scheduler.js'
-import { isRuntimeAgentAuthorized } from './authorization.js'
+import {
+  isRuntimeAgentAuthorized,
+  withRuntimeConversationAuthorization,
+  withRuntimeMessageReadAuthorization,
+} from './authorization.js'
 import { buildRuntimeArgv } from './cli-argv.js'
 import { normalizeByoaSource } from './byoa-source.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
@@ -45,6 +49,8 @@ export type { WakeEvent } from './wake-bus.js'
 interface RuntimeRequest extends Request {
   agent?: AgentRuntimeClaims
 }
+
+type AuthorizedAgentRuntimeClaims = AgentRuntimeClaims & { companyId: string }
 
 async function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction): Promise<void> {
   const header = req.headers['authorization']
@@ -86,13 +92,14 @@ async function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunc
 }
 
 function withAgent(
-  handler: (claims: AgentRuntimeClaims, req: RuntimeRequest, res: Response) => Promise<void>,
+  handler: (claims: AuthorizedAgentRuntimeClaims, req: RuntimeRequest, res: Response) => Promise<void>,
 ) {
   return async (req: RuntimeRequest, res: Response): Promise<void> => {
     const claims = req.agent
     if (!claims) { res.status(401).json({ error: 'unauthenticated' }); return }
+    if (!claims.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
     try {
-      await handler(claims, req, res)
+      await handler(claims as AuthorizedAgentRuntimeClaims, req, res)
     } catch (err) {
       if (err instanceof ProjectFileError) { res.status(err.status).json({ error: err.message, code: err.code }); return }
       const msg = err instanceof Error ? err.message : String(err)
@@ -430,12 +437,18 @@ runtimeRouter.post('/status/heartbeat', withAgent(async (c, req, res) => {
 runtimeRouter.post('/typing', withAgent(async (c, req, res) => {
   const body = req.body as { conversationId?: string; done?: boolean } | undefined
   if (!body?.conversationId) { res.status(400).json({ error: 'conversationId required' }); return }
-  await inprocClient.publishTyping({
-    conversationId: body.conversationId,
+  const gate = await withRuntimeConversationAuthorization({
     agentId: c.sub,
-    done: Boolean(body.done),
     companyId: c.companyId,
+    conversationIds: [body.conversationId],
+    task: () => inprocClient.publishTyping({
+      conversationId: body.conversationId as string,
+      agentId: c.sub,
+      done: Boolean(body.done),
+      companyId: c.companyId,
+    }),
   })
+  if (!gate.authorized) { res.status(403).json({ error: 'not a member of that conversation' }); return }
   res.json({ ok: true })
 }))
 
@@ -667,42 +680,65 @@ runtimeRouter.post('/busy/clear', withAgent(async (c, _req, res) => {
 // ─── thinking-claim — peer-visible "I'm composing" signal ─────────
 runtimeRouter.post('/thinking/mark', withAgent(async (c, req, res) => {
   const body = req.body as { conversationIds?: string[]; ttlSec?: number } | undefined
-  const ids = Array.isArray(body?.conversationIds) ? body!.conversationIds.filter((s) => typeof s === 'string') : []
+  const ids = Array.isArray(body?.conversationIds)
+    ? [...new Set(body.conversationIds.filter((s) => typeof s === 'string'))].sort()
+    : []
+  if (ids.length > 100) { res.status(400).json({ error: 'at most 100 conversationIds' }); return }
   const ttlSec = typeof body?.ttlSec === 'number' && body.ttlSec > 0 && body.ttlSec <= 600 ? body.ttlSec : 60
-  await inprocClient.markThinking(c.sub, ids, ttlSec)
-  // Stamp the freshness-preflight compose-anchor for these convos at THE
-  // SAME moment (NX-preserved, so heartbeats don't keep bumping it later
-  // and defeating the point — the anchor must reflect TURN START, not
-  // "most recent heartbeat"). The cli.cmdReply preflight uses this anchor
-  // to detect peer posts that landed mid-compose even when the agent's
-  // own glance has since advanced the seen-baseline past them.
-  if (ids.length > 0) {
-    const { recordComposeAnchor, getComposeAnchor } = await import('../seen-boundary.js')
-    const now = Date.now()
-    await Promise.all(ids.map(async (cid) => {
-      const existing = await getComposeAnchor(c.sub, cid)
-      if (existing > 0 && now - existing < 30 * 60_000) return // already stamped this turn — keep the first
-      await recordComposeAnchor(c.sub, cid, now)
-    }))
-  }
+  const gate = await withRuntimeConversationAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    conversationIds: ids,
+    task: async () => {
+      await inprocClient.markThinking(c.sub, ids, ttlSec)
+      // Stamp the freshness-preflight compose-anchor at turn start. NX-style
+      // preservation keeps heartbeats from moving the anchor later.
+      if (ids.length > 0) {
+        const { recordComposeAnchor, getComposeAnchor } = await import('../seen-boundary.js')
+        const now = Date.now()
+        await Promise.all(ids.map(async (cid) => {
+          const existing = await getComposeAnchor(c.sub, cid)
+          if (existing > 0 && now - existing < 30 * 60_000) return
+          await recordComposeAnchor(c.sub, cid, now)
+        }))
+      }
+    },
+  })
+  if (!gate.authorized) { res.status(403).json({ error: 'not a member of every conversation' }); return }
   res.json({ ok: true })
 }))
 runtimeRouter.post('/thinking/unmark', withAgent(async (c, req, res) => {
   const body = req.body as { conversationIds?: string[] } | undefined
-  const ids = Array.isArray(body?.conversationIds) ? body!.conversationIds.filter((s) => typeof s === 'string') : []
-  await inprocClient.unmarkThinking(c.sub, ids)
-  // Clear the compose-anchor too — turn ended, next turn gets a fresh anchor.
-  if (ids.length > 0) {
-    const { clearComposeAnchor } = await import('../seen-boundary.js')
-    await Promise.all(ids.map((cid) => clearComposeAnchor(c.sub, cid)))
-  }
+  const ids = Array.isArray(body?.conversationIds)
+    ? [...new Set(body.conversationIds.filter((s) => typeof s === 'string'))].sort()
+    : []
+  if (ids.length > 100) { res.status(400).json({ error: 'at most 100 conversationIds' }); return }
+  const gate = await withRuntimeConversationAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    conversationIds: ids,
+    task: async () => {
+      await inprocClient.unmarkThinking(c.sub, ids)
+      if (ids.length > 0) {
+        const { clearComposeAnchor } = await import('../seen-boundary.js')
+        await Promise.all(ids.map((cid) => clearComposeAnchor(c.sub, cid)))
+      }
+    },
+  })
+  if (!gate.authorized) { res.status(403).json({ error: 'not a member of every conversation' }); return }
   res.json({ ok: true })
 }))
-runtimeRouter.get('/thinking/peek', withAgent(async (_c, req, res) => {
+runtimeRouter.get('/thinking/peek', withAgent(async (c, req, res) => {
   const cid = typeof req.query.conversationId === 'string' ? req.query.conversationId : ''
   if (!cid) { res.status(400).json({ error: 'conversationId required' }); return }
-  const agents = await inprocClient.peekThinking(cid)
-  res.json({ agents })
+  const gate = await withRuntimeConversationAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    conversationIds: [cid],
+    task: () => inprocClient.peekThinking(cid),
+  })
+  if (!gate.authorized) { res.status(403).json({ error: 'not a member of that conversation' }); return }
+  res.json({ agents: gate.result ?? [] })
 }))
 
 // ─── worklog — anti-duplicate-work claims ───────────────────────────
@@ -718,14 +754,21 @@ runtimeRouter.post('/worklog/claim', withAgent(async (c, req, res) => {
   if (!body?.scopeKey || !body.taskType || !body.subject) {
     res.status(400).json({ error: 'scopeKey, taskType, subject required' }); return
   }
-  const result = await inprocClient.claimWork({
-    scopeKey: body.scopeKey,
+  const scopeConversationIds = body.scopeKey === `tenant:${c.companyId}` ? [] : [body.scopeKey]
+  const gate = await withRuntimeConversationAuthorization({
     agentId: c.sub,
-    taskType: body.taskType as Parameters<typeof inprocClient.claimWork>[0]['taskType'],
-    subject: body.subject,
-    ttlSec: typeof body.ttlSec === 'number' && body.ttlSec > 0 && body.ttlSec <= 3600 ? body.ttlSec : undefined,
+    companyId: c.companyId,
+    conversationIds: scopeConversationIds,
+    task: () => inprocClient.claimWork({
+      scopeKey: body.scopeKey as string,
+      agentId: c.sub,
+      taskType: body.taskType as Parameters<typeof inprocClient.claimWork>[0]['taskType'],
+      subject: body.subject as string,
+      ttlSec: typeof body.ttlSec === 'number' && body.ttlSec > 0 && body.ttlSec <= 3600 ? body.ttlSec : undefined,
+    }),
   })
-  res.json(result)
+  if (!gate.authorized) { res.status(403).json({ error: 'worklog scope is not authorized' }); return }
+  res.json(gate.result)
 }))
 runtimeRouter.post('/worklog/release', withAgent(async (c, req, res) => {
   const body = req.body as {
@@ -736,19 +779,33 @@ runtimeRouter.post('/worklog/release', withAgent(async (c, req, res) => {
   if (!body?.scopeKey || !body.taskType || !body.subject) {
     res.status(400).json({ error: 'scopeKey, taskType, subject required' }); return
   }
-  await inprocClient.releaseWork({
-    scopeKey: body.scopeKey,
+  const scopeConversationIds = body.scopeKey === `tenant:${c.companyId}` ? [] : [body.scopeKey]
+  const gate = await withRuntimeConversationAuthorization({
     agentId: c.sub,
-    taskType: body.taskType as Parameters<typeof inprocClient.releaseWork>[0]['taskType'],
-    subject: body.subject,
+    companyId: c.companyId,
+    conversationIds: scopeConversationIds,
+    task: () => inprocClient.releaseWork({
+      scopeKey: body.scopeKey as string,
+      agentId: c.sub,
+      taskType: body.taskType as Parameters<typeof inprocClient.releaseWork>[0]['taskType'],
+      subject: body.subject as string,
+    }),
   })
+  if (!gate.authorized) { res.status(403).json({ error: 'worklog scope is not authorized' }); return }
   res.json({ ok: true })
 }))
-runtimeRouter.get('/worklog/peek', withAgent(async (_c, req, res) => {
+runtimeRouter.get('/worklog/peek', withAgent(async (c, req, res) => {
   const sk = typeof req.query.scopeKey === 'string' ? req.query.scopeKey : ''
   if (!sk) { res.status(400).json({ error: 'scopeKey required' }); return }
-  const entries = await inprocClient.peekWorklog(sk)
-  res.json({ entries })
+  const scopeConversationIds = sk === `tenant:${c.companyId}` ? [] : [sk]
+  const gate = await withRuntimeConversationAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    conversationIds: scopeConversationIds,
+    task: () => inprocClient.peekWorklog(sk),
+  })
+  if (!gate.authorized) { res.status(403).json({ error: 'worklog scope is not authorized' }); return }
+  res.json({ entries: gate.result ?? [] })
 }))
 
 // ─── steering dedup: advance per-agent conversation_reads cursor ─────
@@ -761,11 +818,19 @@ runtimeRouter.post('/conversation/mark-read', withAgent(async (c, req, res) => {
   if (!body?.conversationId || !body.upToMessageId) {
     res.status(400).json({ error: 'conversationId and upToMessageId required' }); return
   }
-  await inprocClient.markConversationRead({
+  const gate = await withRuntimeMessageReadAuthorization({
     agentId: c.sub,
+    companyId: c.companyId,
     conversationId: body.conversationId,
-    upToMessageId: body.upToMessageId,
+    messageId: body.upToMessageId,
+    task: (client) => inprocClient.markConversationRead({
+      agentId: c.sub,
+      companyId: c.companyId,
+      conversationId: body.conversationId as string,
+      upToMessageId: body.upToMessageId as string,
+    }, client),
   })
+  if (!gate.authorized) { res.status(403).json({ error: 'message is not readable in that conversation' }); return }
   res.json({ ok: true })
 }))
 
@@ -781,16 +846,9 @@ runtimeRouter.post('/notices', withAgent(async (c, req, res) => {
     res.status(400).json({ error: 'conversationId, noticeKind, text, dedupeKey required' })
     return
   }
-  // Identity comes from the JWT, NEVER the body — a notice is always about
-  // THIS agent (e.g. its own engine failure). Trusting a body-supplied
-  // agentId/companyId would let any valid token spoof another agent as the
-  // author, cross-tenant. Scope the target conversation to the token's
-  // company and require this agent to be a member of it.
-  const member = await inprocClient.isConversationMember(body.conversationId, c.sub, c.companyId)
-  if (!member) {
-    res.status(403).json({ error: 'not a member of that conversation' })
-    return
-  }
+  // Identity comes from the JWT, NEVER the body. postSystemNotice performs
+  // participant + conversation membership validation and the write under one
+  // transaction, closing the check-then-write revocation window.
   const out = await inprocClient.postSystemNotice({
     conversationId: body.conversationId,
     companyId: c.companyId,
@@ -800,7 +858,11 @@ runtimeRouter.post('/notices', withAgent(async (c, req, res) => {
     dedupeKey: body.dedupeKey,
     dedupeTtlSec: body.dedupeTtlSec ?? 3600,
   })
-  res.json(out)
+  if (!out.authorized) {
+    res.status(403).json({ error: 'not a member of that conversation' })
+    return
+  }
+  res.json({ posted: out.posted })
 }))
 
 // Keep body-parser failures machine-readable and avoid exposing its default

@@ -3,7 +3,8 @@
  *
  * A `transport_status='failed'` row used to sit forever — Resend hiccups,
  * DNS flap, a Cloudflare 502 during deploy, and the message would never
- * leave the database. This loop reclaims those rows: every
+ * leave the database. A process crash could likewise strand a write-first
+ * row in `sending`. This loop reclaims both due states: every
  * EMAIL_RETRY_INTERVAL_MS it picks the next batch whose `next_retry_at`
  * has passed, re-issues the send (preserving threading + recipients +
  * attachments), updates retry_attempts + status, and schedules the next
@@ -56,7 +57,7 @@ interface RetryRow {
   retry_attempts: number
 }
 
-/** Claim a batch of due retries with SKIP LOCKED so concurrent replicas
+/** Claim a batch of due failed or crash-stale sending rows with SKIP LOCKED so concurrent replicas
  *  don't fight for the same row. We hold the transaction for the entire
  *  send loop so a slow Resend call doesn't cause the next tick on this
  *  replica to grab the same row. */
@@ -72,7 +73,7 @@ async function claimDueRetries(limit: number): Promise<RetryRow[]> {
          FROM email_messages em
          JOIN messages m ON m.id = em.message_id
         WHERE em.direction = 'out'
-          AND em.transport_status = 'failed'
+          AND em.transport_status IN ('failed', 'sending')
           AND em.next_retry_at IS NOT NULL
           AND em.next_retry_at <= NOW()
         ORDER BY em.next_retry_at ASC
@@ -173,7 +174,8 @@ async function retryOne(row: RetryRow): Promise<void> {
   const next = nextRetryAt(attemptNumber)
   await pool.query(
     `UPDATE email_messages
-        SET transport_error = $2,
+        SET transport_status = 'failed',
+            transport_error = $2,
             retry_attempts = $3,
             next_retry_at = $4
       WHERE message_id = $1`,

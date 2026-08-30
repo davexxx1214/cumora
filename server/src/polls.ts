@@ -93,39 +93,60 @@ export async function createPoll(input: CreatePollInput): Promise<CreatedPoll> {
     closedReason: null,
   }
 
-  // Validate conversation membership at the boundary — the HTTP layer
-  // already does this, but agent paths reach in here directly so we
-  // double-check rather than trust the caller.
-  const { rows: convoRows } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1 AND company_id = $2`,
-    [input.conversationId, input.companyId],
-  )
-  const convo = convoRows[0]
-  if (!convo) throw new PollError('conversation not found', 404)
-  if (!convo.members.includes(input.authorId)) {
-    throw new PollError('not a member of this conversation', 403)
-  }
-
-  const seqResult = await pool.query<{ seq: number }>(
-    `INSERT INTO conversation_counters (conversation_id, next_sequence)
-     VALUES ($1, 2)
-     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-     RETURNING next_sequence - 1 AS seq`,
-    [input.conversationId],
-  )
-  const sequence = seqResult.rows[0]?.seq ?? 1
   const messageId = `m-${randomUUID()}`
   // Body shadows the question so any code that lists messages without
   // unpacking the poll payload (notifications, search index, plain-text
   // logs) still surfaces something meaningful.
   const body = `📊 ${question}`
 
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, poll, company_id)
-     VALUES ($1,$2,$3,'poll',$4,$5,$6::jsonb,$7)`,
-    [messageId, input.conversationId, input.authorId, body, sequence, JSON.stringify(payload), input.companyId],
-  )
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [input.conversationId])
+  let sequence: number
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Pin current participant + membership at the write boundary. Lock order
+    // matches membership mutations, preventing a stale author from creating a
+    // poll after a concurrent kick, offboarding, or tenant move.
+    const actor = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR SHARE`,
+      [input.authorId, input.companyId],
+    )
+    if (!actor.rowCount) throw new PollError('author is not an active tenant participant', 403)
+    const authorized = await client.query(
+      `SELECT id FROM conversations
+        WHERE id = $1 AND company_id = $2
+          AND members @> to_jsonb(ARRAY[$3::text])
+        FOR UPDATE`,
+      [input.conversationId, input.companyId, input.authorId],
+    )
+    if (!authorized.rowCount) throw new PollError('conversation not found or not authorized', 403)
+
+    const seqResult = await client.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+       RETURNING next_sequence - 1 AS seq`,
+      [input.conversationId],
+    )
+    sequence = seqResult.rows[0]?.seq ?? 1
+    await client.query(
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, poll, company_id)
+       VALUES ($1,$2,$3,'poll',$4,$5,$6::jsonb,$7)`,
+      [messageId, input.conversationId, input.authorId, body, sequence, JSON.stringify(payload), input.companyId],
+    )
+    await client.query(
+      `UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND company_id = $2`,
+      [input.conversationId, input.companyId],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 
   // Drop the poll into the message bus exactly like a text message — the
   // mailbox scheduler wakes member agents, each gets to decide for itself
@@ -152,6 +173,8 @@ export async function createPoll(input: CreatePollInput): Promise<CreatedPoll> {
       poll: payload,
       pollTallies: [],
     },
+  }).catch((error) => {
+    console.warn(`[poll] durable message ${messageId} committed but publish failed`, error)
   })
 
   return { messageId, sequence, poll: payload }
@@ -173,31 +196,32 @@ export async function castVote(input: CastVoteInput): Promise<PollUpdatedEvent> 
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    const voter = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind = $3 AND departed_at IS NULL
+        FOR SHARE`,
+      [input.voterParticipantId, input.companyId, input.voterKind],
+    )
+    if (!voter.rowCount) throw new PollError('voter is not an active tenant participant', 403)
     const { rows } = await client.query<{
       poll: PollPayload | null
       conversation_id: string
       company_id: string
     }>(
-      `SELECT poll, conversation_id, company_id
-         FROM messages
-        WHERE id = $1 AND company_id = $2 AND kind = 'poll'
-        FOR UPDATE`,
-      [input.messageId, input.companyId],
+      `SELECT m.poll, m.conversation_id, m.company_id
+         FROM conversations c
+         JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
+        WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
+          AND c.members @> to_jsonb(ARRAY[$3::text])
+        FOR SHARE OF c
+        FOR UPDATE OF m`,
+      [input.messageId, input.companyId, input.voterParticipantId],
     )
     const row = rows[0]
     if (!row || !row.poll) throw new PollError('poll not found', 404)
     const poll = row.poll
     if (poll.closedAt) throw new PollError('poll is closed', 409)
-
-    // Membership gate: only conversation members can vote.
-    const { rows: convoRows } = await client.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1`,
-      [row.conversation_id],
-    )
-    const members = convoRows[0]?.members ?? []
-    if (!members.includes(input.voterParticipantId)) {
-      throw new PollError('not a member of this conversation', 403)
-    }
 
     if (poll.mode === 'single' && requested.length > 1) {
       throw new PollError('single-choice poll accepts at most one option')
@@ -244,14 +268,35 @@ export async function closePoll(input: CloseInput): Promise<PollUpdatedEvent | n
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    if (input.reason === 'manual') {
+      if (!input.actorId) throw new PollError('actor required for manual close', 403)
+      const actor = await client.query(
+        `SELECT id FROM participants
+          WHERE id = $1 AND company_id = $2
+            AND kind IN ('agent', 'human') AND departed_at IS NULL
+          FOR SHARE`,
+        [input.actorId, input.companyId],
+      )
+      if (!actor.rowCount) throw new PollError('actor is not an active tenant participant', 403)
+    }
     const { rows } = await client.query<{
       poll: PollPayload | null
       author_id: string
     }>(
-      `SELECT poll, author_id FROM messages
-        WHERE id = $1 AND company_id = $2 AND kind = 'poll'
-        FOR UPDATE`,
-      [input.messageId, input.companyId],
+      input.reason === 'manual'
+        ? `SELECT m.poll, m.author_id
+             FROM conversations c
+             JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
+            WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
+              AND c.members @> to_jsonb(ARRAY[$3::text])
+            FOR SHARE OF c
+            FOR UPDATE OF m`
+        : `SELECT poll, author_id FROM messages
+            WHERE id = $1 AND company_id = $2 AND kind = 'poll'
+            FOR UPDATE`,
+      input.reason === 'manual'
+        ? [input.messageId, input.companyId, input.actorId]
+        : [input.messageId, input.companyId],
     )
     const row = rows[0]
     if (!row || !row.poll) throw new PollError('poll not found', 404)

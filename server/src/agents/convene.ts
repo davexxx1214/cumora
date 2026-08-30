@@ -5,9 +5,9 @@ import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { enforceModelPolicy, realTaskModel } from './model-policy.js'
 import { CH_CONVENE, publish } from '../redis.js'
-import { getAllAgentPersonas, getPersona, buildSystemPrompt } from './personas.js'
+import { getPersona, buildSystemPrompt } from './personas.js'
 import { setStatus } from '../status.js'
-import { companyIdForConveneSession, companyIdForConversation } from '../tenant.js'
+import { companyIdForConveneSession } from '../tenant.js'
 
 interface SessionRow {
   id: string
@@ -20,37 +20,87 @@ interface SessionRow {
   state: string
 }
 
-async function nextTranscriptSequence(sessionId: string): Promise<number> {
-  const { rows } = await pool.query<{ c: number }>(
-    `SELECT COUNT(*)::int AS c FROM convene_transcript WHERE session_id = $1`,
-    [sessionId],
-  )
-  return (rows[0]?.c ?? 0) + 1
-}
-
 async function appendTranscript(args: {
   sessionId: string
   authorId: string
   kind: 'text' | 'thought' | 'tool' | 'decision'
   body: string
   decision?: { headline: string; body: string } | null
-}): Promise<{ id: string; sequence: number }> {
+}): Promise<{ id: string; sequence: number } | null> {
   const id = `ct-${randomUUID()}`
-  const sequence = await nextTranscriptSequence(args.sessionId)
-  await pool.query(
-    `INSERT INTO convene_transcript (id, session_id, author_id, kind, body, sequence, decision)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
-    [id, args.sessionId, args.authorId, args.kind, args.body, sequence,
-      args.decision ? JSON.stringify(args.decision) : null],
+  const scope = await pool.query<{ conversation_id: string; company_id: string }>(
+    `SELECT conversation_id, company_id FROM convene_sessions WHERE id = $1`,
+    [args.sessionId],
   )
-  const companyId = (await companyIdForConveneSession(args.sessionId)) ?? undefined
+  const initial = scope.rows[0]
+  if (!initial) return null
+  let sequence = 0
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (args.authorId !== 'system') {
+      const participant = await client.query(
+        `SELECT id FROM participants
+          WHERE id = $1 AND company_id = $2
+            AND kind = 'agent' AND departed_at IS NULL
+          FOR SHARE`,
+        [args.authorId, initial.company_id],
+      )
+      if (!participant.rowCount) {
+        await client.query('ROLLBACK')
+        return null
+      }
+    }
+    const conversation = await client.query(
+      `SELECT id FROM conversations
+        WHERE id = $1 AND company_id = $2
+          AND ($3::text = 'system' OR members @> to_jsonb(ARRAY[$3::text]))
+        FOR SHARE`,
+      [initial.conversation_id, initial.company_id, args.authorId],
+    )
+    if (!conversation.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const session = await client.query(
+      `SELECT id FROM convene_sessions
+        WHERE id = $1 AND conversation_id = $2 AND company_id = $3 AND state = 'live'
+        FOR UPDATE`,
+      [args.sessionId, initial.conversation_id, initial.company_id],
+    )
+    if (!session.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const seq = await client.query<{ sequence: number }>(
+      `SELECT COALESCE(MAX(sequence), 0)::int + 1 AS sequence
+         FROM convene_transcript WHERE session_id = $1`,
+      [args.sessionId],
+    )
+    sequence = seq.rows[0]?.sequence ?? 1
+    await client.query(
+      `INSERT INTO convene_transcript
+        (id, session_id, author_id, kind, body, sequence, decision, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)`,
+      [id, args.sessionId, args.authorId, args.kind, args.body, sequence,
+        args.decision ? JSON.stringify(args.decision) : null, initial.company_id],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
   await publish(CH_CONVENE, {
     type: 'convene',
     sessionId: args.sessionId,
-    conversationId: '',
-    companyId,
+    conversationId: initial.conversation_id,
+    companyId: initial.company_id,
     kind: 'transcript',
     data: { id, sessionId: args.sessionId, authorId: args.authorId, kind: args.kind, body: args.body, sequence, decision: args.decision ?? null, createdAt: new Date().toISOString() },
+  }).catch((error) => {
+    console.warn(`[convene] durable transcript ${id} committed but publish failed`, error)
   })
   return { id, sequence }
 }
@@ -68,45 +118,82 @@ export async function getActiveConvene(conversationId: string): Promise<SessionR
 
 export async function startConvene(args: {
   conversationId: string
+  companyId: string
   startedBy: string
   topic: string
 }): Promise<SessionRow> {
   const id = `cs-${randomUUID()}`
-  const { rows: cv } = await pool.query<{ members: string[]; title: string }>(
-    `SELECT members, title FROM conversations WHERE id = $1`,
-    [args.conversationId],
-  )
-  const convo = cv[0]
-  if (!convo) throw new Error(`conversation ${args.conversationId} not found`)
-
-  const session: SessionRow = {
-    id,
-    conversation_id: args.conversationId,
-    title: `${convo.title} · live`,
-    flair: args.topic.slice(0, 80),
-    started_by: args.startedBy,
-    started_at: new Date().toISOString(),
-    ended_at: null,
-    state: 'live',
+  let session: SessionRow
+  let created = false
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const actor = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR SHARE`,
+      [args.startedBy, args.companyId],
+    )
+    if (!actor.rowCount) throw new Error('convene starter is no longer an active tenant participant')
+    const { rows } = await client.query<{ title: string }>(
+      `SELECT title FROM conversations
+        WHERE id = $1 AND company_id = $2
+          AND members @> to_jsonb(ARRAY[$3::text])
+        FOR UPDATE`,
+      [args.conversationId, args.companyId, args.startedBy],
+    )
+    if (!rows[0]) throw new Error(`conversation ${args.conversationId} not found or not authorized`)
+    const existing = await client.query<SessionRow>(
+      `SELECT id, conversation_id, title, flair, started_by, started_at, ended_at, state
+         FROM convene_sessions
+        WHERE conversation_id = $1 AND company_id = $2 AND state = 'live'
+        ORDER BY started_at DESC LIMIT 1
+        FOR UPDATE`,
+      [args.conversationId, args.companyId],
+    )
+    if (existing.rows[0]) {
+      await client.query('COMMIT')
+      return existing.rows[0]
+    }
+    session = {
+      id,
+      conversation_id: args.conversationId,
+      title: `${rows[0].title} · live`,
+      flair: args.topic.slice(0, 80),
+      started_by: args.startedBy,
+      started_at: new Date().toISOString(),
+      ended_at: null,
+      state: 'live',
+    }
+    await client.query(
+      `INSERT INTO convene_sessions
+        (id, conversation_id, title, flair, started_by, started_at, state, company_id)
+       VALUES ($1,$2,$3,$4,$5,NOW(),'live',$6)`,
+      [id, session.conversation_id, session.title, session.flair, session.started_by, args.companyId],
+    )
+    created = true
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
   }
 
-  await pool.query(
-    `INSERT INTO convene_sessions (id, conversation_id, title, flair, started_by, started_at, state)
-     VALUES ($1,$2,$3,$4,$5,NOW(),'live')`,
-    [id, session.conversation_id, session.title, session.flair, session.started_by],
-  )
-
-  const companyId = (await companyIdForConversation(args.conversationId)) ?? undefined
+  if (!created) return session
   await publish(CH_CONVENE, {
     type: 'convene',
     sessionId: id,
     conversationId: args.conversationId,
-    companyId,
+    companyId: args.companyId,
     kind: 'started',
     data: session,
+  }).catch((error) => {
+    console.warn(`[convene] durable session ${id} committed but started publish failed`, error)
   })
 
-  orchestrate({ session, members: convo.members, topic: args.topic }).catch((e) => {
+  orchestrate({ session, companyId: args.companyId, topic: args.topic }).catch((e) => {
     console.error('[convene] orchestration error', e)
   })
 
@@ -115,84 +202,65 @@ export async function startConvene(args: {
 
 async function orchestrate(args: {
   session: SessionRow
-  members: string[]
+  companyId: string
   topic: string
 }): Promise<void> {
-  const { session, members, topic } = args
-  // Snapshot the agent roster once for this orchestrate run, scoped to the
-  // tenant the convene's conversation belongs to.
-  const tenant = (await companyIdForConversation(session.conversation_id)) ?? 'personal'
-  const allAgents = await getAllAgentPersonas(tenant)
-  const nameById = new Map(allAgents.map((p) => [p.id, p.name]))
-  const isAgentId = new Set(allAgents.map((p) => p.id))
-  const agentMembers = members.filter((m) => isAgentId.has(m))
+  const { session, companyId, topic } = args
+  try {
+    const { rows: agentMembers } = await pool.query<{ id: string }>(
+      `SELECT p.id
+         FROM conversations c
+         CROSS JOIN LATERAL jsonb_array_elements_text(c.members) member(id)
+         JOIN participants p
+           ON p.id = member.id AND p.company_id = c.company_id
+          AND p.kind = 'agent' AND p.departed_at IS NULL
+        WHERE c.id = $1 AND c.company_id = $2
+        ORDER BY p.id`,
+      [session.conversation_id, companyId],
+    )
+    for (const { id: agentId } of agentMembers) {
+      await runAgentTurn({ session, companyId, agentId, topic })
+    }
 
-  const { rows: ctxMsgs } = await pool.query<{ author_id: string; body: string; kind: string }>(
-    `SELECT author_id, body, kind FROM messages
-      WHERE conversation_id = $1 AND kind IN ('text','thought')
-      ORDER BY sequence DESC LIMIT 12`,
-    [session.conversation_id],
-  )
-  const groundingHistory: ResponseInputItem[] = ctxMsgs.reverse().map((m) => ({
-    role: 'user',
-    content: `[${nameById.get(m.author_id) ?? m.author_id}]: ${m.body}`,
-  }))
-
-  for (const agentId of agentMembers) {
-    await runAgentTurn({ session, agentId, groundingHistory, topic })
-  }
-
-  const summary = await classifyDecision({ sessionId: session.id, topic })
-  if (summary) {
-    await appendTranscript({
+    const summary = await classifyDecision({ sessionId: session.id, topic })
+    if (summary) {
+      await appendTranscript({
+        sessionId: session.id,
+        authorId: 'system',
+        kind: 'decision',
+        body: summary.body,
+        decision: { headline: summary.headline, body: summary.body },
+      })
+    }
+  } finally {
+    await pool.query(
+      `UPDATE convene_sessions SET state = 'ended', ended_at = NOW()
+        WHERE id = $1 AND company_id = $2 AND state = 'live'`,
+      [session.id, companyId],
+    )
+    await publish(CH_CONVENE, {
+      type: 'convene',
       sessionId: session.id,
-      authorId: 'system',
-      kind: 'decision',
-      body: summary.body,
-      decision: { headline: summary.headline, body: summary.body },
+      conversationId: session.conversation_id,
+      companyId,
+      kind: 'ended',
+    }).catch((error) => {
+      console.warn(`[convene] session ${session.id} ended but publish failed`, error)
     })
   }
-
-  await pool.query(
-    `UPDATE convene_sessions SET state = 'ended', ended_at = NOW() WHERE id = $1`,
-    [session.id],
-  )
-  const companyId = (await companyIdForConversation(session.conversation_id)) ?? undefined
-  await publish(CH_CONVENE, {
-    type: 'convene',
-    sessionId: session.id,
-    conversationId: session.conversation_id,
-    companyId,
-    kind: 'ended',
-  })
 }
 
 async function runAgentTurn(args: {
   session: SessionRow
+  companyId: string
   agentId: string
-  groundingHistory: ResponseInputItem[]
   topic: string
 }): Promise<void> {
+  const snapshot = await loadAuthorizedTurnSnapshot(args)
+  if (!snapshot) return
   const persona = await getPersona(args.agentId)
   if (!persona) return
   await setStatus(args.agentId, 'thinking')
-
-  const { rows: transcript } = await pool.query<{ author_id: string; kind: string; body: string }>(
-    `SELECT author_id, kind, body FROM convene_transcript
-      WHERE session_id = $1 ORDER BY sequence ASC`,
-    [args.session.id],
-  )
-  // Pre-fetch every distinct author's name in one round-trip.
-  const distinctAuthors = [...new Set(transcript.map((t) => t.author_id))]
-  const nameByAuthor = new Map<string, string>()
-  for (const a of distinctAuthors) {
-    const p = await getPersona(a)
-    if (p) nameByAuthor.set(a, p.name)
-  }
-  const transcriptHistory: ResponseInputItem[] = transcript.map((t) => ({
-    role: t.author_id === args.agentId ? 'assistant' : 'user',
-    content: `[${nameByAuthor.get(t.author_id) ?? t.author_id}]: ${t.body}`,
-  }))
 
   const baseSystem = await buildSystemPrompt(args.agentId)
   const sys = `${baseSystem ?? persona.style}
@@ -201,10 +269,9 @@ You're in a LIVE CONVENE — a real-time work session. Other team members will s
 
 Topic of this convene: ${args.topic}`
 
-  const tenant = (await companyIdForConversation(args.session.conversation_id)) ?? null
   const client = await getTrackedLlmClient({
     purpose: 'convene-speech',
-    companyId: tenant,
+    companyId: args.companyId,
     agentId: args.agentId,
     conversationId: args.session.conversation_id,
     extras: { sessionId: args.session.id, topic: args.topic.slice(0, 120) },
@@ -215,8 +282,8 @@ Topic of this convene: ${args.topic}`
     model: enforceModelPolicy(realTaskModel(persona.model), 'convene-speech'),
     instructions: sys,
     input: [
-      ...args.groundingHistory,
-      ...transcriptHistory,
+      ...snapshot.groundingHistory,
+      ...snapshot.transcriptHistory,
       { role: 'user', content: `[Convene moderator]: ${persona.name}, your turn.` },
     ],
     max_output_tokens: 3000,
@@ -227,6 +294,89 @@ Topic of this convene: ${args.topic}`
     await appendTranscript({ sessionId: args.session.id, authorId: args.agentId, kind: 'text', body })
   }
   await setStatus(args.agentId, 'avail')
+}
+
+async function loadAuthorizedTurnSnapshot(args: {
+  session: SessionRow
+  companyId: string
+  agentId: string
+}): Promise<{
+  groundingHistory: ResponseInputItem[]
+  transcriptHistory: ResponseInputItem[]
+} | null> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const participant = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind = 'agent' AND departed_at IS NULL
+        FOR SHARE`,
+      [args.agentId, args.companyId],
+    )
+    if (!participant.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const conversation = await client.query(
+      `SELECT id FROM conversations
+        WHERE id = $1 AND company_id = $2
+          AND members @> to_jsonb(ARRAY[$3::text])
+        FOR SHARE`,
+      [args.session.conversation_id, args.companyId, args.agentId],
+    )
+    if (!conversation.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const liveSession = await client.query(
+      `SELECT id FROM convene_sessions
+        WHERE id = $1 AND conversation_id = $2 AND company_id = $3 AND state = 'live'
+        FOR SHARE`,
+      [args.session.id, args.session.conversation_id, args.companyId],
+    )
+    if (!liveSession.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const { rows: contextRows } = await client.query<{
+      author_id: string; author_name: string; body: string
+    }>(
+      `SELECT m.author_id, COALESCE(p.name, m.author_id) AS author_name, m.body
+         FROM messages m
+         LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = m.company_id
+        WHERE m.conversation_id = $1 AND m.company_id = $2
+          AND m.kind IN ('text','thought')
+        ORDER BY m.sequence DESC LIMIT 12`,
+      [args.session.conversation_id, args.companyId],
+    )
+    const { rows: transcriptRows } = await client.query<{
+      author_id: string; author_name: string; body: string
+    }>(
+      `SELECT t.author_id, COALESCE(p.name, t.author_id) AS author_name, t.body
+         FROM convene_transcript t
+         LEFT JOIN participants p ON p.id = t.author_id AND p.company_id = $2
+        WHERE t.session_id = $1
+        ORDER BY t.sequence ASC`,
+      [args.session.id, args.companyId],
+    )
+    await client.query('COMMIT')
+    return {
+      groundingHistory: contextRows.reverse().map((row): ResponseInputItem => ({
+        role: 'user',
+        content: `[${row.author_name}]: ${row.body}`,
+      })),
+      transcriptHistory: transcriptRows.map((row): ResponseInputItem => ({
+        role: row.author_id === args.agentId ? 'assistant' : 'user',
+        content: `[${row.author_name}]: ${row.body}`,
+      })),
+    }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 /** Strip hallucinated tool-call XML when the LLM has no real tools. */

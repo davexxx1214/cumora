@@ -33,7 +33,12 @@ export const COMPUTER_STALE_MS = 90_000
 async function broadcastComputerStatus(
   computerId: string, companyId: string, status: ComputerStatus,
 ): Promise<void> {
-  await publish(CH_STATUS, { type: 'computers.status', computerId, status, companyId })
+  await publish(CH_STATUS, { type: 'computers.status', computerId, status, companyId }).catch((error) => {
+    console.warn(
+      `[computer] durable ${computerId}=${status} update committed but publish failed`,
+      error,
+    )
+  })
 }
 
 /** Announce a just-paired computer as online. Split out from {@link pairComputer}

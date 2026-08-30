@@ -1,4 +1,5 @@
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
+import type { PoolClient } from 'pg'
 import {
   storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
@@ -9,6 +10,7 @@ import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
+import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics } from '../agents/observability.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
@@ -379,6 +381,49 @@ async function requireConversationMember(
     throw new HttpError(404, 'not found')
   }
   return { userId, companyId, members: rows[0].members, kind: rows[0].kind }
+}
+
+/** Execute a conversation mutation at a linearizable authorization point.
+ * Lock order is always participant -> conversation, matching membership
+ * helpers. The conversation row is exclusive because every current caller
+ * mutates either it or state whose authorization derives from its members. */
+async function withLockedConversationMember<T>(args: {
+  userId: string
+  companyId: string
+  conversationId: string
+  work: (
+    client: PoolClient,
+    conversation: { members: string[]; kind: string; pinned: boolean },
+  ) => Promise<T>
+}): Promise<T> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const actor = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR SHARE`,
+      [args.userId, args.companyId],
+    )
+    if (!actor.rowCount) throw new HttpError(404, 'not found')
+    const { rows } = await client.query<{ members: string[]; kind: string; pinned: boolean }>(
+      `SELECT members, kind, pinned FROM conversations
+        WHERE id = $1 AND company_id = $2
+          AND members @> to_jsonb(ARRAY[$3::text])
+        FOR UPDATE`,
+      [args.conversationId, args.companyId, args.userId],
+    )
+    if (!rows[0]) throw new HttpError(404, 'not found')
+    const result = await args.work(client, rows[0])
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 async function getDevtoolsState(req: Request & AuthedRequest): Promise<{
@@ -2863,22 +2908,11 @@ api.post('/agents', async (req, res) => {
   // button on the agent card stays disabled because no direct exists.
   // Same idempotent shape as `POST /conversations/direct`.
   try {
-    await pool.query(
-      `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, company_id)
-       VALUES ($1, 'direct', $2, NULL, $3::jsonb, FALSE, NULL, $4)
-       ON CONFLICT (id) DO NOTHING`,
-      [`direct-${data.id}-${randomUUID().slice(0, 6)}`, data.name, JSON.stringify([me, data.id]), tenant],
-    )
-    // Counter row is required for sequence allocation on the first message.
-    await pool.query(
-      `INSERT INTO conversation_counters (conversation_id, next_sequence)
-       SELECT id, 1 FROM conversations
-       WHERE kind = 'direct' AND company_id = $2
-         AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$3::text])
-         AND jsonb_array_length(members) = 2
-       ON CONFLICT (conversation_id) DO NOTHING`,
-      [me, tenant, data.id],
-    )
+    await ensureDirectConversation({
+      companyId: tenant,
+      firstId: me,
+      secondId: data.id,
+    })
   } catch (e) {
     console.warn('[agents] auto-create direct convo failed', e)
   }
@@ -3249,22 +3283,22 @@ api.post('/conversations', async (req, res) => {
   if (!title) { res.status(400).json({ error: 'title required' }); return }
   if (members.length < 2) { res.status(400).json({ error: 'pick at least one teammate' }); return }
 
-  // Validate every member exists in this tenant.
-  const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM participants WHERE id = ANY($1::text[]) AND company_id = $2 AND departed_at IS NULL`,
-    [members, tenant],
-  )
-  const validIds = new Set(existing.map((r) => r.id))
-  const missing = members.filter((m) => !validIds.has(m))
-  if (missing.length > 0) {
-    res.status(400).json({ error: `unknown participant(s): ${missing.join(', ')}` }); return
-  }
-
   const id = `g-${randomUUID().slice(0, 8)}`
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
     await client.query('SELECT id FROM companies WHERE id = $1 FOR UPDATE', [tenant])
+    const participantIds = [...members].sort()
+    const { rows: active } = await client.query<{ id: string }>(
+      `SELECT id FROM participants
+        WHERE company_id = $1 AND id = ANY($2::text[])
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        ORDER BY id FOR SHARE`,
+      [tenant, participantIds],
+    )
+    if (active.length !== participantIds.length) {
+      throw new HttpError(400, 'every member must be an active participant in this workspace')
+    }
     if (projectId) await validateNewProjectBinding(client, tenant, me, projectId)
     await client.query(
       `INSERT INTO conversations (id, kind, title, topic, members, pinned, tag, pulled_by, company_id, project_id)
@@ -3273,10 +3307,12 @@ api.post('/conversations', async (req, res) => {
     await client.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
     await client.query('COMMIT')
   } catch (error) {
-    await client.query('ROLLBACK')
+    await client.query('ROLLBACK').catch(() => {})
     if (error instanceof ProjectFileError) { res.status(error.status).json({ code: error.code, error: error.message }); return }
     throw error
-  } finally { client.release() }
+  } finally {
+    client.release()
+  }
   res.status(201).json({ id, members, projectId })
 })
 
@@ -3337,17 +3373,18 @@ api.post('/conversations/:id/topic', async (req, res) => {
   const { id } = req.params
   const raw = req.body?.topic
   const topic = raw === null || raw === '' ? null : (typeof raw === 'string' ? raw.trim().slice(0, 200) : null)
-  const { rows } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  if (!rows[0]) { res.status(404).json({ error: 'not found' }); return }
-  if (!rows[0].members.includes(me)) {
-    res.status(403).json({ error: 'only members can change the topic' }); return
-  }
-  await pool.query(
-    `UPDATE conversations SET topic = $2, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, topic, tenant],
-  )
+  await withLockedConversationMember({
+    userId: me,
+    companyId: tenant,
+    conversationId: id,
+    work: async (client) => {
+      await client.query(
+        `UPDATE conversations SET topic = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3`,
+        [id, topic, tenant],
+      )
+    },
+  })
   await publish(CH_CONVO_UPDATED, {
     type: 'conversation.updated',
     conversationId: id,
@@ -3364,18 +3401,19 @@ api.post('/conversations/:id/title', async (req, res) => {
   const { id } = req.params
   const title = String(req.body?.title ?? '').trim().slice(0, 80)
   if (!title) { res.status(400).json({ error: 'title required' }); return }
-  const { rows } = await pool.query<{ members: string[]; kind: string }>(
-    `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  if (!rows[0]) { res.status(404).json({ error: 'not found' }); return }
-  if (rows[0].kind !== 'group') { res.status(400).json({ error: 'only group chats can be renamed' }); return }
-  if (!rows[0].members.includes(me)) {
-    res.status(403).json({ error: 'only members can rename the group' }); return
-  }
-  await pool.query(
-    `UPDATE conversations SET title = $2, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, title, tenant],
-  )
+  await withLockedConversationMember({
+    userId: me,
+    companyId: tenant,
+    conversationId: id,
+    work: async (client, conversation) => {
+      if (conversation.kind !== 'group') throw new HttpError(400, 'only group chats can be renamed')
+      await client.query(
+        `UPDATE conversations SET title = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3`,
+        [id, title, tenant],
+      )
+    },
+  })
   await publish(CH_CONVO_UPDATED, {
     type: 'conversation.updated',
     conversationId: id,
@@ -3393,33 +3431,60 @@ api.post('/conversations/direct', async (req, res) => {
   const otherId = String(req.body?.otherId ?? '').trim()
   if (!otherId) { res.status(400).json({ error: 'otherId required' }); return }
   if (otherId === me) { res.status(400).json({ error: 'cannot DM yourself' }); return }
-  const { rows: pp } = await pool.query<{ id: string; kind: string }>(
-    `SELECT id, kind FROM participants WHERE id = $1 AND company_id = $2 AND departed_at IS NULL`, [otherId, tenant],
-  )
-  if (!pp[0]) { res.status(404).json({ error: 'unknown participant' }); return }
+  const participantIds = [me, otherId].sort()
+  const pairKey = JSON.stringify(participantIds)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows: participants } = await client.query<{ id: string; kind: string; name: string }>(
+      `SELECT id, kind, name FROM participants
+        WHERE company_id = $1 AND id = ANY($2::text[])
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        ORDER BY id FOR SHARE`,
+      [tenant, participantIds],
+    )
+    if (participants.length !== 2) throw new HttpError(404, 'unknown or inactive participant')
+    // JSON member pairs have no native unique constraint. A transaction-level
+    // advisory lock makes HTTP and agent direct-chat creation idempotent under
+    // concurrent first messages.
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+      [tenant, pairKey],
+    )
+    const { rows: existing } = await client.query<{ id: string }>(
+      `SELECT id FROM conversations
+        WHERE kind = 'direct' AND company_id = $3
+          AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$2::text])
+          AND jsonb_array_length(members) = 2
+        ORDER BY updated_at DESC LIMIT 1
+        FOR UPDATE`,
+      [me, otherId, tenant],
+    )
+    if (existing[0]) {
+      await client.query('COMMIT')
+      res.json({ id: existing[0].id, created: false })
+      return
+    }
 
-  // Look for an existing direct chat with exactly these two members.
-  const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM conversations
-      WHERE kind = 'direct' AND company_id = $3
-        AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$2::text])
-        AND jsonb_array_length(members) = 2
-      ORDER BY updated_at DESC LIMIT 1`,
-    [me, otherId, tenant],
-  )
-  if (existing[0]) { res.json({ id: existing[0].id, created: false }); return }
-
-  const id = `direct-${otherId}-${randomUUID().slice(0, 6)}`
-  const { rows: title } = await pool.query<{ name: string }>(
-    `SELECT name FROM participants WHERE id = $1 AND company_id = $2`, [otherId, tenant],
-  )
-  await pool.query(
-    `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, company_id)
-     VALUES ($1, 'direct', $2, NULL, $3::jsonb, FALSE, $4, $5)`,
-    [id, title[0]?.name ?? otherId, JSON.stringify([me, otherId]), pp[0].kind === 'human' ? 'human' : null, tenant],
-  )
-  await pool.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
-  res.status(201).json({ id, created: true })
+    const id = `direct-${otherId}-${randomUUID().slice(0, 6)}`
+    const other = participants.find((participant) => participant.id === otherId)!
+    await client.query(
+      `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, company_id)
+       VALUES ($1, 'direct', $2, NULL, $3::jsonb, FALSE, $4, $5)`,
+      [id, other.name, JSON.stringify([me, otherId]), other.kind === 'human' ? 'human' : null, tenant],
+    )
+    await client.query(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`,
+      [id],
+    )
+    await client.query('COMMIT')
+    res.status(201).json({ id, created: true })
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 })
 
 /** Toggle (or set) the pinned state of a conversation. */
@@ -3428,17 +3493,22 @@ api.post('/conversations/:id/pin', async (req, res) => {
   // Pin state is column-level on conversations (shared across all viewers).
   // Without a membership gate, any tenant member could pin/unpin a private
   // DM they're not part of, mutating UI state for the real members.
-  const { companyId: tenant } = await requireConversationMember(req, id)
-  const { rows } = await pool.query<{ pinned: boolean }>(
-    `SELECT pinned FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  if (!rows[0]) { res.status(404).json({ error: 'not found' }); return }
+  const { userId: me, companyId: tenant } = await requireCompany(req)
   const requested = req.body?.pinned
-  const next = typeof requested === 'boolean' ? requested : !rows[0].pinned
-  await pool.query(
-    `UPDATE conversations SET pinned = $2, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, next, tenant],
-  )
+  const next = await withLockedConversationMember({
+    userId: me,
+    companyId: tenant,
+    conversationId: id,
+    work: async (client, conversation) => {
+      const value = typeof requested === 'boolean' ? requested : !conversation.pinned
+      await client.query(
+        `UPDATE conversations SET pinned = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3`,
+        [id, value, tenant],
+      )
+      return value
+    },
+  })
   res.json({ ok: true, pinned: next })
 })
 
@@ -3459,19 +3529,19 @@ api.post('/conversations/:id/pin', async (req, res) => {
 api.post('/conversations/:id/mute', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
-  // Validate the conversation belongs to this tenant + the caller is a
-  // member — same rule as every other per-convo mutation.
-  const { rows: convo } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  if (!convo[0]) { res.status(404).json({ error: 'not found' }); return }
-  if (!convo[0].members.includes(me)) { res.status(403).json({ error: 'not a member' }); return }
   const mute = req.body?.mute !== false  // default to mute=true if omitted
   if (!mute) {
-    await pool.query(
-      `DELETE FROM conversation_mutes WHERE user_id = $1 AND conversation_id = $2`,
-      [me, id],
-    )
+    await withLockedConversationMember({
+      userId: me,
+      companyId: tenant,
+      conversationId: id,
+      work: async (client) => {
+        await client.query(
+          `DELETE FROM conversation_mutes WHERE user_id = $1 AND conversation_id = $2`,
+          [me, id],
+        )
+      },
+    })
     res.json({ ok: true, muted: false, mutedUntil: null })
     return
   }
@@ -3488,13 +3558,20 @@ api.post('/conversations/:id/mute', async (req, res) => {
     }
     until = parsed
   }
-  await pool.query(
-    `INSERT INTO conversation_mutes (user_id, conversation_id, muted_at, muted_until)
-     VALUES ($1, $2, NOW(), $3)
-     ON CONFLICT (user_id, conversation_id)
-     DO UPDATE SET muted_at = NOW(), muted_until = EXCLUDED.muted_until`,
-    [me, id, until],
-  )
+  await withLockedConversationMember({
+    userId: me,
+    companyId: tenant,
+    conversationId: id,
+    work: async (client) => {
+      await client.query(
+        `INSERT INTO conversation_mutes (user_id, conversation_id, muted_at, muted_until)
+         VALUES ($1, $2, NOW(), $3)
+         ON CONFLICT (user_id, conversation_id)
+         DO UPDATE SET muted_at = NOW(), muted_until = EXCLUDED.muted_until`,
+        [me, id, until],
+      )
+    },
+  })
   res.json({ ok: true, muted: true, mutedUntil: until ? until.toISOString() : null })
 })
 
@@ -3520,23 +3597,21 @@ api.post('/conversations/:id/members', async (req, res) => {
     `SELECT id FROM participants WHERE id = $1 AND company_id = $2 AND departed_at IS NULL`, [newMember, tenant],
   )
   if (!existing[0]) { res.status(400).json({ error: `unknown participant: ${newMember}` }); return }
-  const { addConversationMember, postMembershipSystemMessage } = await import('../agents/membership.js')
+  const { addConversationMember } = await import('../agents/membership.js')
   // Postgres edits the array. Splicing it here and writing the whole thing
   // back loses a concurrent membership change, and the `joined` row below is
   // posted either way — so the transcript would record a join that the
   // members column does not agree with.
-  const next = await addConversationMember({ conversationId: id, memberId: newMember, companyId: tenant }) ?? []
-  await postMembershipSystemMessage({
-    conversationId: id, companyId: tenant, actorId: me,
-    kind: 'joined', participantId: newMember,
+  const mutation = await addConversationMember({
+    conversationId: id, memberId: newMember, actorId: me, companyId: tenant,
   })
-  res.json({ ok: true, members: next })
+  if (!mutation) { res.status(403).json({ error: 'membership changed; add cancelled' }); return }
+  res.json({ ok: true, members: mutation.members })
 })
 
 /** Leave a group conversation — removes the caller from members.
- *  Posts the `left` system row BEFORE the members mutation so the
- *  caller's mailbox surfaces this final row in their next wake (the
- *  inbox query filters by current `c.members @> [me]`). */
+ *  The authorization predicate is repeated in the mutation itself so a
+ *  concurrent revocation cannot leave this stale request authorized. */
 api.post('/conversations/:id/leave', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
@@ -3549,20 +3624,20 @@ api.post('/conversations/:id/leave', async (req, res) => {
     res.status(400).json({ error: 'cannot leave a direct conversation' }); return
   }
   if (!c.members.includes(me)) { res.status(409).json({ error: 'not a member' }); return }
-  const { postMembershipSystemMessage, removeConversationMember } = await import('../agents/membership.js')
-  await postMembershipSystemMessage({
-    conversationId: id, companyId: tenant, actorId: me,
-    kind: 'left', participantId: me,
+  const { removeConversationMember } = await import('../agents/membership.js')
+  const mutation = await removeConversationMember({
+    conversationId: id, memberId: me, actorId: me, companyId: tenant,
+    allowSoleMember: true,
+    kind: 'left',
   })
-  const next = await removeConversationMember({ conversationId: id, memberId: me, companyId: tenant }) ?? []
+  if (!mutation) { res.status(409).json({ error: 'membership changed; leave cancelled' }); return }
   await reconcileProjectWorkflowAssignees(tenant, id, me)
-  res.json({ ok: true, members: next })
+  res.json({ ok: true, members: mutation.members })
 })
 
 /** Kick a participant (human or agent) from a group. Owner/admin of the
- *  workspace — they do not need to already be a member of the group.
- *  Posts the `kicked` system row BEFORE the members mutation so the
- *  target's mailbox surfaces this final row (same order as `cumora kick`). */
+ *  workspace need not already belong to the group. The membership change and
+ *  durable delivery notice commit together, then project assignments follow. */
 api.delete('/conversations/:id/members/:memberId', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompanyRole(req, PRIVILEGED_ROLES)
   const { id, memberId } = req.params
@@ -3580,14 +3655,19 @@ api.delete('/conversations/:id/members/:memberId', async (req, res) => {
     res.status(400).json({ error: `cannot kick from a ${c.kind} conversation` }); return
   }
   if (!c.members.includes(target)) { res.status(400).json({ error: 'not a member' }); return }
-  const { postMembershipSystemMessage, removeConversationMember } = await import('../agents/membership.js')
-  await postMembershipSystemMessage({
-    conversationId: id, companyId: tenant, actorId: me,
-    kind: 'kicked', participantId: target,
+  const { removeConversationMember } = await import('../agents/membership.js')
+  const mutation = await removeConversationMember({
+    conversationId: id,
+    memberId: target,
+    actorId: me,
+    companyId: tenant,
+    allowSoleMember: true,
+    allowPrivilegedActor: true,
+    kind: 'kicked',
   })
-  const next = await removeConversationMember({ conversationId: id, memberId: target, companyId: tenant }) ?? []
+  if (!mutation) { res.status(409).json({ error: 'membership changed; removal cancelled' }); return }
   await reconcileProjectWorkflowAssignees(tenant, id, target)
-  res.json({ ok: true, members: next })
+  res.json({ ok: true, members: mutation.members })
 })
 
 /** Human typing indicator. The client throttles emission to roughly one
@@ -3930,7 +4010,7 @@ api.post('/conversations/:id/messages', async (req, res) => {
     res.status(403).json({ error: 'not a member of this conversation' })
     return
   }
-  const agentRecipientIds = resolveAgentRecipientIds({
+  let agentRecipientIds = resolveAgentRecipientIds({
     body,
     conversationKind: convo.kind,
     agentMemberIds: convo.agent_ids,
@@ -3967,85 +4047,144 @@ api.post('/conversations/:id/messages', async (req, res) => {
     }
   }
 
-  // If the client asked to quote, prove that target message exists in THIS
-  // same conversation. Cross-convo quotes would leak content across rooms
-  // (the renderer inlines a summary regardless of who's in the target room),
-  // so we reject those at the boundary. Silently drop instead of 400 if the
-  // quoted id is unknown — most likely it was deleted between the user
-  // hitting reply and us receiving the request; better to send the body
-  // than fail the whole send.
   let quotedSummary: {
     id: string; authorId: string; authorName: string; kind: string;
     body: string; sequence: number
   } | null = null
   let resolvedQuotedId: string | null = null
-  if (quotedMessageId) {
-    const { rows: qr } = await pool.query<{
-      id: string; author_id: string; author_name: string; kind: string;
-      body: string; sequence: number
-    }>(
-      `SELECT m.id, m.author_id,
-              COALESCE(p.name, u.display_name, m.author_id) AS author_name,
-              m.kind, m.body, m.sequence
-         FROM messages m
-         LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = $3
-         LEFT JOIN users u ON u.id = m.author_id
-        WHERE m.id = $1 AND m.conversation_id = $2`,
-      [quotedMessageId, id, tenant],
+  const proposedMessageId = `m-${randomUUID()}`
+  let persisted: { id: string; sequence: number } | undefined
+  let insertedNew = false
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Final write authorization is transactional. Locking the actor before
+    // the conversation matches membership mutation lock order, so a kick,
+    // offboard, or tenant move either happens before this write (and rejects
+    // it) or after the committed message — never between check and INSERT.
+    const actor = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR SHARE`,
+      [me, tenant],
     )
-    if (qr[0]) {
-      resolvedQuotedId = qr[0].id
-      quotedSummary = {
-        id: qr[0].id,
-        authorId: qr[0].author_id,
-        authorName: qr[0].author_name,
-        kind: qr[0].kind,
-        body: qr[0].body.slice(0, 240),
-        sequence: qr[0].sequence,
+    if (!actor.rowCount) throw new HttpError(403, 'participant is no longer active in this workspace')
+    const currentConversation = await client.query<{ kind: string; agent_ids: string[] }>(
+      `SELECT c.kind,
+              ARRAY(
+                SELECT participant.id FROM participants participant
+                 WHERE participant.company_id = c.company_id
+                   AND participant.kind = 'agent' AND participant.departed_at IS NULL
+                   AND c.members @> to_jsonb(ARRAY[participant.id])
+              ) AS agent_ids
+         FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+          AND members @> to_jsonb(ARRAY[$3::text])
+        FOR UPDATE`,
+      [id, tenant, me],
+    )
+    if (!currentConversation.rowCount) throw new HttpError(403, 'not a member of this conversation')
+    if (currentConversation.rows[0].kind === 'email') {
+      throw new HttpError(409, 'conversation changed; retry the email reply')
+    }
+    agentRecipientIds = resolveAgentRecipientIds({
+      body,
+      conversationKind: currentConversation.rows[0].kind,
+      agentMemberIds: currentConversation.rows[0].agent_ids,
+    })
+
+    // Prove a quoted target belongs to this same authorized conversation.
+    // Unknown/deleted ids are dropped so the body can still be delivered.
+    if (quotedMessageId) {
+      const { rows: qr } = await client.query<{
+        id: string; author_id: string; author_name: string; kind: string;
+        body: string; sequence: number
+      }>(
+        `SELECT m.id, m.author_id,
+                COALESCE(p.name, u.display_name, m.author_id) AS author_name,
+                m.kind, m.body, m.sequence
+           FROM messages m
+           LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = $3
+           LEFT JOIN users u ON u.id = m.author_id
+          WHERE m.id = $1 AND m.conversation_id = $2`,
+        [quotedMessageId, id, tenant],
+      )
+      if (qr[0]) {
+        resolvedQuotedId = qr[0].id
+        quotedSummary = {
+          id: qr[0].id,
+          authorId: qr[0].author_id,
+          authorName: qr[0].author_name,
+          kind: qr[0].kind,
+          body: qr[0].body.slice(0, 240),
+          sequence: qr[0].sequence,
+        }
       }
     }
+
+    // Retrying a message, or sending it twice at the same time, can leave a
+    // sequence gap. Gaps are safe because sequence is ordering-only.
+    const seqResult = await client.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+       RETURNING next_sequence - 1 AS seq`,
+      [id],
+    )
+    const sequence = seqResult.rows[0]?.seq ?? 1
+    const inserted = await client.query<{ id: string; sequence: number }>(
+      `INSERT INTO messages
+         (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id, agent_recipient_ids)
+       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb)
+       ON CONFLICT (conversation_id, author_id, client_id) WHERE client_id IS NOT NULL
+       DO NOTHING
+       RETURNING id, sequence`,
+      [
+        proposedMessageId,
+        id,
+        me,
+        body,
+        sequence,
+        attachment ? JSON.stringify(attachment) : null,
+        resolvedQuotedId,
+        tenant,
+        clientId,
+        agentRecipientIds ? JSON.stringify(agentRecipientIds) : null,
+      ],
+    )
+    persisted = inserted.rows[0] ?? (clientId
+      ? (await client.query<{ id: string; sequence: number }>(
+          `SELECT id, sequence FROM messages
+            WHERE conversation_id = $1 AND author_id = $2 AND client_id = $3`,
+          [id, me, clientId],
+        )).rows[0]
+      : undefined)
+    if (!persisted) throw new Error('message insert returned no row')
+    insertedNew = Boolean(inserted.rows[0])
+    if (insertedNew) {
+      await client.query(
+        `UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND company_id = $2`,
+        [id, tenant],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
   }
-
-  // Retrying a message, or sending it twice at the same time, can leave a gap
-  // in sequence numbers. They only sort messages, so gaps are safe.
-  const seqResult = await pool.query<{ seq: number }>(
-    `INSERT INTO conversation_counters (conversation_id, next_sequence)
-     VALUES ($1, 2)
-     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-     RETURNING next_sequence - 1 AS seq`,
-    [id],
-  )
-  const sequence = seqResult.rows[0]?.seq ?? 1
-
-  const proposedMessageId = `m-${randomUUID()}`
-  const inserted = await pool.query<{ id: string; sequence: number }>(
-    `INSERT INTO messages
-       (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id, agent_recipient_ids)
-     VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb)
-     ON CONFLICT (conversation_id, author_id, client_id) WHERE client_id IS NOT NULL
-     DO NOTHING
-     RETURNING id, sequence`,
-    [proposedMessageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant, clientId,
-      agentRecipientIds ? JSON.stringify(agentRecipientIds) : null],
-  )
-  const persisted = inserted.rows[0] ?? (clientId
-    ? (await pool.query<{ id: string; sequence: number }>(
-        `SELECT id, sequence FROM messages
-          WHERE conversation_id = $1 AND author_id = $2 AND client_id = $3`,
-        [id, me, clientId],
-      )).rows[0]
-    : undefined)
   if (!persisted) throw new Error('message insert returned no row')
   const messageId = persisted.id
   const persistedSequence = persisted.sequence
   deliveryMessageId = messageId
-  if (!inserted.rows[0]) {
+  if (!insertedNew) {
     logDelivery('message.reused', { sequence: persistedSequence })
     res.status(202).json({ id: messageId, sequence: persistedSequence })
     return
   }
   logDelivery('message.committed', { sequence: persistedSequence })
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [id])
 
   // Test-only fault injection: reproduce a connection disappearing after
   // persistence but before either HTTP or WebSocket acknowledgement.
@@ -4361,23 +4500,17 @@ api.post('/email/send', async (req, res) => {
       subject, memberIds: [...memberIds],
     })
     const fromLine = formatAddress(sender.email, sender.displayName)
-    const sendRes = await sendViaProvider({
-      from: fromLine,
-      to: toResolved.map((r) => formatAddress(r.addr, r.name)),
-      cc: ccResolved.length ? ccResolved.map((r) => formatAddress(r.addr, r.name)) : undefined,
-      subject, text: body, messageId,
-      attachments: resolvedAttachments.map((a) => ({
-        filename: a.filename, mimeType: a.mimeType, path: a.publicUrl,
-      })),
-    })
+    // Authorize and commit the durable outbound row before the network hop.
+    // persistEmailMessage pins the active participant and conversation
+    // membership, so a concurrent removal wins before any provider call.
     const persisted = await persistEmailMessage({
       conversationId: conv.conversationId,
       companyId: tenant,
       authorId: me,
       direction: 'out',
-      transportStatus: sendRes.ok ? 'sent' : 'failed',
-      transportError: sendRes.error,
-      smtpMessageId: sendRes.smtpMessageId ?? messageId,
+      transportStatus: 'sending',
+      transportError: null,
+      smtpMessageId: messageId,
       inReplyTo: null, references: [],
       subject,
       fromAddr: fromLine,
@@ -4388,6 +4521,32 @@ api.post('/email/send', async (req, res) => {
         filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
         storageKey: a.storageKey,
       })),
+    })
+    const sendRes = await sendViaProvider({
+      from: fromLine,
+      to: toResolved.map((r) => formatAddress(r.addr, r.name)),
+      cc: ccResolved.length ? ccResolved.map((r) => formatAddress(r.addr, r.name)) : undefined,
+      subject, text: body, messageId,
+      attachments: resolvedAttachments.map((a) => ({
+        filename: a.filename, mimeType: a.mimeType, path: a.publicUrl,
+      })),
+    })
+    const finalStatus = sendRes.ok ? 'sent' : 'failed'
+    await pool.query(
+      `UPDATE email_messages
+          SET transport_status = $1, transport_error = $2,
+              smtp_message_id = $3, next_retry_at = $4
+        WHERE message_id = $5 AND company_id = $6`,
+      [
+        finalStatus, sendRes.error, sendRes.smtpMessageId ?? messageId,
+        finalStatus === 'failed' ? new Date(Date.now() + 60_000) : null,
+        persisted.messageId, tenant,
+      ],
+    ).catch((error) => {
+      // The provider result is already irreversible. Preserve that response
+      // so a client does not retry and send a duplicate merely because the
+      // local status update had a transient failure.
+      console.warn(`[email/send] post-send status update failed for ${persisted.messageId}`, error)
     })
     res.status(sendRes.ok ? 200 : 502).json({
       messageId: persisted.messageId,
@@ -4538,6 +4697,26 @@ api.post('/email/reply/:messageId', async (req, res) => {
     const inReplyTo = o.smtp_message_id ? normalizeMessageId(o.smtp_message_id) : null
     const messageId = mintMessageId()
     const fromLine = formatAddress(sender.email, sender.displayName)
+    // WRITE-FIRST: this transaction is the final authorization boundary.
+    // A participant removed while this request is in flight cannot reach the
+    // external mail provider with stale conversation access.
+    const persisted = await persistEmailMessage({
+      conversationId: o.conversation_id,
+      companyId: tenant,
+      authorId: me,
+      direction: 'out',
+      transportStatus: 'sending',
+      transportError: null,
+      smtpMessageId: messageId,
+      inReplyTo, references: newReferences,
+      subject, fromAddr: fromLine,
+      toAddrs: replyTo, ccAddrs: ccCombined,
+      body,
+      attachments: resolvedAttachments.map((a) => ({
+        filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
+        storageKey: a.storageKey,
+      })),
+    })
     const sendRes = await sendViaProvider({
       from: fromLine, to: replyTo,
       cc: ccCombined.length ? ccCombined : undefined,
@@ -4549,22 +4728,19 @@ api.post('/email/reply/:messageId', async (req, res) => {
         filename: a.filename, mimeType: a.mimeType, path: a.publicUrl,
       })),
     })
-    const persisted = await persistEmailMessage({
-      conversationId: o.conversation_id,
-      companyId: tenant,
-      authorId: me,
-      direction: 'out',
-      transportStatus: sendRes.ok ? 'sent' : 'failed',
-      transportError: sendRes.error,
-      smtpMessageId: sendRes.smtpMessageId ?? messageId,
-      inReplyTo, references: newReferences,
-      subject, fromAddr: fromLine,
-      toAddrs: replyTo, ccAddrs: ccCombined,
-      body,
-      attachments: resolvedAttachments.map((a) => ({
-        filename: a.filename, mimeType: a.mimeType, sizeBytes: a.sizeBytes,
-        storageKey: a.storageKey,
-      })),
+    const finalStatus = sendRes.ok ? 'sent' : 'failed'
+    await pool.query(
+      `UPDATE email_messages
+          SET transport_status = $1, transport_error = $2,
+              smtp_message_id = $3, next_retry_at = $4
+        WHERE message_id = $5 AND company_id = $6`,
+      [
+        finalStatus, sendRes.error, sendRes.smtpMessageId ?? messageId,
+        finalStatus === 'failed' ? new Date(Date.now() + 60_000) : null,
+        persisted.messageId, tenant,
+      ],
+    ).catch((error) => {
+      console.warn(`[email/reply] post-send status update failed for ${persisted.messageId}`, error)
     })
     // Auto-ack — replying definitionally means I read the original.
     await pool.query(
@@ -4693,56 +4869,63 @@ api.post('/messages/:id/reactions', async (req, res) => {
   const emoji = String(req.body?.emoji ?? '').trim()
   if (!emoji) { res.status(400).json({ error: 'emoji required' }); return }
 
-  // Resolve conversation + author *and* enforce that the caller is in the
-  // conversation's members array. The previous query was tenant-only, which
-  // let any peer add reactions to private DMs they had no business reading.
-  // We pull `members` in the same round-trip so we don't need a follow-up
-  // SELECT just to gate.
-  const { rows: cv } = await pool.query<{
-    conversation_id: string; author_id: string; members: string[]
-  }>(
-    `SELECT m.conversation_id, m.author_id, c.members
+  const { rows: cv } = await pool.query<{ conversation_id: string }>(
+    `SELECT m.conversation_id
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
       WHERE m.id = $1 AND c.company_id = $2 LIMIT 1`,
     [id, tenant],
   )
   if (!cv[0]) { res.status(404).json({ error: 'message not found' }); return }
-  if (!cv[0].members.includes(me)) {
-    // Stay opaque on permission denied (same 404 a cross-tenant message
-    // returns) so the response doesn't disclose existence.
-    res.status(404).json({ error: 'message not found' }); return
-  }
   const conversationId = cv[0].conversation_id
-  const messageAuthorId = cv[0].author_id
-
-  // Toggle
-  const existing = await pool.query<{ count: string }>(
-    `SELECT COUNT(*)::text AS count FROM message_reactions
-      WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-    [id, me, emoji],
-  )
-  const wasRemoval = Number(existing.rows[0]?.count ?? '0') > 0
-  if (wasRemoval) {
-    await pool.query(
-      `DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-      [id, me, emoji],
-    )
-  } else {
-    await pool.query(
-      `INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)
-       ON CONFLICT DO NOTHING`,
-      [id, me, emoji],
-    )
-  }
+  const mutation = await withLockedConversationMember({
+    userId: me,
+    companyId: tenant,
+    conversationId,
+    work: async (client) => {
+      const { rows: message } = await client.query<{ author_id: string }>(
+        `SELECT author_id FROM messages
+          WHERE id = $1 AND conversation_id = $2 AND company_id = $3`,
+        [id, conversationId, tenant],
+      )
+      if (!message[0]) throw new HttpError(404, 'message not found')
+      const existing = await client.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM message_reactions
+          WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+        [id, me, emoji],
+      )
+      const wasRemoval = Number(existing.rows[0]?.count ?? '0') > 0
+      if (wasRemoval) {
+        await client.query(
+          `DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+          [id, me, emoji],
+        )
+      } else {
+        await client.query(
+          `INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)
+           ON CONFLICT DO NOTHING`,
+          [id, me, emoji],
+        )
+      }
+      const { rows: reactions } = await client.query<{ emoji: string; count: number; users: string[] }>(
+        `SELECT emoji,
+                COUNT(*)::int AS count,
+                array_agg(user_id ORDER BY user_id) AS users
+           FROM message_reactions WHERE message_id = $1
+           GROUP BY emoji ORDER BY count DESC, emoji ASC`,
+        [id],
+      )
+      return { wasRemoval, messageAuthorId: message[0].author_id, reactions }
+    },
+  })
 
   // Climate signal: a new reaction TO an agent's message bumps that
   // agent's affinity toward the reactor (they feel valued). Un-reacting
   // doesn't dock — the "I didn't mean it" path shouldn't be punitive.
-  if (!wasRemoval) {
+  if (!mutation.wasRemoval) {
     const { bumpClimate } = await import('../agents/climate.js')
     void bumpClimate({
-      agentId: messageAuthorId, aboutId: me,
+      agentId: mutation.messageAuthorId, aboutId: me,
       affinity: 0.05, trust: 0.02,
       note: `received ${emoji} from ${me}`,
     })
@@ -4752,24 +4935,17 @@ api.post('/messages/:id/reactions', async (req, res) => {
   // WS to every client in the tenant, and "is this mine" is per-recipient.
   // Renderer derives mine = users.includes(meId) — see fromApi /
   // applyEvent in src/stores/messages.ts.
-  const { rows: agg } = await pool.query<{ emoji: string; count: number; users: string[] }>(
-    `SELECT emoji,
-            COUNT(*)::int AS count,
-            array_agg(user_id ORDER BY user_id) AS users
-       FROM message_reactions WHERE message_id = $1
-       GROUP BY emoji ORDER BY count DESC, emoji ASC`,
-    [id],
-  )
-
   await publish(CH_REACTIONS, {
     type: 'message.reactions',
     conversationId,
     companyId: tenant,
     messageId: id,
-    reactions: agg,
+    reactions: mutation.reactions,
+  }).catch((error) => {
+    console.warn(`[reactions] durable reaction on ${id} committed but publish failed`, error)
   })
 
-  res.json({ reactions: agg })
+  res.json({ reactions: mutation.reactions })
 })
 
 /* ============== Peek (agent-only conversations) ==============
@@ -5050,45 +5226,64 @@ api.post('/conversations/:id/convene', async (req, res) => {
   // initiate. Without membership-gating, a peer could spin up convene
   // sessions on private DMs, both leaking the topic and triggering agent
   // activity in rooms they don't belong to.
-  const { userId: me } = await requireConversationMember(req, id)
+  const { userId: me, companyId: tenant } = await requireCompany(req)
   const topic = String(req.body?.topic ?? 'live work session')
-  const session = await startConvene({ conversationId: id, startedBy: me, topic })
+  const session = await startConvene({ conversationId: id, companyId: tenant, startedBy: me, topic })
   res.json(session)
 })
 
 api.get('/conversations/:id/convene', async (req, res) => {
-  // Reading the active session leaks its existence + topic — same membership
-  // bar as starting it.
-  await requireConversationMember(req, req.params.id)
-  const session = await getActiveConvene(req.params.id)
+  const { userId, companyId } = await requireCompany(req)
+  const session = await withLockedConversationMember({
+    userId,
+    companyId,
+    conversationId: req.params.id,
+    work: async (client) => {
+      const { rows } = await client.query(
+        `SELECT id, conversation_id, title, flair, started_by, started_at, ended_at, state
+           FROM convene_sessions
+          WHERE conversation_id = $1 AND company_id = $2 AND state = 'live'
+          ORDER BY started_at DESC LIMIT 1`,
+        [req.params.id, companyId],
+      )
+      return rows[0] ?? null
+    },
+  })
   res.json(session)
 })
 
 api.get('/convene/:sessionId/transcript', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
-  // Resolve the parent conversation + its members in a single round-trip so
-  // we can enforce membership without an extra SELECT. Tenant gate stays in
-  // the JOIN; the members check is the new bar.
-  const { rows: gate } = await pool.query<{ members: string[] }>(
-    `SELECT c.members
+  const { rows: scope } = await pool.query<{ conversation_id: string }>(
+    `SELECT s.conversation_id
        FROM convene_sessions s
        JOIN conversations c ON c.id = s.conversation_id
       WHERE s.id = $1 AND c.company_id = $2 LIMIT 1`,
     [req.params.sessionId, tenant],
   )
-  if (!gate[0]) { res.status(404).json({ error: 'not found' }); return }
-  if (!gate[0].members.includes(me)) {
-    // Opaque 404 — don't disclose that the session exists in a room the
-    // caller can't read.
-    res.status(404).json({ error: 'not found' }); return
-  }
-  const { rows } = await pool.query(
-    `SELECT id, session_id AS "sessionId", author_id AS "authorId", kind, body, sequence,
-            decision, created_at AS "createdAt"
-       FROM convene_transcript WHERE session_id = $1
-       ORDER BY sequence ASC`,
-    [req.params.sessionId],
-  )
+  if (!scope[0]) throw new HttpError(404, 'not found')
+  const rows = await withLockedConversationMember({
+    userId: me,
+    companyId: tenant,
+    conversationId: scope[0].conversation_id,
+    work: async (client) => {
+      const currentSession = await client.query(
+        `SELECT 1 FROM convene_sessions
+          WHERE id = $1 AND conversation_id = $2 AND company_id = $3`,
+        [req.params.sessionId, scope[0].conversation_id, tenant],
+      )
+      if (!currentSession.rowCount) throw new HttpError(404, 'not found')
+      const transcript = await client.query(
+        `SELECT id, session_id AS "sessionId", author_id AS "authorId", kind, body, sequence,
+                decision, created_at AS "createdAt"
+           FROM convene_transcript
+          WHERE session_id = $1 AND company_id = $2
+          ORDER BY sequence ASC`,
+        [req.params.sessionId, tenant],
+      )
+      return transcript.rows
+    },
+  })
   res.json(rows)
 })
 

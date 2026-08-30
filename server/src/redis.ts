@@ -11,7 +11,12 @@ const lazyConnect = process.env.CUMORA_RUNTIME_CLIENT === 'http'
 
 /** Single shared client for normal commands. */
 export const redis = new IORedis(env.REDIS_URL, {
-  maxRetriesPerRequest: null,
+  // Durable writes must never hang forever after PostgreSQL COMMIT while a
+  // disconnected Redis client quietly accumulates an offline queue. Callers
+  // can now fail-open or retry explicitly within a bounded deadline.
+  maxRetriesPerRequest: 1,
+  enableOfflineQueue: false,
+  commandTimeout: 2_000,
   enableReadyCheck: true,
   lazyConnect,
 })
@@ -87,6 +92,10 @@ export interface MessageNewEvent extends TenantTagged {
      *  optimistic bubble when the WS event races the POST response — id
      *  alone can't match because the optimistic is keyed by tempId. */
     clientId?: string
+    /** Durable one-shot recipient for membership departure notices. The
+     * scheduler verifies this value against the persisted message before
+     * adding it to wake fan-out. */
+    deliveryRecipientId?: string
     /** When this message is a reply, the id of the quoted-original. */
     quotedMessageId?: string
     /** Durable agent delivery audience. null/omitted = normal room
@@ -349,11 +358,9 @@ export interface DocMentionEvent extends TenantTagged {
 }
 
 /** "Heads-up — this calendar event fires in N minutes." Broadcast on
- *  CH_CALENDAR_REMINDER and bridged to every WS client in the company;
- *  the renderer filters on `recipientUserIds.includes(meId)` so only the
- *  intended humans actually pop a toast. Note: recipients can be empty
- *  on agent-only events — the WS bridge still delivers it but no
- *  renderer will match. */
+ *  CH_CALENDAR_REMINDER; the WS bridge resolves recipientUserIds against live
+ *  workspace membership before routing. The renderer repeats the filter as
+ *  defense in depth. Recipients may be empty for agent-only events. */
 export interface CalendarReminderEvent extends TenantTagged {
   type: 'calendar.reminder'
   eventId: string

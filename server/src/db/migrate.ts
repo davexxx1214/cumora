@@ -33,12 +33,20 @@ CREATE TABLE IF NOT EXISTS messages (
   tool            JSONB,
   attachment      JSONB,
   client_id       TEXT,
+  -- A membership departure message remains in the removed participant's
+  -- runtime inbox even though the conversation membership update has already
+  -- committed. Null for ordinary messages.
+  delivery_recipient_id TEXT,
   created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(conversation_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_messages_convo_created ON messages(conversation_id, created_at);
 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_recipient_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_messages_delivery_recipient
+  ON messages(delivery_recipient_id, created_at, id)
+  WHERE delivery_recipient_id IS NOT NULL;
 
 -- Reply-to / quote target. Soft self-FK (no ON DELETE CASCADE) so deleting
 -- the original leaves replies as orphans rendered as "[deleted]" stubs

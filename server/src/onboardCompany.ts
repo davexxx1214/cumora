@@ -14,6 +14,7 @@ import { pool } from './db/pool.js'
 import { invalidatePersonaCache } from './agents/personas.js'
 import { randomUUID } from 'node:crypto'
 import { gravatarUrlForEmail } from './auth.js'
+import { ensureDirectConversation } from './agents/private_chat.js'
 
 interface StarterAgent {
   /** Preferred id; we'll suffix on collision. */
@@ -259,46 +260,82 @@ export async function joinAllHands(args: {
   participantId: string
 }): Promise<void> {
   const { companyId, participantId } = args
-  const { rows: companyRow } = await pool.query<{
-    all_hands_conversation_id: string | null
-  }>(
-    `SELECT all_hands_conversation_id FROM companies WHERE id = $1`,
-    [companyId],
-  )
-  const convId = companyRow[0]?.all_hands_conversation_id
-  if (!convId) return  // no group yet → nothing to join
-
-  // Append the new member to the conversation's members JSON array if not
-  // already present, atomically.
-  const { rows: updated } = await pool.query<{ added: boolean }>(
-    `UPDATE conversations
-        SET members = members || to_jsonb(ARRAY[$2::text]),
-            updated_at = NOW()
-      WHERE id = $1
-        AND NOT (members @> to_jsonb(ARRAY[$2::text]))
-      RETURNING TRUE AS added`,
-    [convId, participantId],
-  )
-  if (updated.length === 0) return  // already a member → don't double-post
-
-  // Drop a `kind='system'` message so the join is visible in the thread.
-  // body is a JSON-encoded payload — the frontend parses it and renders a
-  // clickable participant chip.
-  const seqResult = await pool.query<{ seq: number }>(
-    `INSERT INTO conversation_counters (conversation_id, next_sequence)
-     VALUES ($1, 2)
-     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-     RETURNING next_sequence - 1 AS seq`,
-    [convId],
-  )
-  const sequence = seqResult.rows[0]?.seq ?? 1
+  let convId: string | null = null
+  let sequence = 0
   const messageId = `m-${randomUUID()}`
   const body = JSON.stringify({ kind: 'joined', participantId })
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-     VALUES ($1, $2, $3, 'system', $4, $5, $6)`,
-    [messageId, convId, participantId, body, sequence, companyId],
-  )
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Serialize onboarding against offboarding / tenant reassignment. A stale
+    // caller must not add a departed or foreign participant to the tenant's
+    // all-hands conversation.
+    const participant = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR UPDATE`,
+      [participantId, companyId],
+    )
+    if (!participant.rowCount) {
+      await client.query('ROLLBACK')
+      return
+    }
+
+    const { rows: companyRow } = await client.query<{
+      all_hands_conversation_id: string | null
+    }>(
+      `SELECT all_hands_conversation_id FROM companies WHERE id = $1 FOR SHARE`,
+      [companyId],
+    )
+    convId = companyRow[0]?.all_hands_conversation_id ?? null
+    if (!convId) {
+      await client.query('COMMIT')
+      return
+    }
+
+    const { rows: updated } = await client.query<{ added: boolean }>(
+      `UPDATE conversations c
+          SET members = members || to_jsonb(ARRAY[$2::text]),
+              updated_at = NOW()
+        WHERE c.id = $1
+          AND c.company_id = $3
+          AND NOT (c.members @> to_jsonb(ARRAY[$2::text]))
+          AND EXISTS (
+            SELECT 1 FROM participants target
+             WHERE target.id = $2 AND target.company_id = c.company_id
+               AND target.kind IN ('agent', 'human')
+               AND target.departed_at IS NULL
+          )
+        RETURNING TRUE AS added`,
+      [convId, participantId, companyId],
+    )
+    if (updated.length === 0) {
+      await client.query('COMMIT')
+      return
+    }
+
+    const seqResult = await client.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+       RETURNING next_sequence - 1 AS seq`,
+      [convId],
+    )
+    sequence = seqResult.rows[0]?.seq ?? 1
+    await client.query(
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+       VALUES ($1, $2, $3, 'system', $4, $5, $6)`,
+      [messageId, convId, participantId, body, sequence, companyId],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+  if (!convId || sequence === 0) return
 
   // Broadcast so already-open clients see the join in real time.
   const { CH_MESSAGE_NEW, CH_STATUS, publish } = await import('./redis.js')
@@ -310,6 +347,8 @@ export async function joinAllHands(args: {
       id: messageId, conversationId: convId, authorId: participantId,
       kind: 'system', body, sequence, at: new Date().toISOString(),
     },
+  }).catch((error) => {
+    console.warn('[onboard] all-hands message publish failed; row remains durable', error instanceof Error ? error.message : error)
   })
 
   // Fire-and-forget: also publish the full participant payload so existing
@@ -382,30 +421,13 @@ export async function seedMemberDms(args: {
     [companyId, memberId],
   )
   for (const other of others) {
-    // Skip if a direct chat between this pair already exists in this
-    // company — saves redundant rows on partial reruns or when the same
-    // member is somehow re-onboarded.
-    const { rows: ex } = await pool.query(
-      `SELECT 1 FROM conversations
-        WHERE company_id = $1 AND kind = 'direct'
-          AND members @> to_jsonb(ARRAY[$2::text, $3::text])
-          AND jsonb_array_length(members) = 2 LIMIT 1`,
-      [companyId, memberId, other.id],
-    )
-    if (ex[0]) continue
-    const dmId = `direct-${other.id}-${randomUUID().slice(0, 6)}`
-    await pool.query(
-      `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, company_id)
-       VALUES ($1, 'direct', $2, NULL, $3::jsonb, FALSE, $4, $5)
-       ON CONFLICT (id) DO NOTHING`,
-      [dmId, other.name, JSON.stringify([memberId, other.id]),
-       other.kind === 'human' ? 'human' : null, companyId],
-    )
-    await pool.query(
-      `INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)
-       ON CONFLICT (conversation_id) DO NOTHING`,
-      [dmId],
-    )
+    await ensureDirectConversation({
+      companyId,
+      firstId: memberId,
+      secondId: other.id,
+    }).catch((error) => {
+      console.warn(`[onboard] skipped stale DM pair ${memberId}/${other.id}`, error)
+    })
   }
 }
 

@@ -10,6 +10,7 @@
  */
 
 import { pool } from '../db/pool.js'
+import type { PoolClient } from 'pg'
 import { env } from '../env.js'
 import {
   listAgentWorkflowNotifications,
@@ -52,9 +53,84 @@ function err(text: string, code = 1): CliResult {
  *  /agents POST), so id-only lookup returns the single correct row. */
 async function agentCompany(agentId: string): Promise<string | null> {
   const { rows } = await pool.query<{ company_id: string | null }>(
-    `SELECT company_id FROM participants WHERE id = $1 LIMIT 1`, [agentId],
+    `SELECT company_id FROM participants
+      WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL
+      LIMIT 1`,
+    [agentId],
   )
   return rows[0]?.company_id ?? null
+}
+
+/** Keep an active participant's tenant assignment stable for a command whose
+ * work spans multiple SQL statements (or a provider network call). Membership
+ * mutations, offboarding, and tenant moves all take a conflicting participant
+ * row lock, so they serialize before or after this command instead of changing
+ * authorization midway through it. */
+async function withActiveParticipantLock<T>(args: {
+  participantId: string
+  companyId: string
+  kind?: 'agent' | 'human'
+  run: (client: PoolClient) => Promise<T>
+}): Promise<T | null> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const params: unknown[] = [args.participantId, args.companyId]
+    const kindPredicate = args.kind ? `AND kind = $3` : `AND kind IN ('agent', 'human')`
+    if (args.kind) params.push(args.kind)
+    const active = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          ${kindPredicate} AND departed_at IS NULL
+        FOR SHARE`,
+      params,
+    )
+    if (!active.rowCount) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const result = await args.run(client)
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function withConversationActorLock<T>(args: {
+  participantId: string
+  companyId: string
+  conversationId: string
+  kind?: 'agent' | 'human'
+  conversationKind?: string
+  run: (client: PoolClient) => Promise<T>
+}): Promise<T | null> {
+  return withActiveParticipantLock({
+    participantId: args.participantId,
+    companyId: args.companyId,
+    kind: args.kind,
+    run: async (client) => {
+      const params: unknown[] = [args.conversationId, args.companyId, args.participantId]
+      let kindPredicate = ''
+      if (args.conversationKind) {
+        params.push(args.conversationKind)
+        kindPredicate = `AND kind = $4`
+      }
+      const authorized = await client.query(
+        `SELECT id FROM conversations
+          WHERE id = $1 AND company_id = $2
+            AND members @> to_jsonb(ARRAY[$3::text])
+            ${kindPredicate}
+          FOR UPDATE`,
+        params,
+      )
+      if (!authorized.rowCount) return null
+      return args.run(client)
+    },
+  })
 }
 
 /* ============== argv parsing ============== */
@@ -414,12 +490,17 @@ EXAMPLES:
 
 async function cmdWhoami(parsed: ParsedArgs): Promise<CliResult> {
   const id = resolveAs(parsed)
+  const companyId = await agentCompany(id)
+  if (!companyId) return err(`cannot resolve active company for ${id}`)
   const { rows } = await pool.query<{
     id: string; kind: string; name: string; role: string | null;
     status: string; bio: string | null; tools: string[] | null
   }>(
-    `SELECT id, kind, name, role, status, bio, tools FROM participants WHERE id = $1`,
-    [id],
+    `SELECT id, kind, name, role, status, bio, tools
+       FROM participants
+      WHERE id = $1 AND company_id = $2
+        AND kind = 'agent' AND departed_at IS NULL`,
+    [id, companyId],
   )
   const p = rows[0]
   if (!p) return err(`unknown participant: ${id}`)
@@ -427,9 +508,17 @@ async function cmdWhoami(parsed: ParsedArgs): Promise<CliResult> {
 
   const { rows: convos } = await pool.query<{ id: string; title: string; kind: string }>(
     `SELECT id, title, kind FROM conversations
-      WHERE members @> to_jsonb(ARRAY[$1::text])
+      WHERE company_id = $2
+        AND members @> to_jsonb(ARRAY[$1::text])
+        AND EXISTS (
+          SELECT 1 FROM participants requester
+           WHERE requester.id = $1
+             AND requester.company_id = conversations.company_id
+             AND requester.kind = 'agent'
+             AND requester.departed_at IS NULL
+        )
       ORDER BY updated_at DESC`,
-    [id],
+    [id, companyId],
   )
   const lines = [
     `id:        ${p.id}`,
@@ -479,21 +568,29 @@ async function cmdParticipants(parsed: ParsedArgs): Promise<CliResult> {
 
 async function cmdConversations(parsed: ParsedArgs, kindFilter?: 'group' | 'direct'): Promise<CliResult> {
   const me = resolveAs(parsed)
-  const params: unknown[] = [me]
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
+  const params: unknown[] = [me, companyId]
   let kindWhere = ''
   if (kindFilter) {
     params.push(kindFilter)
-    kindWhere = `AND kind = $2`
+    kindWhere = `AND c.kind = $3`
   }
   const { rows } = await pool.query<{
     id: string; kind: string; title: string; subtitle: string | null;
     members: string[]; tag: string | null;
     updated_at: string; pulled_by: { agentId?: string } | null
   }>(
-    `SELECT id, kind, title, subtitle, members, tag, updated_at, pulled_by
-       FROM conversations
-      WHERE members @> to_jsonb(ARRAY[$1::text]) ${kindWhere}
-      ORDER BY updated_at DESC`,
+    `SELECT c.id, c.kind, c.title, c.subtitle, c.members, c.tag, c.updated_at, c.pulled_by
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $1
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE c.company_id = $2
+        AND c.members @> to_jsonb(ARRAY[$1::text]) ${kindWhere}
+      ORDER BY c.updated_at DESC`,
     params,
   )
   if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
@@ -514,19 +611,33 @@ async function cmdConversations(parsed: ParsedArgs, kindFilter?: 'group' | 'dire
 }
 
 async function cmdMembers(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const id = parsed.positional[0]
   if (!id) return err('usage: members <conversation_id>')
   const { rows } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1`,
-    [id],
+    `SELECT c.members
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND c.company_id = $3
+        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+    [id, me, companyId],
   )
   if (!rows[0]) return err(`unknown conversation: ${id}`)
   const memberIds = rows[0].members
   const { rows: peeps } = await pool.query<{
     id: string; name: string; kind: string; role: string | null; status: string; avatar_url: string | null
   }>(
-    `SELECT id, name, kind, role, status, avatar_url FROM participants WHERE id = ANY($1::text[])`,
-    [memberIds],
+    `SELECT id, name, kind, role, status, avatar_url
+       FROM participants
+      WHERE id = ANY($1::text[]) AND company_id = $2`,
+    [memberIds, companyId],
   )
   if (parsed.flags.json) return ok(JSON.stringify(peeps, null, 2))
   const memberLines: string[] = []
@@ -543,6 +654,9 @@ async function cmdMembers(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const id = parsed.positional[0]
   if (!id) return err('usage: messages <conversation_id> [--tail N] [--thread <root_id>]')
   const tail = Math.min(200, Math.max(1, Number(parsed.flags.tail ?? 20)))
@@ -550,11 +664,11 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   // when an agent wants to focus on what's happening in one sub-discussion
   // before deciding how to respond.
   const threadRootId = parsed.flags.thread ? String(parsed.flags.thread) : null
-  const params: unknown[] = [id]
+  const params: unknown[] = [id, me, companyId]
   let whereExtra = ''
   if (threadRootId) {
     params.push(threadRootId)
-    whereExtra = `AND quoted_message_id = $2`
+    whereExtra = `AND m.quoted_message_id = $4`
   }
   params.push(tail)
   const limitParam = `$${params.length}`
@@ -565,9 +679,21 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
     quoted_message_id: string | null;
     quoted: { id: string; authorId: string; authorName: string; body: string } | null;
   }>(
-    `SELECT
-        id, author_id, kind, body, sequence, created_at, attachment, poll,
-        quoted_message_id,
+    `WITH authorized_conversation AS MATERIALIZED (
+       SELECT c.id
+         FROM conversations c
+         JOIN participants requester
+           ON requester.id = $2
+          AND requester.company_id = c.company_id
+          AND requester.kind = 'agent'
+          AND requester.departed_at IS NULL
+        WHERE c.id = $1
+          AND c.company_id = $3
+          AND c.members @> to_jsonb(ARRAY[$2::text])
+     )
+     SELECT
+        m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at, m.attachment, m.poll,
+        m.quoted_message_id,
         (
           SELECT jsonb_build_object(
             'id', qm.id,
@@ -576,12 +702,14 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
             'body', LEFT(qm.body, 240)
           )
             FROM messages qm
-           WHERE qm.id = messages.quoted_message_id
-             AND qm.conversation_id = messages.conversation_id
+           WHERE qm.id = m.quoted_message_id
+             AND qm.conversation_id = m.conversation_id
         ) AS quoted
-       FROM messages WHERE conversation_id = $1
+       FROM messages m
+       JOIN authorized_conversation authorized ON authorized.id = m.conversation_id
+      WHERE TRUE
        ${whereExtra}
-       ORDER BY sequence DESC LIMIT ${limitParam}`,
+       ORDER BY m.sequence DESC LIMIT ${limitParam}`,
     params,
   )
   for (const row of rows) await freshenRowAttachment(row)
@@ -592,7 +720,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   // this, the agent's typical flow `messages → reply` would HOLD on the
   // very tail it just fetched. Redis-only, fail-open, monotonic.
   if (inOrder.length > 0) {
-    await recordSeen(resolveAs(parsed), id, inOrder[inOrder.length - 1].sequence)
+    await recordSeen(me, id, inOrder[inOrder.length - 1].sequence)
   }
   if (parsed.flags.json) return ok(JSON.stringify(inOrder, null, 2))
   if (inOrder.length === 0) {
@@ -644,16 +772,28 @@ async function cmdThread(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdConvening(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const id = parsed.positional[0]
   if (!id) return err('usage: convening <conversation_id>')
   const { rows } = await pool.query<{
     pulled_by_id: string; pulled_at: string; headline_lead: string; headline_tail: string;
     subhead: string; who_and_why: unknown; reasoning: unknown; status: string
   }>(
-    `SELECT pulled_by_id, pulled_at, headline_lead, headline_tail, subhead,
-            who_and_why, reasoning, status
-       FROM convening_info WHERE conversation_id = $1`,
-    [id],
+    `SELECT ci.pulled_by_id, ci.pulled_at, ci.headline_lead, ci.headline_tail, ci.subhead,
+            ci.who_and_why, ci.reasoning, ci.status
+       FROM convening_info ci
+       JOIN conversations c ON c.id = ci.conversation_id
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE ci.conversation_id = $1
+        AND c.company_id = $3
+        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+    [id, me, companyId],
   )
   const c = rows[0]
   if (!c) return err(`no convening info for ${id}`)
@@ -678,15 +818,18 @@ async function cmdConvening(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const query = parsed.positional[0]
   if (!query) return err('usage: search <query> [--in <convo_id>] [--limit N]')
   const inConvo = parsed.flags.in ? String(parsed.flags.in) : null
   const limit = Math.min(50, Math.max(1, Number(parsed.flags.limit ?? 10)))
-  const params: unknown[] = [`%${query}%`]
+  const params: unknown[] = [me, companyId, `%${query}%`]
   let whereExtra = ''
   if (inConvo) {
     params.push(inConvo)
-    whereExtra = `AND m.conversation_id = $2`
+    whereExtra = `AND m.conversation_id = $4`
   }
   params.push(limit)
   const limitParam = `$${params.length}`
@@ -696,7 +839,15 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
   }>(
     `SELECT m.id, m.conversation_id, m.author_id, m.body, m.created_at, m.attachment
        FROM messages m
-      WHERE m.body ILIKE $1 ${whereExtra}
+       JOIN conversations c ON c.id = m.conversation_id
+       JOIN participants requester
+         ON requester.id = $1
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      WHERE c.company_id = $2
+        AND c.members @> to_jsonb(ARRAY[$1::text])
+        AND m.body ILIKE $3 ${whereExtra}
       ORDER BY m.created_at DESC LIMIT ${limitParam}`,
     params,
   )
@@ -716,11 +867,14 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdToolsLog(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const agent = parsed.flags.agent ? String(parsed.flags.agent) : null
   const limit = Math.min(50, Math.max(1, Number(parsed.flags.limit ?? 15)))
-  const params: unknown[] = []
-  let where = ''
-  if (agent) { params.push(agent); where = `WHERE agent_id = $1` }
+  const params: unknown[] = [companyId]
+  let where = 'WHERE company_id = $1'
+  if (agent) { params.push(agent); where += ` AND agent_id = $2` }
   params.push(limit)
   const limitParam = `$${params.length}`
   const { rows } = await pool.query<{
@@ -863,19 +1017,27 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
         ) AS quoted
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
+       JOIN participants requesting_agent
+         ON requesting_agent.id = $1
+        AND requesting_agent.company_id = c.company_id
+        AND requesting_agent.kind = 'agent'
+        AND requesting_agent.departed_at IS NULL
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
-      WHERE c.members @> to_jsonb(ARRAY[$1::text])
-        AND m.author_id <> $1
-        AND (
-          m.agent_recipient_ids IS NULL
-          OR m.agent_recipient_ids @> to_jsonb(ARRAY[$1::text])
+      WHERE (
+          (
+            c.members @> to_jsonb(ARRAY[$1::text])
+            AND (m.agent_recipient_ids IS NULL OR m.agent_recipient_ids @> to_jsonb(ARRAY[$1::text]))
+          )
+          OR m.delivery_recipient_id = $1
         )
+        AND (m.author_id <> $1 OR m.delivery_recipient_id = $1)
         AND m.created_at > COALESCE(
           (SELECT last_read_at FROM conversation_reads
             WHERE user_id = $1 AND conversation_id = c.id),
           '1970-01-01T00:00:00Z'::timestamptz)
         AND (
-          c.kind = 'direct'
+          m.delivery_recipient_id = $1
+          OR c.kind = 'direct'
           OR NOT EXISTS (
             SELECT 1 FROM conversation_mutes mu
              WHERE mu.user_id = $1 AND mu.conversation_id = c.id
@@ -1016,6 +1178,8 @@ async function cmdWorkflow(parsed: ParsedArgs): Promise<CliResult> {
  *  on it, pick a different angle) instead of blurting the same thing. */
 async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
+  const companyId = await agentCompany(me)
+  if (!companyId) return err(`cannot resolve active company for ${me}`)
   const convoId = (typeof parsed.flags['conversation'] === 'string' ? parsed.flags['conversation'] : null)
     ?? parsed.positional[0]
   if (!convoId) return err('usage: glance --conversation <id>  (or: glance <id>)')
@@ -1034,11 +1198,18 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
             m.kind, m.body, m.created_at, m.sequence
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
       WHERE m.conversation_id = $1
+        AND c.company_id = $3
+        AND c.members @> to_jsonb(ARRAY[$2::text])
       ORDER BY m.created_at DESC
       LIMIT 12`,
-    [convoId],
+    [convoId, me, companyId],
   )
   const recent = rows.reverse()
 
@@ -1106,12 +1277,23 @@ async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
   }
   const convoId = parsed.positional[0]
   if (!convoId) return err('usage: ack <conversation_id>  OR  ack --all')
-  await pool.query(
+  const activeAgentCompanyId = await agentCompany(me)
+  const { rowCount } = await pool.query(
     `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, NOW())
+     SELECT $1, c.id, NOW()
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $1
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $2
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND c.members @> to_jsonb(ARRAY[$1::text])
      ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-    [me, convoId],
+    [me, convoId, activeAgentCompanyId],
   )
+  if (!rowCount) return err(`conversation ${convoId} not found or no longer authorized`)
   // Standing down — see the --all branch above.
   void clearHold(me, `reply:${convoId}`)
   return ok(`acked ${convoId}`)
@@ -1166,31 +1348,31 @@ async function cmdMute(parsed: ParsedArgs): Promise<CliResult> {
   if (!conversation) return err(`conversation not found: ${conversationId}`)
   if (!conversation.members.includes(me)) return err(`you are not a member of ${conversationId}`)
   if (conversation.kind === 'direct') return err('direct conversations always deliver; mute a group instead')
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    await client.query(
+  const muted = await withConversationActorLock({
+    participantId: me,
+    companyId,
+    conversationId,
+    kind: 'agent',
+    run: async (client) => {
+      await client.query(
       `INSERT INTO conversation_mutes (user_id, conversation_id, muted_at, muted_until)
        VALUES ($1, $2, NOW(), $3)
        ON CONFLICT (user_id, conversation_id)
        DO UPDATE SET muted_at = NOW(), muted_until = EXCLUDED.muted_until`,
-      [me, conversationId, until],
-    )
-    // Muting is a deliberate stand-down. Seal the current unread tail so
-    // following later resumes from that point instead of replaying a backlog.
-    await client.query(
-      `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-      [me, conversationId],
-    )
-    await client.query('COMMIT')
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw error
-  } finally {
-    client.release()
-  }
+        [me, conversationId, until],
+      )
+      // Muting is a deliberate stand-down. Seal the current unread tail so
+      // following later resumes from that point instead of replaying a backlog.
+      await client.query(
+        `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
+        [me, conversationId],
+      )
+      return true
+    },
+  })
+  if (!muted) return err(`conversation ${conversationId} is no longer authorized`)
   void clearHold(me, `reply:${conversationId}`)
   const expiry = until ? ` until ${until.toISOString()}` : ' until you follow it again'
   return ok(
@@ -1206,12 +1388,19 @@ async function cmdFollow(parsed: ParsedArgs): Promise<CliResult> {
   if (!conversationId) return err('usage: follow <conversation_id>')
   const companyId = await agentCompany(me)
   if (!companyId) return err(`unknown agent ${me} (no company)`)
-  const { rowCount } = await pool.query(
-    `DELETE FROM conversation_mutes mu USING conversations c
-      WHERE mu.user_id = $1 AND mu.conversation_id = $2
-        AND c.id = mu.conversation_id AND c.company_id = $3`,
-    [me, conversationId, companyId],
-  )
+  const followed = await withConversationActorLock({
+    participantId: me,
+    companyId,
+    conversationId,
+    kind: 'agent',
+    run: (client) => client.query(
+      `DELETE FROM conversation_mutes
+        WHERE user_id = $1 AND conversation_id = $2`,
+      [me, conversationId],
+    ),
+  })
+  if (!followed) return err(`conversation ${conversationId} is no longer authorized`)
+  const rowCount = followed.rowCount
   return ok(rowCount
     ? `Following ${conversationId} again. New messages will resume normal inbox delivery.`
     : `${conversationId} was not muted; normal delivery is already active.`)
@@ -1404,7 +1593,7 @@ async function cmdShip(parsed: ParsedArgs): Promise<CliResult> {
 // `agents/membership.ts` so the HTTP endpoints (POST /members,
 // POST /leave) and the agent CLI share one implementation. Importing
 // here re-exposes the names this file already used.
-import { addConversationMember, postMembershipSystemMessage, removeConversationMember } from './membership.js'
+import { addConversationMember, removeConversationMember } from './membership.js'
 
 async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
@@ -1419,24 +1608,25 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
+  if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') {
     return err('cannot leave a direct conversation — use `cumora ack` to mute it from your inbox instead')
   }
   if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId}`)
 
-  // Post the system message BEFORE updating members so the leaving
-  // agent's inbox (filtered by c.members @> [me]) still surfaces this
-  // final row in their next wake — that's how they "perceive" their own
-  // departure cleanly.
-  const systemMessage = await postMembershipSystemMessage({
+  // Bind authorization to the write itself. If another member revoked us
+  // after the SELECT above, this must fail closed and must not emit a false
+  // departure event.
+  const mutation = await removeConversationMember({
     conversationId: convoId,
-    companyId: c.company_id,
+    memberId: me,
     actorId: me,
+    companyId: c.company_id,
+    allowSoleMember: true,
     kind: 'left',
-    participantId: me,
   })
-
-  const next = await removeConversationMember({ conversationId: convoId, memberId: me }) ?? []
+  if (!mutation) return err(`${me} is no longer a member of ${convoId}`)
+  const next = mutation.members
 
   return ok(`left "${c.title}" (${convoId}); ${next.length} member(s) remain`, [{
     event: 'conversation.membership_changed',
@@ -1446,7 +1636,7 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
     actorId: me,
     participantId: me,
     companyId: c.company_id ?? undefined,
-    systemMessageId: systemMessage.messageId,
+    systemMessageId: mutation.systemMessageId,
     memberCount: next.length,
     visibleToUser: true,
   }])
@@ -1467,6 +1657,7 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
+  if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') {
     return err('cannot invite into a direct conversation — use `cumora pull-group` to start a fresh thread')
   }
@@ -1483,15 +1674,14 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
     if (!pp[0]) return err(`${target} is not a participant in this workspace`)
   }
 
-  const next = await addConversationMember({ conversationId: convoId, memberId: target }) ?? []
-
-  const systemMessage = await postMembershipSystemMessage({
+  const mutation = await addConversationMember({
     conversationId: convoId,
-    companyId: c.company_id,
+    memberId: target,
     actorId: me,
-    kind: 'joined',
-    participantId: target,
+    companyId: c.company_id,
   })
+  if (!mutation) return err(`${me} is no longer a member of ${convoId} — invite cancelled`)
+  const next = mutation.members
 
   return ok(`invited ${target} into "${c.title}" (${convoId}); ${next.length} member(s) total`, [{
     event: 'conversation.membership_changed',
@@ -1501,7 +1691,7 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
     actorId: me,
     participantId: target,
     companyId: c.company_id ?? undefined,
-    systemMessageId: systemMessage.messageId,
+    systemMessageId: mutation.systemMessageId,
     memberCount: next.length,
     visibleToUser: true,
   }])
@@ -1522,6 +1712,7 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
+  if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') return err('cannot kick from a direct conversation')
   if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId} — can't kick from a group you're not in`)
   if (!c.members.includes(target)) return err(`${target} is not a member of ${convoId}`)
@@ -1536,23 +1727,24 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
     return err(`kicking ${target} would leave only ${me} in this group; pass --confirm-empty if that's intended`)
   }
 
-  // Post BEFORE removing the target from members. The mailbox query
-  // filters by current `c.members @> [agentId]`, so if we updated first
-  // the kicked agent would never see the row that explains why their
-  // inbox went quiet on this conversation. Posting first means the
-  // target gets one last wake with this exact message.
-  const systemMessage = await postMembershipSystemMessage({
-    conversationId: convoId,
-    companyId: c.company_id,
-    actorId: me,
-    kind: 'kicked',
-    participantId: target,
-  })
-
   // Report what the row actually holds now, not the array we predicted from a
-  // read taken before the guards above — a concurrent join or leave lands in
-  // between, and the count is user-visible.
-  const remaining = await removeConversationMember({ conversationId: convoId, memberId: target }) ?? []
+  // read taken before the guards above. The actor predicate is part of this
+  // UPDATE, so a concurrent revocation cannot leave this stale kick authorized.
+  const confirmedEmpty = Boolean(parsed.flags['confirm-empty'])
+  const mutation = await removeConversationMember({
+    conversationId: convoId,
+    memberId: target,
+    actorId: me,
+    companyId: c.company_id,
+    allowSoleMember: confirmedEmpty,
+    kind: 'kicked',
+  })
+  if (!mutation) {
+    return err(confirmedEmpty
+      ? `membership changed or ${me} is no longer authorized in ${convoId} — kick cancelled`
+      : `membership changed, the kick is no longer authorized, or it would leave only ${me}; retry with --confirm-empty if intended`)
+  }
+  const remaining = mutation.members
 
   return ok(`kicked ${target} from "${c.title}" (${convoId}); ${remaining.length} member(s) remain`, [{
     event: 'conversation.membership_changed',
@@ -1562,7 +1754,7 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
     actorId: me,
     participantId: target,
     companyId: c.company_id ?? undefined,
-    systemMessageId: systemMessage.messageId,
+    systemMessageId: mutation.systemMessageId,
     memberCount: remaining.length,
     visibleToUser: true,
   }])
@@ -1591,27 +1783,38 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     return err('usage: reply <convo_id> "<body>" [--quote <msg_id>] [--attach <url> | --generate-image "<prompt>" [--size square|wide|tall] | --attach-text "<filename>" "<content>" | --attach-bytes "<filename>" --bytes-b64 "<base64>" [--bytes-mime "<mime>"]]')
   }
 
-  // Verify the participant is a member of the conversation.
+  // Agent ids are globally unique, so pin their current tenant here. Human
+  // callers can belong to several companies; for them the conversation id +
+  // active participant membership below selects the tenant instead.
+  const activeAgentCompanyId = await agentCompany(me)
+
+  // Friendly preflight only. The final INSERT transaction repeats this
+  // authorization while holding both the active participant row and the
+  // conversation row, so a concurrent kick, offboarding, or tenant move
+  // cannot leave this snapshot authorized at the write boundary.
   const { rows: cv } = await pool.query<{
     members: string[]; company_id: string; kind: string; actor_is_agent: boolean; agent_ids: string[]
   }>(
     `SELECT c.members, c.company_id, c.kind,
-            EXISTS (
-              SELECT 1 FROM participants p
-               WHERE p.id = $2 AND p.company_id = c.company_id
-                 AND p.kind = 'agent' AND p.departed_at IS NULL
-            ) AS actor_is_agent,
+            (requester.kind = 'agent') AS actor_is_agent,
             ARRAY(
               SELECT member.id FROM participants member
                WHERE member.company_id = c.company_id
                  AND member.kind = 'agent' AND member.departed_at IS NULL
                  AND c.members @> to_jsonb(ARRAY[member.id])
             ) AS agent_ids
-       FROM conversations c WHERE c.id = $1`,
-    [convoId, me],
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!cv[0]) return err(`unknown conversation ${convoId}`)
-  if (!cv[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
+  if (!cv[0]) return err(`conversation ${convoId} not found or no longer authorized`)
   const companyId = cv[0].company_id
 
   // ─── Anti-monologue gate ──────────────────────────────────────────
@@ -2041,6 +2244,24 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const txClient = await pool.connect()
   try {
     await txClient.query('BEGIN')
+    const { rows: authorizedRows } = await txClient.query<{ member_count: number }>(
+      `SELECT jsonb_array_length(c.members)::int AS member_count
+         FROM participants requester
+         JOIN conversations c
+           ON c.company_id = requester.company_id
+          AND c.id = $2
+          AND c.members @> to_jsonb(ARRAY[$1::text])
+        WHERE requester.id = $1
+          AND requester.company_id = $3
+          AND requester.kind IN ('agent', 'human')
+          AND requester.departed_at IS NULL
+        FOR SHARE OF requester, c`,
+      [me, convoId, companyId],
+    )
+    if (!authorizedRows[0]) {
+      await txClient.query('ROLLBACK')
+      return err(`conversation ${convoId} no longer authorized; reply cancelled`)
+    }
     const { rows: seqRow } = await txClient.query<{ seq: number }>(
       `INSERT INTO conversation_counters (conversation_id, next_sequence)
        VALUES ($1, 2)
@@ -2072,7 +2293,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     // contradicting this check's own "verbatim-dup is a hard no, the server enforces"
     // contract.) The peer-only query below already exempts genuine self-monologue: a
     // real follow-up isn't verbatim-identical to a recent PEER post, so it still passes.
-    if (cv[0].members.length > 2) {
+    if (authorizedRows[0].member_count > 2) {
       const draftBodyTrimmed = body.trim()
       if (draftBodyTrimmed.length > 0) {
         const { rows: lastPeer } = await txClient.query<{ sequence: number; author_id: string; body: string }>(
@@ -2100,6 +2321,13 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId,
         agentRecipientIds ? JSON.stringify(agentRecipientIds) : null],
     )
+    await txClient.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
+    await txClient.query(
+      `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
+      [me, convoId],
+    )
     await txClient.query('COMMIT')
   } catch (e) {
     await txClient.query('ROLLBACK').catch(() => { /* already failed */ })
@@ -2107,22 +2335,15 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   } finally {
     txClient.release()
   }
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
-
-  // Posting auto-acks me on this conversation (I clearly saw the messages I'm replying to)
-  await pool.query(
-    `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-    [me, convoId],
-  )
   // Advance the Redis "seen" boundary to my own just-inserted seq, so the
   // freshness preflight on my NEXT cumora reply compares against the post-
   // insertion state (peer messages with seq <= mine are "things I obviously
   // saw"; only seq > mine would trip a HOLD). Pure Redis side-effect — does
   // NOT touch conversation_reads.last_read_at or anything else loadInbox
   // depends on.
-  await recordSeen(me, convoId, sequence)
+  await recordSeen(me, convoId, sequence).catch((error) => {
+    console.warn(`[reply] message ${messageId} committed but seen-boundary update failed`, error)
+  })
   // Drop any lingering hold token: this send committed WITHOUT the
   // override, so a hold acknowledged-but-unused must not arm a later
   // preemptive --send-anyway in this conversation.
@@ -2155,6 +2376,8 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         sequence: quotedSummary.sequence,
       } : undefined,
     },
+  }).catch((error) => {
+    console.warn(`[reply] durable message ${messageId} committed but publish failed`, error)
   })
   const attachmentNote = attachment
     ? ` · attached ${attachment.kind} "${attachment.name}"`
@@ -2580,8 +2803,10 @@ async function listEmailContacts(
   companyId: string,
   viewerId: string,
   query?: string,
+  client?: PoolClient,
 ): Promise<EmailContact[]> {
   const out: EmailContact[] = []
+  const db = client ?? pool
   const { computeAgentAddress } = await import('../email.js')
   // Optional fuzzy filter. Applied uniformly across name / id / email so a
   // single query like "wey" matches an agent's id, a human's display
@@ -2600,7 +2825,7 @@ async function listEmailContacts(
   // exposes a deterministic address for un-minted agents, so the CLI
   // contact list should match (otherwise a fresh agent is invisible until
   // someone has emailed them, which is the bootstrap chicken-and-egg).
-  const { rows: agents } = await pool.query<{ id: string; name: string; email: string | null; slug: string; role: string | null }>(
+  const { rows: agents } = await db.query<{ id: string; name: string; email: string | null; slug: string; role: string | null }>(
     `SELECT p.id, p.name, p.email, p.role, c.slug
        FROM participants p
        JOIN companies c ON c.id = p.company_id
@@ -2617,7 +2842,7 @@ async function listEmailContacts(
     if (matches(c)) out.push(c)
   }
   // 2. Workspace humans (auth email).
-  const { rows: humans } = await pool.query<{ id: string; display_name: string; email: string }>(
+  const { rows: humans } = await db.query<{ id: string; display_name: string; email: string }>(
     `SELECT u.id, u.display_name, u.email
        FROM users u
        JOIN company_members cm ON cm.user_id = u.id
@@ -2633,7 +2858,7 @@ async function listEmailContacts(
   // at the 30 most recent; with a filter we widen the net so a search
   // can find older correspondents too (still capped to keep memory bounded).
   const limit = q ? 200 : 30
-  const { rows: ext } = await pool.query<{ address: string; display_name: string | null; message_count: number }>(
+  const { rows: ext } = await db.query<{ address: string; display_name: string | null; message_count: number }>(
     `SELECT address, display_name, message_count FROM email_contacts
       WHERE company_id = $1
       ORDER BY last_seen_at DESC LIMIT $2`,
@@ -2714,13 +2939,14 @@ async function listAgentEmailThreads(args: {
   companyId: string
   unreadOnly: boolean
   limit: number
+  client?: PoolClient
 }): Promise<EmailThreadRow[]> {
   // Threads = email conversations the agent is in. We surface the latest
   // email_messages row per thread for the snippet, and an unread count
   // computed against conversation_reads.last_read_at (same source of
   // truth as the chat inbox uses). Keeps the agent's mental model
   // consistent: "unread" means "you haven't acked this thread since".
-  const { rows } = await pool.query<EmailThreadRow>(
+  const { rows } = await (args.client ?? pool).query<EmailThreadRow>(
     `WITH my_threads AS (
        SELECT c.id, c.title, c.updated_at
          FROM conversations c
@@ -2887,9 +3113,18 @@ async function cmdPollShow(parsed: ParsedArgs, me: string, companyId: string): P
   const messageId = parsed.positional[1]
   if (!messageId) return err('usage: poll show <message_id>')
   const { rows } = await pool.query<{ poll: { question: string; mode: string; options: Array<{ id: string; text: string }>; expiresAt: string | null; closedAt: string | null } | null; author_id: string }>(
-    `SELECT poll, author_id FROM messages
-      WHERE id = $1 AND company_id = $2 AND kind = 'poll' LIMIT 1`,
-    [messageId, companyId],
+    `SELECT m.poll, m.author_id
+       FROM participants requester
+       JOIN conversations c
+         ON c.company_id = requester.company_id
+        AND c.members @> to_jsonb(ARRAY[$3::text])
+       JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
+      WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
+        AND requester.id = $3
+        AND requester.kind = 'agent'
+        AND requester.departed_at IS NULL
+      LIMIT 1`,
+    [messageId, companyId, me],
   )
   const row = rows[0]
   if (!row || !row.poll) return err(`poll ${messageId} not found`)
@@ -2980,7 +3215,14 @@ async function cmdEmailContacts(
   // — the agent's LLM uses this signal to ask the user for the address
   // instead of silently doing nothing.
   const query = parsed.positional[1]?.trim() ?? ''
-  const list = await listEmailContacts(companyId, me, query)
+  const lockedList = await withActiveParticipantLock({
+    participantId: me,
+    companyId,
+    kind: 'agent',
+    run: (client) => listEmailContacts(companyId, me, query, client),
+  })
+  if (!lockedList) return err(`cannot resolve active company for ${me}`)
+  const list = lockedList
   if (json) return ok(JSON.stringify(list, null, 2))
   if (list.length === 0) {
     const { env } = await import('../env.js')
@@ -3013,7 +3255,14 @@ async function cmdEmailContacts(
 async function cmdEmailInbox(parsed: ParsedArgs, me: string, companyId: string): Promise<CliResult> {
   const unread = Boolean(parsed.flags.unread)
   const limit = Math.min(50, Math.max(1, Number(parsed.flags.limit ?? 20)))
-  const threads = await listAgentEmailThreads({ agentId: me, companyId, unreadOnly: unread, limit })
+  const lockedThreads = await withActiveParticipantLock({
+    participantId: me,
+    companyId,
+    kind: 'agent',
+    run: (client) => listAgentEmailThreads({ agentId: me, companyId, unreadOnly: unread, limit, client }),
+  })
+  if (!lockedThreads) return err(`cannot resolve active company for ${me}`)
+  const threads = lockedThreads
   if (parsed.flags.json) return ok(JSON.stringify(threads, null, 2))
   if (threads.length === 0) {
     // Distinguish "feature not wired" from "feature wired, just empty" so
@@ -3048,49 +3297,55 @@ async function cmdEmailShow(parsed: ParsedArgs, me: string, companyId: string): 
   const convoId = parsed.positional[1]
   if (!convoId) return err('usage: email show <conversation_id> [--tail N]')
   const tail = Math.min(50, Math.max(1, Number(parsed.flags.tail ?? 10)))
-  // Confirm membership — agents can only read threads they're on.
-  const { rows: cv } = await pool.query<{ members: string[]; title: string }>(
-    `SELECT members, title FROM conversations
-      WHERE id = $1 AND company_id = $2 AND kind = 'email' LIMIT 1`,
-    [convoId, companyId],
-  )
-  if (!cv[0]) return err(`unknown email thread ${convoId}`)
-  if (!cv[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
-  const { rows: msgs } = await pool.query<{
-    id: string; created_at: string; body: string; from_addr: string;
-    to_addrs: string[]; cc_addrs: string[]; subject: string;
-    smtp_message_id: string | null; in_reply_to: string | null;
-    direction: 'in' | 'out'; transport_status: string;
-  }>(
-    `SELECT m.id, m.created_at::text, m.body,
-            em.from_addr, em.to_addrs, em.cc_addrs, em.subject,
-            em.smtp_message_id, em.in_reply_to, em.direction, em.transport_status
-       FROM messages m
-       JOIN email_messages em ON em.message_id = m.id
-      WHERE m.conversation_id = $1
-      ORDER BY m.sequence DESC
-      LIMIT $2`,
-    [convoId, tail],
-  )
-  msgs.reverse()
-  if (parsed.flags.json) return ok(JSON.stringify({ thread: convoId, title: cv[0].title, messages: msgs }, null, 2))
-  if (msgs.length === 0) return ok(`(thread ${convoId} has no email messages)`)
-  const lines: string[] = [`thread ${convoId}  "${cv[0].title}"`, '']
-  for (const m of msgs) {
-    const at = new Date(m.created_at).toISOString().replace('T', ' ').slice(0, 16)
-    const arrow = m.direction === 'in' ? '↓ in' : '↑ out'
-    lines.push(`────  [${m.id}]  ${arrow}  ${m.transport_status}  ${at}`)
-    lines.push(`from:    ${m.from_addr}`)
-    if (m.to_addrs?.length) lines.push(`to:      ${m.to_addrs.join(', ')}`)
-    if (m.cc_addrs?.length) lines.push(`cc:      ${m.cc_addrs.join(', ')}`)
-    lines.push(`subject: ${m.subject}`)
-    if (m.in_reply_to) lines.push(`in-reply-to: <${m.in_reply_to}>`)
-    lines.push('')
-    lines.push(m.body)
-    lines.push('')
-  }
-  lines.push(`reply with \`cumora email reply ${msgs[msgs.length - 1].id} --body "..."\`.`)
-  return ok(lines.join('\n'))
+  const result = await withConversationActorLock({
+    participantId: me,
+    companyId,
+    conversationId: convoId,
+    kind: 'agent',
+    conversationKind: 'email',
+    run: async (client) => {
+      const { rows: cv } = await client.query<{ title: string }>(
+        `SELECT title FROM conversations WHERE id = $1 AND company_id = $2`,
+        [convoId, companyId],
+      )
+      const { rows: msgs } = await client.query<{
+        id: string; created_at: string; body: string; from_addr: string;
+        to_addrs: string[]; cc_addrs: string[]; subject: string;
+        smtp_message_id: string | null; in_reply_to: string | null;
+        direction: 'in' | 'out'; transport_status: string;
+      }>(
+        `SELECT m.id, m.created_at::text, m.body,
+                em.from_addr, em.to_addrs, em.cc_addrs, em.subject,
+                em.smtp_message_id, em.in_reply_to, em.direction, em.transport_status
+           FROM messages m
+           JOIN email_messages em ON em.message_id = m.id AND em.company_id = $3
+          WHERE m.conversation_id = $1 AND m.company_id = $3
+          ORDER BY m.sequence DESC
+          LIMIT $2`,
+        [convoId, tail, companyId],
+      )
+      msgs.reverse()
+      if (parsed.flags.json) return ok(JSON.stringify({ thread: convoId, title: cv[0].title, messages: msgs }, null, 2))
+      if (msgs.length === 0) return ok(`(thread ${convoId} has no email messages)`)
+      const lines: string[] = [`thread ${convoId}  "${cv[0].title}"`, '']
+      for (const m of msgs) {
+        const at = new Date(m.created_at).toISOString().replace('T', ' ').slice(0, 16)
+        const arrow = m.direction === 'in' ? '↓ in' : '↑ out'
+        lines.push(`────  [${m.id}]  ${arrow}  ${m.transport_status}  ${at}`)
+        lines.push(`from:    ${m.from_addr}`)
+        if (m.to_addrs?.length) lines.push(`to:      ${m.to_addrs.join(', ')}`)
+        if (m.cc_addrs?.length) lines.push(`cc:      ${m.cc_addrs.join(', ')}`)
+        lines.push(`subject: ${m.subject}`)
+        if (m.in_reply_to) lines.push(`in-reply-to: <${m.in_reply_to}>`)
+        lines.push('')
+        lines.push(m.body)
+        lines.push('')
+      }
+      lines.push(`reply with \`cumora email reply ${msgs[msgs.length - 1].id} --body "..."\`.`)
+      return ok(lines.join('\n'))
+    },
+  })
+  return result ?? err(`email thread ${convoId} not found or no longer authorized`)
 }
 
 async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): Promise<CliResult> {
@@ -3151,9 +3406,27 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     memberIds: [...memberIds],
   })
 
-  // Call the provider FIRST so we record sent/failed accurately. If
-  // anything throws we still write a queued/failed row — the agent
-  // shouldn't lose the draft just because Resend hiccuped.
+  // WRITE-FIRST: persist an authorized durable row before the network hop.
+  // persistEmailMessage locks the active author and current conversation
+  // membership in its transaction, so a revoked actor never reaches Resend.
+  const persisted = await persistEmailMessage({
+    conversationId: conv.conversationId,
+    companyId,
+    authorId: me,
+    direction: 'out',
+    transportStatus: 'sending',
+    transportError: null,
+    smtpMessageId: messageId,
+    inReplyTo: null,
+    references: [],
+    subject,
+    fromAddr: formatAddress(sender.email, sender.displayName),
+    toAddrs: toResolved.map((r) => formatAddress(r.addr, r.name)),
+    ccAddrs: ccResolved.map((r) => formatAddress(r.addr, r.name)),
+    body,
+    autoSubmitted: true,
+  })
+
   const sendRes = await sendViaProvider({
     from: formatAddress(sender.email, sender.displayName),
     to: toResolved.map((r) => formatAddress(r.addr, r.name)),
@@ -3163,23 +3436,19 @@ async function cmdEmailSend(parsed: ParsedArgs, me: string, companyId: string): 
     messageId,
     autoSubmitted: 'auto-generated',
   })
-
-  const persisted = await persistEmailMessage({
-    conversationId: conv.conversationId,
-    companyId,
-    authorId: me,
-    direction: 'out',
-    transportStatus: sendRes.ok ? 'sent' : 'failed',
-    transportError: sendRes.error,
-    smtpMessageId: sendRes.smtpMessageId ?? messageId,
-    inReplyTo: null,
-    references: [],
-    subject,
-    fromAddr: formatAddress(sender.email, sender.displayName),
-    toAddrs: toResolved.map((r) => formatAddress(r.addr, r.name)),
-    ccAddrs: ccResolved.map((r) => formatAddress(r.addr, r.name)),
-    body,
-    autoSubmitted: true,
+  const finalStatus = sendRes.ok ? 'sent' : 'failed'
+  await pool.query(
+    `UPDATE email_messages
+        SET transport_status = $1, transport_error = $2,
+            smtp_message_id = $3, next_retry_at = $4
+      WHERE message_id = $5 AND company_id = $6`,
+    [
+      finalStatus, sendRes.error, sendRes.smtpMessageId ?? messageId,
+      finalStatus === 'failed' ? new Date(Date.now() + 60_000) : null,
+      persisted.messageId, companyId,
+    ],
+  ).catch((error) => {
+    console.warn(`[email] post-send UPDATE failed for ${persisted.messageId}; retry worker will reconcile`, error)
   })
 
   if (!sendRes.ok) {
@@ -3209,7 +3478,14 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
   if (!replyTo || !body) return err('usage: email reply <message_id> --body "..." [--cc <addr|id>...]')
   const attachmentError = rejectsEmailAttachmentFlags(parsed)
   if (attachmentError) return attachmentError
-  // Pull the original email row and its conversation context.
+  const {
+    ensureAgentAddress, formatAddress,
+    sendViaProvider, persistEmailMessage, mintMessageId, normalizeMessageId,
+    sanitizeSubject, splitReplyAddresses,
+  } = await import('../email.js')
+  const sender = await ensureAgentAddress(me)
+  if (!sender) return err('agent has no email address (EMAIL_DOMAIN unset or company missing)')
+
   const { rows: orig } = await pool.query<{
     conversation_id: string
     smtp_message_id: string | null
@@ -3226,21 +3502,6 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
   )
   if (!orig[0]) return err(`unknown email message ${replyTo}`)
   const o = orig[0]
-  // Confirm membership — same gate as `email show`.
-  const { rows: cv } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1`, [o.conversation_id],
-  )
-  if (!cv[0] || !cv[0].members.includes(me)) {
-    return err(`${me} is not a member of thread ${o.conversation_id}`)
-  }
-
-  const {
-    ensureAgentAddress, formatAddress,
-    sendViaProvider, persistEmailMessage, mintMessageId, normalizeMessageId,
-    sanitizeSubject, splitReplyAddresses,
-  } = await import('../email.js')
-  const sender = await ensureAgentAddress(me)
-  if (!sender) return err('agent has no email address (EMAIL_DOMAIN unset or company missing)')
 
   // Reply-all split: TO = original From, CC = original To+Cc minus self.
   // Earlier iterations collapsed everyone into TO; that read fine but
@@ -3287,6 +3548,27 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
   const inReplyTo = o.smtp_message_id ? normalizeMessageId(o.smtp_message_id) : null
   const messageId = mintMessageId()
 
+  // WRITE-FIRST. This is the authorization boundary: persistEmailMessage
+  // locks the current participant and verifies current conversation
+  // membership before committing the durable outbound row.
+  const persisted = await persistEmailMessage({
+    conversationId: o.conversation_id,
+    companyId,
+    authorId: me,
+    direction: 'out',
+    transportStatus: 'sending',
+    transportError: null,
+    smtpMessageId: messageId,
+    inReplyTo,
+    references: newReferences,
+    subject,
+    fromAddr: formatAddress(sender.email, sender.displayName),
+    toAddrs,
+    ccAddrs: ccCombined,
+    body,
+    autoSubmitted: true,
+  })
+
   const sendRes = await sendViaProvider({
     from: formatAddress(sender.email, sender.displayName),
     to: toAddrs,
@@ -3298,23 +3580,19 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     messageId,
     autoSubmitted: 'auto-replied',
   })
-
-  const persisted = await persistEmailMessage({
-    conversationId: o.conversation_id,
-    companyId,
-    authorId: me,
-    direction: 'out',
-    transportStatus: sendRes.ok ? 'sent' : 'failed',
-    transportError: sendRes.error,
-    smtpMessageId: sendRes.smtpMessageId ?? messageId,
-    inReplyTo,
-    references: newReferences,
-    subject,
-    fromAddr: formatAddress(sender.email, sender.displayName),
-    toAddrs,
-    ccAddrs: ccCombined,
-    body,
-    autoSubmitted: true,
+  const finalStatus = sendRes.ok ? 'sent' : 'failed'
+  await pool.query(
+    `UPDATE email_messages
+        SET transport_status = $1, transport_error = $2,
+            smtp_message_id = $3, next_retry_at = $4
+      WHERE message_id = $5 AND company_id = $6`,
+    [
+      finalStatus, sendRes.error, sendRes.smtpMessageId ?? messageId,
+      finalStatus === 'failed' ? new Date(Date.now() + 60_000) : null,
+      persisted.messageId, companyId,
+    ],
+  ).catch((error) => {
+    console.warn(`[email] post-send UPDATE failed for ${persisted.messageId}; retry worker will reconcile`, error)
   })
 
   // Auto-ack — replying definitionally means I read the original.
@@ -3515,12 +3793,24 @@ async function saveTextAttachment(
 }
 
 async function cmdTopicRead(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
   const convoId = parsed.positional[0]
   if (!convoId) return err('usage: topic <conversation_id>')
+  const activeAgentCompanyId = await agentCompany(me)
   const { rows } = await pool.query<{ topic: string | null; title: string }>(
-    `SELECT topic, title FROM conversations WHERE id = $1`, [convoId],
+    `SELECT c.topic, c.title
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!rows[0]) return err(`unknown conversation ${convoId}`)
+  if (!rows[0]) return err(`conversation ${convoId} not found or no longer authorized`)
   const t = rows[0].topic
   if (!t) return ok(`(no topic set on "${rows[0].title}")`)
   return ok(t)
@@ -3532,22 +3822,40 @@ async function cmdTopicSet(parsed: ParsedArgs): Promise<CliResult> {
   if (!convoId) return err('usage: topic-set <conversation_id> "<text>"  (empty body clears the topic)')
   const raw = unescapeChat(parsed.positional.slice(1).join(' ')).trim()
   const topic = raw.length > 0 ? raw.slice(0, 200) : null
+  const activeAgentCompanyId = await agentCompany(me)
 
-  const { rows } = await pool.query<{ members: string[]; company_id: string }>(
-    `SELECT members, company_id FROM conversations WHERE id = $1`, [convoId],
+  const { rows: preflight } = await pool.query<{ company_id: string }>(
+    `SELECT c.company_id
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!rows[0]) return err(`unknown conversation ${convoId}`)
-  if (!rows[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
-
-  await pool.query(
-    `UPDATE conversations SET topic = $2, updated_at = NOW() WHERE id = $1`,
-    [convoId, topic],
-  )
+  if (!preflight[0]) return err(`conversation ${convoId} not found or no longer authorized`)
+  const updated = await withConversationActorLock({
+    participantId: me,
+    companyId: preflight[0].company_id,
+    conversationId: convoId,
+    run: async (client) => client.query<{ company_id: string }>(
+      `UPDATE conversations SET topic = $2, updated_at = NOW()
+        WHERE id = $1 AND company_id = $3
+        RETURNING company_id`,
+      [convoId, topic, preflight[0].company_id],
+    ),
+  })
+  const companyId = updated?.rows[0]?.company_id
+  if (!companyId) return err(`conversation ${convoId} not found or no longer authorized`)
   const { CH_CONVO_UPDATED, publish } = await import('../redis.js')
   await publish(CH_CONVO_UPDATED, {
     type: 'conversation.updated',
     conversationId: convoId,
-    companyId: rows[0].company_id,
+    companyId,
     patch: { topic },
   })
   return ok(topic ? `topic set: "${topic}"` : '(topic cleared)', [{
@@ -3555,7 +3863,7 @@ async function cmdTopicSet(parsed: ParsedArgs): Promise<CliResult> {
     command: 'topic-set',
     conversationId: convoId,
     actorId: me,
-    companyId: rows[0].company_id,
+    companyId,
     topic,
     visibleToUser: true,
   }])
@@ -3569,13 +3877,23 @@ async function cmdRename(parsed: ParsedArgs): Promise<CliResult> {
   if (!convoId) return err('usage: rename <conversation_id> "<new title>"')
   const title = unescapeChat(parsed.positional.slice(1).join(' ')).trim().slice(0, 80)
   if (!title) return err('rename requires a non-empty title')
+  const activeAgentCompanyId = await agentCompany(me)
 
   const { rows } = await pool.query<{ members: string[]; kind: string; company_id: string; title: string }>(
-    `SELECT members, kind, company_id, title FROM conversations WHERE id = $1`, [convoId],
+    `SELECT c.members, c.kind, c.company_id, c.title
+       FROM conversations c
+       JOIN participants requester
+         ON requester.id = $2
+        AND requester.company_id = c.company_id
+        AND requester.kind IN ('agent', 'human')
+        AND requester.departed_at IS NULL
+      WHERE c.id = $1
+        AND ($3::text IS NULL OR c.company_id = $3)
+        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+    [convoId, me, activeAgentCompanyId],
   )
-  if (!rows[0]) return err(`unknown conversation ${convoId}`)
+  if (!rows[0]) return err(`conversation ${convoId} not found or no longer authorized`)
   if (rows[0].kind !== 'group') return err(`only group chats can be renamed (${convoId} is a ${rows[0].kind})`)
-  if (!rows[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
   const currentTitle = rows[0].title
 
   // Optimistic-concurrency: --if-equals "<expected current title>" lets a caller
@@ -3600,10 +3918,19 @@ async function cmdRename(parsed: ParsedArgs): Promise<CliResult> {
     return ok(`(no-op — title was already "${title}")`)
   }
 
-  await pool.query(
-    `UPDATE conversations SET title = $2, updated_at = NOW() WHERE id = $1`,
-    [convoId, title],
-  )
+  const updated = await withConversationActorLock({
+    participantId: me,
+    companyId: rows[0].company_id,
+    conversationId: convoId,
+    run: async (client) => client.query(
+      `UPDATE conversations
+          SET title = $2, updated_at = NOW()
+        WHERE id = $1 AND company_id = $3
+          AND kind = 'group' AND title = $4`,
+      [convoId, title, rows[0].company_id, currentTitle],
+    ),
+  })
+  if (!updated?.rowCount) return err(`conversation ${convoId} changed or is no longer authorized; rename cancelled`)
   const { CH_CONVO_UPDATED, publish } = await import('../redis.js')
   await publish(CH_CONVO_UPDATED, {
     type: 'conversation.updated',
@@ -5548,6 +5875,8 @@ async function publishDocChanged(
     companyId,
     documentId,
     actorId,
+  }).catch((error) => {
+    console.warn(`[doc] durable ${kind} for ${documentId} committed but publish failed`, error)
   })
 }
 
@@ -5556,9 +5885,59 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
   const companyId = await agentCompany(me)
   if (!companyId) return err(`unknown agent ${me} (no company)`)
+  const pendingChanges: Array<{
+    kind: 'document.created' | 'document.updated' | 'document.deleted'
+    documentId: string
+  }> = []
+  const finalizers: Array<() => Promise<void>> = []
+  let locked: CliResult | null
+  try {
+    locked = await withActiveParticipantLock({
+      participantId: me,
+      companyId,
+      kind: 'agent',
+      run: async (client) => cmdDocAsActiveAgent(
+        parsed,
+        op,
+        me,
+        companyId,
+        client,
+        (kind, documentId) => pendingChanges.push({ kind, documentId }),
+        (finalizer) => finalizers.push(finalizer),
+      ),
+    })
+  } finally {
+    for (const finalize of finalizers) {
+      await finalize().catch((error) => {
+        console.warn('[doc] post-transaction cleanup failed', error)
+      })
+    }
+  }
+  if (!locked) return err(`agent ${me} is no longer active in ${companyId}`)
+  // `withActiveParticipantLock` commits before returning. Publish only now so
+  // subscribers that immediately reload never observe pre-commit state, and a
+  // failed transaction cannot emit a ghost document event.
+  for (const change of pendingChanges) {
+    await publishDocChanged(companyId, change.documentId, change.kind, me)
+  }
+  return locked
+}
+
+async function cmdDocAsActiveAgent(
+  parsed: ParsedArgs,
+  op: string,
+  me: string,
+  companyId: string,
+  dbClient: PoolClient,
+  onChanged: (
+    kind: 'document.created' | 'document.updated' | 'document.deleted',
+    documentId: string,
+  ) => void,
+  onFinally: (finalizer: () => Promise<void>) => void,
+): Promise<CliResult> {
 
   if (op === 'ls' || op === 'list') {
-    const { rows } = await pool.query<{
+    const { rows } = await dbClient.query<{
       id: string; title: string; created_by: string; updated_at: Date
     }>(
       `SELECT id, title, created_by, updated_at FROM documents
@@ -5585,8 +5964,9 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     // still collide thanks to subject normalization.
     const blocked = await tryClaimTenantWork(companyId, me, 'doc-create', title)
     if (blocked) return blocked
+    onFinally(() => releaseTenantWork(companyId, me, 'doc-create', title))
 
-    try {
+    {
       // The claim above only guards work IN FLIGHT — it's released the
       // moment the first creator finishes, so it cannot stop a SEQUENTIAL
       // duplicate (2026-06-12: nova created+released 《第七天的猫》 at
@@ -5601,7 +5981,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       const docHoldScope = `doc-create:${normTitle}`
       const forceArmed = Boolean(parsed.flags.force) && (await consumeHold(me, docHoldScope)).armed
       if (!forceArmed) {
-        const { rows: recentDups } = await pool.query<{
+        const { rows: recentDups } = await dbClient.query<{
           id: string; title: string; created_by: string; created_at: Date
         }>(
           `SELECT id, title, created_by, created_at FROM documents
@@ -5625,7 +6005,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         }
       }
       const id = `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`
-      await pool.query(
+      await dbClient.query(
         `INSERT INTO documents (id, company_id, title, created_by) VALUES ($1, $2, $3, $4)`,
         [id, companyId, title.slice(0, 200), me],
       )
@@ -5635,9 +6015,9 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       const body = typeof parsed.flags.body === 'string' ? unescapeChat(parsed.flags.body) : ''
       if (body) {
         const { applyAgentEdit } = await import('../documents/rooms.js')
-        await applyAgentEdit(id, companyId, me, [{ kind: 'append', text: body }])
+        await applyAgentEdit(id, companyId, me, [{ kind: 'append', text: body }], dbClient)
       }
-      await publishDocChanged(companyId, id, 'document.created', me)
+      onChanged('document.created', id)
       return ok(`created document ${id}: ${title}`, [{
         event: 'document.created',
         command: 'doc create',
@@ -5648,20 +6028,18 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         bodyLength: body.length,
         visibleToUser: true,
       }])
-    } finally {
-      await releaseTenantWork(companyId, me, 'doc-create', title)
     }
   }
 
   if (op === 'read' || op === 'show') {
     const docId = parsed.positional[1]
     if (!docId) return err('usage: doc read <document_id>')
-    const { rows } = await pool.query<{ company_id: string; title: string }>(
+    const { rows } = await dbClient.query<{ company_id: string; title: string }>(
       `SELECT company_id, title FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { readDocumentText } = await import('../documents/rooms.js')
-    const body = await readDocumentText(docId, companyId)
+    const body = await readDocumentText(docId, companyId, dbClient)
     if (parsed.flags.json) return ok(JSON.stringify({ id: docId, title: rows[0].title, body }, null, 2))
     return ok([
       `# ${rows[0].title}  (${docId})`,
@@ -5675,13 +6053,13 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const text = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.text === 'string' ? unescapeChat(parsed.flags.text) : '')
     if (!docId || !text) return err('usage: doc append <document_id> "<text>"')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    await applyAgentEdit(docId, companyId, me, [{ kind: 'append', text }])
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await applyAgentEdit(docId, companyId, me, [{ kind: 'append', text }], dbClient)
+    onChanged('document.updated', docId)
     return ok(`appended ${text.length} chars to ${docId}`, [{
       event: 'document.updated',
       command: 'doc append',
@@ -5699,13 +6077,13 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const text = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.text === 'string' ? unescapeChat(parsed.flags.text) : '')
     if (!docId || !text) return err('usage: doc prepend <document_id> "<text>"')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    await applyAgentEdit(docId, companyId, me, [{ kind: 'insertParagraph', at: 'start', text }])
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    await applyAgentEdit(docId, companyId, me, [{ kind: 'insertParagraph', at: 'start', text }], dbClient)
+    onChanged('document.updated', docId)
     return ok(`prepended ${text.length} chars to ${docId}`, [{
       event: 'document.updated',
       command: 'doc prepend',
@@ -5762,12 +6140,12 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       placement = { mode: atRaw === 'start' ? 'start' : 'end' }
     }
 
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit, isAnchoredImagePlacement } = await import('../documents/rooms.js')
-    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'image', src, alt: alt || null, placement }])
+    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'image', src, alt: alt || null, placement }], dbClient)
 
     // Anchor miss is a HARD error now — falling back to end-of-doc on a
     // missed snippet is how the doc collected duplicate inert images
@@ -5778,7 +6156,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
       const snippet = placement.anchorText.slice(0, 60)
       return err(`anchor not found in ${docId}: "${snippet}". Re-read the doc and pick a snippet that uniquely identifies the target block — no image was inserted.`)
     }
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    onChanged('document.updated', docId)
 
     let where: string
     if (isAnchoredImagePlacement(placement)) {
@@ -5813,7 +6191,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     if (provided.length > 1) {
       return err('pass only one of --src / --src-contains / --alt')
     }
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
@@ -5822,11 +6200,11 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         : srcContains ? { by: 'src-contains', substring: srcContains }
           : { by: 'alt', alt: altMatch }
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'imageDelete', match }])
+    const result = await applyAgentEdit(docId, companyId, me, [{ kind: 'imageDelete', match }], dbClient)
     if (result.imagesDeleted === 0) {
       return err(`no images in ${docId} matched the criterion`)
     }
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    onChanged('document.updated', docId)
     return ok(`deleted ${result.imagesDeleted} image${result.imagesDeleted === 1 ? '' : 's'} from ${docId}`, [{
       event: 'document.updated',
       command: 'doc image-delete',
@@ -5844,14 +6222,14 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const find = typeof parsed.flags.find === 'string' ? unescapeChat(parsed.flags.find) : ''
     const replace = typeof parsed.flags.replace === 'string' ? unescapeChat(parsed.flags.replace) : ''
     if (!docId || !find) return err('usage: doc replace <document_id> --find "..." --replace "..."')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replace', find, replace }])
+    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replace', find, replace }], dbClient)
     if (r.replaced === 0) return err(`text not found in ${docId}: ${JSON.stringify(find).slice(0, 80)}`)
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    onChanged('document.updated', docId)
     return ok(`replaced ${r.replaced} occurrence in ${docId}`, [{
       event: 'document.updated',
       command: 'doc replace',
@@ -5870,14 +6248,14 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const text = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.text === 'string' ? unescapeChat(parsed.flags.text) : '')
     if (!docId || !anchor || !text) return err('usage: doc replace-block <document_id> --anchor "<snippet in the block>" "<replacement markdown>"')
-    const { rows } = await pool.query<{ company_id: string }>(
+    const { rows } = await dbClient.query<{ company_id: string }>(
       `SELECT company_id FROM documents WHERE id = $1 LIMIT 1`, [docId],
     )
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
-    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replaceBlock', anchorText: anchor, text }])
+    const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replaceBlock', anchorText: anchor, text }], dbClient)
     if (r.blocksReplaced === 0) return err(`no block containing ${JSON.stringify(anchor).slice(0, 80)} in ${docId}`)
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    onChanged('document.updated', docId)
     return ok(`replaced 1 block in ${docId}`, [{
       event: 'document.updated',
       command: 'doc replace-block',
@@ -5894,13 +6272,13 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     const title = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.title === 'string' ? parsed.flags.title : '')
     if (!docId || !title) return err('usage: doc rename <document_id> "<title>"')
-    const r = await pool.query(
+    const r = await dbClient.query(
       `UPDATE documents SET title = $1, updated_at = NOW()
         WHERE id = $2 AND company_id = $3`,
       [title.slice(0, 200), docId, companyId],
     )
     if (!r.rowCount) return err(`document ${docId} not found`)
-    await publishDocChanged(companyId, docId, 'document.updated', me)
+    onChanged('document.updated', docId)
     return ok(`renamed ${docId} to "${title}"`, [{
       event: 'document.updated',
       command: 'doc rename',
@@ -5916,14 +6294,14 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
   if (op === 'delete' || op === 'rm') {
     const docId = parsed.positional[1]
     if (!docId) return err('usage: doc delete <document_id>')
-    const { rows } = await pool.query<{ created_by: string }>(
+    const { rows } = await dbClient.query<{ created_by: string }>(
       `SELECT created_by FROM documents WHERE id = $1 AND company_id = $2 LIMIT 1`,
       [docId, companyId],
     )
     if (rows.length === 0) return err(`document ${docId} not found`)
     if (rows[0].created_by !== me) return err(`only the creator can delete document ${docId}`)
-    await pool.query(`DELETE FROM documents WHERE id = $1`, [docId])
-    await publishDocChanged(companyId, docId, 'document.deleted', me)
+    await dbClient.query(`DELETE FROM documents WHERE id = $1`, [docId])
+    onChanged('document.deleted', docId)
     return ok(`deleted document ${docId}`, [{
       event: 'document.deleted',
       command: 'doc delete',

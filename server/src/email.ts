@@ -15,6 +15,7 @@
  * want to burn Resend quota.
  */
 import { randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
 
@@ -330,9 +331,8 @@ interface SendArgs {
   inReplyTo?: string | null
   references?: string[]
   /** When set, the provider should accept this id as the Message-ID rather
-   *  than minting its own. Resend doesn't support this directly — it
-   *  always mints — so we track our minted id alongside whatever the
-   *  provider returns and use whichever is non-null. */
+   *  than minting its own. The same stable value also derives Resend's
+   *  Idempotency-Key, making crash recovery safe within its 24-hour window. */
   messageId?: string | null
   /** True when this send is automation (heartbeat decision or agent CLI
    *  shelling out). Adds an RFC 3834 Auto-Submitted header so receiving
@@ -452,6 +452,9 @@ export async function sendViaProvider(args: SendArgs): Promise<ProviderSendResul
       headers: {
         'authorization': `Bearer ${apiKey}`,
         'content-type': 'application/json',
+        ...(args.messageId
+          ? { 'idempotency-key': `cumora-email/${normalizeMessageId(args.messageId) ?? args.messageId}` }
+          : {}),
       },
       body: JSON.stringify(body),
     })
@@ -513,11 +516,12 @@ export async function sendViaProvider(args: SendArgs): Promise<ProviderSendResul
 export async function findEmailConversationByMessageIds(
   messageIds: string[],
   companyId: string,
+  client?: PoolClient,
 ): Promise<string | null> {
   if (messageIds.length === 0) return null
   const norm = messageIds.map(normalizeMessageId).filter((x): x is string => Boolean(x))
   if (norm.length === 0) return null
-  const { rows } = await pool.query<{ conversation_id: string }>(
+  const { rows } = await (client ?? pool).query<{ conversation_id: string }>(
     `SELECT conversation_id FROM email_messages
       WHERE company_id = $1
         AND LOWER(smtp_message_id) = ANY($2::text[])
@@ -628,32 +632,59 @@ export async function persistEmailMessage(args: {
   // Need this lazily to avoid a circular import (redis pulls in env, etc).
   const { CH_MESSAGE_NEW, publish } = await import('./redis.js')
   const messageId = `m-${randomUUID()}`
-  // Atomic sequence claim — same pattern as cmdReply / api/router.ts.
-  const seqResult = await pool.query<{ seq: number }>(
-    `INSERT INTO conversation_counters (conversation_id, next_sequence)
-     VALUES ($1, 2)
-     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-     RETURNING next_sequence - 1 AS seq`,
-    [args.conversationId],
-  )
-  const sequence = seqResult.rows[0]?.seq ?? 1
-  // No need to stash headers on the messages row — the API joins on
-  // email_messages and emits a typed `email` field per row when kind='email'.
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-     VALUES ($1, $2, $3, 'email', $4, $5, $6)`,
-    [messageId, args.conversationId, args.authorId, args.body, sequence, args.companyId],
-  )
-  // Schedule the first retry attempt for outbound failures. The retry
-  // worker only ever looks at direction='out' + status='failed' rows whose
-  // next_retry_at is in the past, so inbound + sent rows trivially get
-  // ignored. We use a fresh 60-second backoff for the first try; the
-  // worker compounds it on each subsequent miss.
-  const initialRetryAt = (args.direction === 'out' && args.transportStatus === 'failed')
-    ? new Date(Date.now() + 60_000)
-    : null
-  await pool.query(
-    `INSERT INTO email_messages (
+  interface PersistedAttachment {
+    id: string; filename: string; mimeType: string; sizeBytes: number;
+    storageKey: string | null; truncated: boolean;
+  }
+  const persistedAttachments: PersistedAttachment[] = []
+  let sequence = 0
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (args.direction === 'out') {
+      // Outbound mail is a privileged conversation write. Pin the current
+      // participant row before checking membership so a concurrent kick,
+      // offboarding, or tenant reassignment serializes at this boundary.
+      const actor = await client.query(
+        `SELECT id FROM participants
+          WHERE id = $1 AND company_id = $2
+            AND kind IN ('agent', 'human') AND departed_at IS NULL
+          FOR SHARE`,
+        [args.authorId, args.companyId],
+      )
+      if (!actor.rowCount) throw new Error('email author is no longer an active tenant participant')
+    }
+    const conversation = await client.query(
+      `SELECT id FROM conversations
+        WHERE id = $1 AND company_id = $2
+          AND ($3::boolean = FALSE OR members @> to_jsonb(ARRAY[$4::text]))
+        FOR UPDATE`,
+      [args.conversationId, args.companyId, args.direction === 'out', args.authorId],
+    )
+    if (!conversation.rowCount) throw new Error('email conversation not found or no longer authorized')
+
+    const seqResult = await client.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+       RETURNING next_sequence - 1 AS seq`,
+      [args.conversationId],
+    )
+    sequence = seqResult.rows[0]?.seq ?? 1
+    await client.query(
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+       VALUES ($1, $2, $3, 'email', $4, $5, $6)`,
+      [messageId, args.conversationId, args.authorId, args.body, sequence, args.companyId],
+    )
+    const initialRetryAt = args.direction === 'out'
+      ? (args.transportStatus === 'failed'
+          ? new Date(Date.now() + 60_000)
+          : args.transportStatus === 'sending'
+            ? new Date(Date.now() + 5 * 60_000)
+            : null)
+      : null
+    await client.query(
+      `INSERT INTO email_messages (
         message_id, conversation_id, company_id, direction, transport_status,
         transport_error, smtp_message_id, in_reply_to, references_chain,
         subject, from_addr, to_addrs, cc_addrs, bcc_addrs, html, raw_size_bytes,
@@ -679,40 +710,41 @@ export async function persistEmailMessage(args: {
       args.rawSizeBytes ?? null,
       Boolean(args.autoSubmitted),
       initialRetryAt,
-    ],
-  )
-  // Outbound attachments: same email_attachments shape inbound writes from
-  // the webhook, so the /messages JOIN doesn't need to know which direction
-  // produced the row. We also capture the inserted ids so the wake event
-  // can echo them — the renderer's freshly-arrived bubble shouldn't have
-  // to wait for a /messages refetch to see attachments.
-  interface PersistedAttachment {
-    id: string; filename: string; mimeType: string; sizeBytes: number;
-    storageKey: string | null; truncated: boolean;
-  }
-  const persistedAttachments: PersistedAttachment[] = []
-  if (args.attachments?.length) {
-    for (const a of args.attachments) {
-      const attId = `eatt-${randomUUID().slice(0, 12)}`
-      const filename = a.filename.slice(0, 200)
-      const mimeType = (a.mimeType || 'application/octet-stream').slice(0, 120)
-      const truncated = Boolean(a.truncated)
-      await pool.query(
-        `INSERT INTO email_attachments
+      ],
+    )
+    if (args.attachments?.length) {
+      for (const a of args.attachments) {
+        const attId = `eatt-${randomUUID().slice(0, 12)}`
+        const filename = a.filename.slice(0, 200)
+        const mimeType = (a.mimeType || 'application/octet-stream').slice(0, 120)
+        const truncated = Boolean(a.truncated)
+        await client.query(
+          `INSERT INTO email_attachments
            (id, message_id, conversation_id, company_id, filename, mime_type, size_bytes, storage_key, truncated)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [
-          attId,
-          messageId, args.conversationId, args.companyId,
-          filename, mimeType, a.sizeBytes,
-          a.storageKey, truncated,
-        ],
-      )
-      persistedAttachments.push({
-        id: attId, filename, mimeType, sizeBytes: a.sizeBytes,
-        storageKey: a.storageKey, truncated,
-      })
+          [
+            attId,
+            messageId, args.conversationId, args.companyId,
+            filename, mimeType, a.sizeBytes,
+            a.storageKey, truncated,
+          ],
+        )
+        persistedAttachments.push({
+          id: attId, filename, mimeType, sizeBytes: a.sizeBytes,
+          storageKey: a.storageKey, truncated,
+        })
+      }
     }
+    await client.query(
+      `UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND company_id = $2`,
+      [args.conversationId, args.companyId],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
   }
   // Resolve a fresh public URL per attachment for the wake event, mirroring
   // what /conversations/:id/messages does on read. Truncated rows stay
@@ -729,7 +761,6 @@ export async function persistEmailMessage(args: {
       url, truncated: a.truncated,
     }
   }))
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [args.conversationId])
   // Wake every member-agent of the conversation. The scheduler dedups
   // across replicas via the wake-claim Redis key.
   await publish(CH_MESSAGE_NEW, {
@@ -762,6 +793,12 @@ export async function persistEmailMessage(args: {
         attachments: wakeAttachments,
       },
     },
+  }).catch((error) => {
+    // Persistence is the outbox boundary. A transient Redis outage must not
+    // prevent the caller from reaching the provider; clients will refetch the
+    // committed row, and a stale `sending` deadline lets the retry worker
+    // recover if the process dies before finalizing transport state.
+    console.warn(`[email] message publish failed for ${messageId}`, error)
   })
   return { messageId, sequence }
 }
@@ -786,40 +823,64 @@ export async function findOrCreateEmailConversation(args: {
    *  sender. Order is preserved for the title fallback ("A ↔ B"). */
   memberIds: string[]
 }): Promise<{ conversationId: string; created: boolean }> {
-  const candidates = [args.inReplyTo, ...args.references]
-    .map((x) => normalizeMessageId(x))
-    .filter((x): x is string => Boolean(x))
-  const existing = await findEmailConversationByMessageIds(candidates, args.companyId)
-  if (existing) {
-    // Membership repair: a thread can pick up new participants over time
-    // (someone CC'd later). Add anyone who isn't already a member.
-    await pool.query(
-      `UPDATE conversations
-          SET members = (
-            SELECT to_jsonb(ARRAY(
-              SELECT DISTINCT m FROM (
-                SELECT jsonb_array_elements_text(members) AS m
-                UNION
-                SELECT unnest($2::text[]) AS m
-              ) u
-            ))
-          )
-        WHERE id = $1`,
-      [existing, args.memberIds],
-    )
-    return { conversationId: existing, created: false }
-  }
-  // Strip leading Re:/Fwd: for the title — easier to scan in the
-  // conversation list. The full subject is preserved on each message.
-  const cleanSubject = args.subject.replace(/^\s*((re|fwd|fw)\s*:\s*)+/i, '').trim() || '(no subject)'
-  const id = `email-${randomUUID().slice(0, 12)}`
   const uniqueMembers = Array.from(new Set(args.memberIds))
-  await pool.query(
-    `INSERT INTO conversations (id, kind, title, members, company_id, topic)
-     VALUES ($1, 'email', $2, $3::jsonb, $4, $5)`,
-    [id, cleanSubject.slice(0, 200), JSON.stringify(uniqueMembers), args.companyId, cleanSubject.slice(0, 200)],
-  )
-  return { conversationId: id, created: true }
+  const concreteMembers = uniqueMembers.filter((id) => !id.startsWith('external:')).sort()
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    if (concreteMembers.length > 0) {
+      const active = await client.query<{ id: string }>(
+        `SELECT id FROM participants
+          WHERE company_id = $1 AND id = ANY($2::text[])
+            AND kind IN ('agent', 'human') AND departed_at IS NULL
+          ORDER BY id FOR SHARE`,
+        [args.companyId, concreteMembers],
+      )
+      if (active.rows.length !== concreteMembers.length) {
+        throw new Error('email conversation contains a foreign or departed participant')
+      }
+    }
+
+    const candidates = [args.inReplyTo, ...args.references]
+      .map((x) => normalizeMessageId(x))
+      .filter((x): x is string => Boolean(x))
+    const existing = await findEmailConversationByMessageIds(candidates, args.companyId, client)
+    if (existing) {
+      // Membership repair is serialized with participant moves and validates
+      // every concrete member before extending the JSON array.
+      await client.query(
+        `UPDATE conversations
+            SET members = (
+              SELECT to_jsonb(ARRAY(
+                SELECT DISTINCT m FROM (
+                  SELECT jsonb_array_elements_text(members) AS m
+                  UNION
+                  SELECT unnest($2::text[]) AS m
+                ) u
+              ))
+            )
+          WHERE id = $1 AND company_id = $3`,
+        [existing, uniqueMembers, args.companyId],
+      )
+      await client.query('COMMIT')
+      return { conversationId: existing, created: false }
+    }
+
+    const cleanSubject = args.subject.replace(/^\s*((re|fwd|fw)\s*:\s*)+/i, '').trim() || '(no subject)'
+    const id = `email-${randomUUID().slice(0, 12)}`
+    await client.query(
+      `INSERT INTO conversations (id, kind, title, members, company_id, topic)
+       VALUES ($1, 'email', $2, $3::jsonb, $4, $5)`,
+      [id, cleanSubject.slice(0, 200), JSON.stringify(uniqueMembers), args.companyId, cleanSubject.slice(0, 200)],
+    )
+    await client.query('COMMIT')
+    return { conversationId: id, created: true }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 /** Bump (or create) the email_contacts row for an external sender. We

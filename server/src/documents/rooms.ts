@@ -15,6 +15,7 @@
  * twice is a no-op.
  */
 import * as Y from 'yjs'
+import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
 import {
   redis, sub, publish,
@@ -67,8 +68,11 @@ const evictions = new Map<string, NodeJS.Timeout>()
  *  echo-suppressed when they originated here. */
 const INSTANCE_ORIGIN = `instance:${env.INSTANCE_ID}`
 
-async function loadSnapshot(documentId: string): Promise<{ state: Uint8Array | null; lastIncluded: bigint }> {
-  const { rows } = await pool.query<{ state_bytes: Buffer; snapshot_at_update_id: string }>(
+async function loadSnapshot(
+  documentId: string,
+  dbClient?: PoolClient,
+): Promise<{ state: Uint8Array | null; lastIncluded: bigint }> {
+  const { rows } = await (dbClient ?? pool).query<{ state_bytes: Buffer; snapshot_at_update_id: string }>(
     `SELECT state_bytes, snapshot_at_update_id
        FROM document_snapshots
       WHERE document_id = $1`,
@@ -82,8 +86,9 @@ async function loadSnapshot(documentId: string): Promise<{ state: Uint8Array | n
 async function loadUpdatesAfter(
   documentId: string,
   afterId: bigint,
+  dbClient?: PoolClient,
 ): Promise<Array<{ id: bigint; bytes: Uint8Array }>> {
-  const { rows } = await pool.query<{ id: string; update_bytes: Buffer }>(
+  const { rows } = await (dbClient ?? pool).query<{ id: string; update_bytes: Buffer }>(
     `SELECT id, update_bytes
        FROM document_updates
       WHERE document_id = $1 AND id > $2
@@ -133,12 +138,23 @@ async function maybeCompact(room: Room): Promise<void> {
   room.updatesSinceSnapshot = 0
 }
 
-async function hydrateDoc(documentId: string, doc: Y.Doc): Promise<void> {
-  const snap = await loadSnapshot(documentId)
-  if (snap.state) Y.applyUpdate(doc, snap.state, 'hydrate')
-  const tail = await loadUpdatesAfter(documentId, snap.lastIncluded)
-  for (const u of tail) {
-    Y.applyUpdate(doc, u.bytes, 'hydrate')
+async function hydrateDoc(documentId: string, doc: Y.Doc, dbClient?: PoolClient): Promise<void> {
+  // A cold load is a two-query logical read. When the caller does not already
+  // own a transaction connection, reserve one for the whole hydration rather
+  // than returning it between snapshot and tail. Otherwise a pool-full wave
+  // of locked CLI callers can occupy every released slot while waiting on the
+  // shared `room.loaded`, leaving each hydration's tail query queued behind
+  // the callers that depend on it.
+  const client = dbClient ?? await pool.connect()
+  try {
+    const snap = await loadSnapshot(documentId, client)
+    if (snap.state) Y.applyUpdate(doc, snap.state, 'hydrate')
+    const tail = await loadUpdatesAfter(documentId, snap.lastIncluded, client)
+    for (const u of tail) {
+      Y.applyUpdate(doc, u.bytes, 'hydrate')
+    }
+  } finally {
+    if (!dbClient) client.release()
   }
 }
 
@@ -146,7 +162,11 @@ function roomKey(documentId: string): string {
   return documentId
 }
 
-async function getOrCreateRoom(documentId: string, companyId: string): Promise<Room> {
+async function getOrCreateRoom(
+  documentId: string,
+  companyId: string,
+  dbClient?: PoolClient,
+): Promise<Room> {
   // Clear any pending eviction — we're reusing the warm room.
   const pending = evictions.get(documentId)
   if (pending) { clearTimeout(pending); evictions.delete(documentId) }
@@ -167,10 +187,11 @@ async function getOrCreateRoom(documentId: string, companyId: string): Promise<R
     hydrated: false,
     loaded: Promise.resolve(),
   }
-  rooms.set(roomKey(documentId), room)
+  const key = roomKey(documentId)
+  rooms.set(key, room)
 
   room.loaded = (async () => {
-    await hydrateDoc(documentId, doc)
+    await hydrateDoc(documentId, doc, dbClient)
     room.hydrated = true
     doc.on('update', (update: Uint8Array, origin: unknown) => {
       // Hydration replays are tagged 'hydrate' to skip persistence + fan-out.
@@ -214,7 +235,14 @@ async function getOrCreateRoom(documentId: string, companyId: string): Promise<R
     })
     normalizeMarkdownImageParagraphs(doc, pmFragment(doc), { originId: 'system:doc-image-normalize', authorId: 'system' })
     await refreshDocumentImageUrls(doc, pmFragment(doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
-  })()
+  })().catch((error) => {
+    // Never cache a rejected hydration promise. A transient DB timeout or a
+    // corrupt row must fail the current waiters, but a later request should be
+    // able to build a fresh room after the underlying problem is corrected.
+    if (rooms.get(key) === room) rooms.delete(key)
+    room.doc.destroy()
+    throw error
+  })
 
   await room.loaded
   return room
@@ -258,8 +286,9 @@ export async function applyLocalUpdate(
   originId: string,
   authorId: string,
   update: Uint8Array,
+  dbClient?: PoolClient,
 ): Promise<void> {
-  const room = await getOrCreateRoom(documentId, companyId)
+  const room = await getOrCreateRoom(documentId, companyId, dbClient)
   // origin carries everything the persistence hook needs to route the
   // event correctly. Plain object so the `remote` discriminator is absent
   // (i.e. it's a LOCAL update — must persist + fan-out).
@@ -596,8 +625,12 @@ function fragmentToPlainText(fragment: Y.XmlFragment): string {
 /** Read-only access to the doc's current plain-text body. Used by REST
  *  bootstrap responses + agent tools that don't want to hold a WS
  *  session. Extracted by walking the ProseMirror fragment. */
-export async function readDocumentText(documentId: string, companyId: string): Promise<string> {
-  const room = await getOrCreateRoom(documentId, companyId)
+export async function readDocumentText(
+  documentId: string,
+  companyId: string,
+  dbClient?: PoolClient,
+): Promise<string> {
+  const room = await getOrCreateRoom(documentId, companyId, dbClient)
   await refreshDocumentImageUrls(room.doc, pmFragment(room.doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
   return fragmentToPlainText(pmFragment(room.doc))
 }
@@ -701,8 +734,9 @@ export async function applyAgentEdit(
     | { kind: 'image'; src: string; alt: string | null; placement: AgentImagePlacement }
     | { kind: 'imageDelete'; match: AgentImageDeleteMatch }
   >,
+  dbClient?: PoolClient,
 ): Promise<{ replaced: number; imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null; imagesDeleted: number; blocksReplaced: number }> {
-  const room = await getOrCreateRoom(documentId, companyId)
+  const room = await getOrCreateRoom(documentId, companyId, dbClient)
   const fragment = pmFragment(room.doc)
   let replaced = 0
   let imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null = null

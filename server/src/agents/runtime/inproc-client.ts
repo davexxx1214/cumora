@@ -14,7 +14,8 @@
  * The pod-side HttpRuntimeClient (Phase 3) will speak the same shapes
  * over HTTP.
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { pool } from '../../db/pool.js'
 import { CH_MESSAGE_NEW, CH_TYPING, publish, redis } from '../../redis.js'
 import { notifyAlert } from '../../alerting.js'
@@ -45,7 +46,6 @@ async function refreshAttachmentUrls(rows: ReadonlyArray<{ attachment?: unknown 
 const inprocBusyHeartbeatFailures = new Map<string, number>()
 const INPROC_BUSY_HEARTBEAT_ALERT_THRESHOLD = 5
 import { companyIdForConversation } from '../../tenant.js'
-import { nextConversationSequence } from '../membership.js'
 import { getPersona } from '../personas.js'
 import {
   setStatus as setStatusImpl,
@@ -153,21 +153,38 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     try {
       await client.query('SET enable_seqscan = off')
       const res = await client.query<InboxRow>(
-      `WITH convos AS (
+      `WITH requesting_agent AS MATERIALIZED (
+         SELECT company_id
+           FROM participants
+          WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL
+       ),
+       convos AS (
          SELECT c.id, c.company_id,
                 c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
                 c.project_id, pr.name AS project_name,
                 COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz) AS lr_at,
                 COALESCE(cr.last_read_message_id, '') AS lr_id,
+                c.members @> to_jsonb(ARRAY[$1::text]) AS current_member,
                 EXISTS (
                   SELECT 1 FROM conversation_mutes mu
                    WHERE mu.user_id = $1 AND mu.conversation_id = c.id
                      AND (mu.muted_until IS NULL OR mu.muted_until > NOW())
                 ) AS muted
-           FROM conversations c
+           FROM requesting_agent ra
+           JOIN conversations c ON c.company_id = ra.company_id
            LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
            LEFT JOIN projects pr ON pr.id = c.project_id
           WHERE c.members @> to_jsonb(ARRAY[$1::text])
+             OR EXISTS (
+               SELECT 1
+                 FROM messages delivered
+                WHERE delivered.conversation_id = c.id
+                  AND delivered.delivery_recipient_id = $1
+                  AND ROW(delivered.created_at, delivered.id) > ROW(
+                    COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz),
+                    COALESCE(cr.last_read_message_id, '')
+                  )
+             )
        )
        SELECT
           m.id, m.conversation_id, co.company_id,
@@ -191,14 +208,18 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
            -- last_read_message_id as a tiebreaker for same-instant messages.
            SELECT * FROM messages mm
             WHERE mm.conversation_id = co.id
-              AND mm.author_id <> $1
               AND (
-                mm.agent_recipient_ids IS NULL
-                OR mm.agent_recipient_ids @> to_jsonb(ARRAY[$1::text])
+                (
+                  co.current_member
+                  AND (mm.agent_recipient_ids IS NULL OR mm.agent_recipient_ids @> to_jsonb(ARRAY[$1::text]))
+                )
+                OR mm.delivery_recipient_id = $1
               )
+              AND (mm.author_id <> $1 OR mm.delivery_recipient_id = $1)
               AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
               AND (
-                NOT co.muted
+                mm.delivery_recipient_id = $1
+                OR NOT co.muted
                 OR co.conversation_kind = 'direct'
                 OR EXISTS (
                   SELECT 1 FROM regexp_matches(mm.body, '@([[:alnum:]_-]+)', 'g') mention
@@ -614,25 +635,6 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     }
   }
 
-  /** Is `agentId` a member of `conversationId`, scoped to `companyId` when
-   *  given? Used to keep JWT-pinned writes (e.g. postSystemNotice) from
-   *  touching conversations the caller isn't in. */
-  async isConversationMember(
-    conversationId: string,
-    agentId: string,
-    companyId?: string | null,
-  ): Promise<boolean> {
-    const { rows } = await pool.query<{ ok: boolean }>(
-      `SELECT 1 AS ok FROM conversations
-        WHERE id = $1
-          AND ($3::text IS NULL OR company_id = $3)
-          AND members @> to_jsonb(ARRAY[$2::text])
-        LIMIT 1`,
-      [conversationId, agentId, companyId ?? null],
-    )
-    return rows.length > 0
-  }
-
   async postSystemNotice(args: {
     conversationId: string
     companyId?: string | null
@@ -641,41 +643,113 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     text: string
     dedupeKey: string
     dedupeTtlSec: number
-  }): Promise<{ posted: boolean }> {
-    // NX/EX deduplication: first caller to set the key wins and posts the
-    // notice; everyone else gets `posted: false`. The key namespace lives
-    // entirely in Redis so it auto-expires and survives across pods.
-    const lockKey = `notice:${args.dedupeKey}`
-    const acquired = await redis.set(
-      lockKey, args.agentId,
-      'EX', args.dedupeTtlSec,
-      'NX',
-    )
-    if (acquired !== 'OK') return { posted: false }
-
+  }): Promise<{ posted: boolean; authorized: boolean }> {
+    const companyId = args.companyId
+      ?? await companyIdForConversation(args.conversationId)
+    if (!companyId) return { posted: false, authorized: false }
+    const ttlSec = Math.max(1, Math.min(Math.floor(args.dedupeTtlSec), 7 * 24 * 3600))
+    const dedupeFingerprint = createHash('sha256')
+      .update(`${companyId}\0${args.conversationId}\0${args.dedupeKey}`)
+      .digest('hex')
+    const clientId = `runtime-notice:${dedupeFingerprint}`
     const messageId = `m-${randomUUID()}`
-    const sequence = await nextConversationSequence(args.conversationId)
     const body = JSON.stringify({
       kind: 'notice',
       noticeKind: args.noticeKind,
       text: args.text,
     })
-    await pool.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-       VALUES ($1,$2,$3,'system',$4,$5,$6)`,
-      [messageId, args.conversationId, args.agentId, body, sequence, args.companyId ?? null],
-    )
+    let sequence = 0
+    let posted = false
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const participant = await client.query(
+        `SELECT id FROM participants
+          WHERE id = $1 AND company_id = $2
+            AND kind = 'agent' AND departed_at IS NULL
+          FOR SHARE`,
+        [args.agentId, companyId],
+      )
+      if (!participant.rowCount) {
+        await client.query('ROLLBACK')
+        return { posted: false, authorized: false }
+      }
+      const conversation = await client.query(
+        `SELECT id FROM conversations
+          WHERE id = $1 AND company_id = $2
+            AND members @> to_jsonb(ARRAY[$3::text])
+          FOR UPDATE`,
+        [args.conversationId, companyId, args.agentId],
+      )
+      if (!conversation.rowCount) {
+        await client.query('ROLLBACK')
+        return { posted: false, authorized: false }
+      }
+
+      // PostgreSQL is the durable idempotency boundary. The advisory lock
+      // serializes all agents using the same room/key, while client_id lets a
+      // committed notice survive Redis/process failures. Clear only expired
+      // markers so the original rolling TTL semantics remain intact.
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext('runtime-notice'), hashtext($1))`,
+        [dedupeFingerprint],
+      )
+      await client.query(
+        `UPDATE messages SET client_id = NULL
+          WHERE conversation_id = $1 AND client_id = $2
+            AND created_at <= NOW() - make_interval(secs => $3::int)`,
+        [args.conversationId, clientId, ttlSec],
+      )
+      const recent = await client.query(
+        `SELECT 1 FROM messages
+          WHERE conversation_id = $1 AND client_id = $2
+            AND created_at > NOW() - make_interval(secs => $3::int)
+          LIMIT 1`,
+        [args.conversationId, clientId, ttlSec],
+      )
+      if (recent.rowCount) {
+        await client.query('COMMIT')
+        return { posted: false, authorized: true }
+      }
+
+      const seqRes = await client.query<{ seq: number }>(
+        `INSERT INTO conversation_counters (conversation_id, next_sequence)
+         VALUES ($1, 2)
+         ON CONFLICT (conversation_id) DO UPDATE
+           SET next_sequence = conversation_counters.next_sequence + 1
+         RETURNING next_sequence - 1 AS seq`,
+        [args.conversationId],
+      )
+      sequence = seqRes.rows[0]?.seq ?? 1
+      await client.query(
+        `INSERT INTO messages
+          (id, conversation_id, author_id, kind, body, sequence, company_id, client_id)
+         VALUES ($1,$2,$3,'system',$4,$5,$6,$7)`,
+        [messageId, args.conversationId, args.agentId, body, sequence, companyId, clientId],
+      )
+      await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [args.conversationId])
+      await client.query('COMMIT')
+      posted = true
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
+
     await publish(CH_MESSAGE_NEW, {
       type: 'message.new',
       conversationId: args.conversationId,
-      companyId: args.companyId ?? undefined,
+      companyId,
       message: {
         id: messageId, conversationId: args.conversationId, authorId: args.agentId,
         kind: 'system', body, sequence,
         at: new Date().toISOString(),
       },
+    }).catch((error) => {
+      console.warn(`[runtime] durable notice ${messageId} committed but publish failed`, error)
     })
-    return { posted: true }
+    return { posted, authorized: true }
   }
 
   // ─── Steering busy heartbeat ──────────────────────────────────────
@@ -984,18 +1058,31 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
 
   async markConversationRead(args: {
     agentId: string
+    companyId?: string | null
     conversationId: string
     upToMessageId: string
-  }): Promise<void> {
+  }, dbClient?: PoolClient): Promise<void> {
     // Monotonic advance via ROW comparison: only update the cursor
     // when the incoming (created_at, message_id) pair lexicographically
     // exceeds the existing pair. This makes the operation idempotent,
     // out-of-order safe, AND collision-safe — two messages with the
     // same created_at are distinguishable by id.
     try {
-      await pool.query(
+      await (dbClient ?? pool).query(
         `WITH msg AS (
-           SELECT created_at, id AS message_id FROM messages WHERE id = $1
+           SELECT m.created_at, m.id AS message_id
+             FROM messages m
+             JOIN conversations c
+               ON c.id = m.conversation_id AND c.company_id = m.company_id
+             JOIN participants p
+               ON p.id = $2 AND p.company_id = c.company_id
+              AND p.kind = 'agent' AND p.departed_at IS NULL
+            WHERE m.id = $1 AND m.conversation_id = $3
+              AND ($4::text IS NULL OR c.company_id = $4)
+              AND (
+                c.members @> to_jsonb(ARRAY[$2::text])
+                OR (m.kind = 'system' AND m.delivery_recipient_id = $2)
+              )
          )
          INSERT INTO conversation_reads (user_id, conversation_id, last_read_at, last_read_message_id)
          SELECT $2, $3, msg.created_at, msg.message_id FROM msg
@@ -1009,9 +1096,10 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
              WHEN ROW(EXCLUDED.last_read_at, EXCLUDED.last_read_message_id)
                 > ROW(conversation_reads.last_read_at, conversation_reads.last_read_message_id)
              THEN EXCLUDED.last_read_message_id ELSE conversation_reads.last_read_message_id END`,
-        [args.upToMessageId, args.agentId, args.conversationId],
+        [args.upToMessageId, args.agentId, args.conversationId, args.companyId ?? null],
       )
     } catch (err) {
+      if (dbClient) throw err
       console.warn(`[runtime] markConversationRead(${args.agentId}, ${args.conversationId}, ${args.upToMessageId}) failed — dropping`,
         err instanceof Error ? err.message : err)
     }

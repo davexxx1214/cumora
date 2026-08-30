@@ -377,6 +377,126 @@ test('[integration] runtime: /inbox-triage/payload rejects a stale token before 
   assert.match(String(r.body?.error ?? ''), /token tenant/i)
 })
 
+test('[integration] runtime: a current token cannot use a stale member id to read or write the old tenant through /cli', async () => {
+  const originalTenant = await seedAgent()
+  const currentTenant = await seedAgent()
+  const oldPeerId = `a-old-peer-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status)
+     VALUES ($1,$2,'agent',$1,'peer','P','#abcdef','avail')`,
+    [oldPeerId, originalTenant.companyId],
+  )
+  const oldConversationId = await seedContextConversation({
+    companyId: originalTenant.companyId,
+    members: [originalTenant.agentId],
+    authorId: originalTenant.agentId,
+    body: 'old-runtime-tenant-secret',
+  })
+  await pool.query(
+    `UPDATE conversations SET topic = 'old-runtime-topic-secret' WHERE id = $1`,
+    [oldConversationId],
+  )
+  const { rows: oldMessageRows } = await pool.query<{ id: string }>(
+    `SELECT id FROM messages WHERE conversation_id = $1 AND kind = 'text' LIMIT 1`,
+    [oldConversationId],
+  )
+  const oldMessageId = oldMessageRows[0].id
+  const oldPollId = `m-${randomUUID()}`
+  await pool.query(
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, poll, company_id)
+     VALUES ($1,$2,$3,'poll','old-runtime-poll-secret',2,$4::jsonb,$5)`,
+    [
+      oldPollId,
+      oldConversationId,
+      originalTenant.agentId,
+      JSON.stringify({
+        question: 'old-runtime-poll-secret', mode: 'single',
+        options: [{ id: 'opt-one', text: 'one' }, { id: 'opt-two', text: 'two' }],
+        expiresAt: null, closedAt: null, closedReason: null,
+      }),
+      originalTenant.companyId,
+    ],
+  )
+
+  const moved = await pool.query(
+    `UPDATE participants SET company_id = $1 WHERE id = $2 AND company_id = $3`,
+    [currentTenant.companyId, originalTenant.agentId, originalTenant.companyId],
+  )
+  assert.equal(moved.rowCount, 1)
+  const currentToken = signAgentToken({
+    agentId: originalTenant.agentId,
+    companyId: currentTenant.companyId,
+  })
+
+  for (const argv of [
+    ['conversations', '--json'],
+    ['messages', oldConversationId, '--json'],
+    ['members', oldConversationId, '--json'],
+    ['glance', oldConversationId, '--json'],
+    ['topic', oldConversationId],
+    ['search', 'old-runtime', '--json'],
+    ['react', oldMessageId, '👀'],
+    ['poll', 'show', oldPollId],
+    ['poll', 'vote', oldPollId, 'opt-one'],
+    ['poll', 'close', oldPollId],
+    ['poll', 'create', oldConversationId, 'must-not-land', 'one', 'two'],
+    ['dm', oldPeerId, 'forbidden', 'must-not-land'],
+    ['pull-group', 'forbidden', '--members', oldPeerId, '--reason', 'must-not-land', '--say', 'must-not-land'],
+    ['reply', oldConversationId, 'must-not-land'],
+    ['topic-set', oldConversationId, 'must-not-land'],
+    ['rename', oldConversationId, 'must-not-land'],
+  ]) {
+    const r = await call('/runtime/cli', { token: currentToken, body: { argv } })
+    assert.equal(r.status, 200, argv.join(' '))
+    assert.doesNotMatch(
+      String(r.body?.text ?? ''),
+      /old-runtime-(tenant|topic|poll)-secret/,
+      argv.join(' '),
+    )
+  }
+
+  const { rows } = await pool.query<{ body: string; topic: string | null; title: string }>(
+    `SELECT m.body, c.topic, c.title
+       FROM conversations c
+      JOIN messages m ON m.conversation_id = c.id AND m.kind = 'text'
+      WHERE c.id = $1
+      ORDER BY m.sequence ASC`,
+    [oldConversationId],
+  )
+  assert.deepEqual(rows, [{
+    body: 'old-runtime-tenant-secret',
+    topic: 'old-runtime-topic-secret',
+    title: `Context ${oldConversationId}`,
+  }])
+  const { rows: sideEffects } = await pool.query<{
+    reactions: number; votes: number; message_count: number; closed_at: string | null
+  }>(
+    `SELECT
+       (SELECT COUNT(*)::int FROM message_reactions WHERE message_id = $1) AS reactions,
+       (SELECT COUNT(*)::int FROM poll_votes WHERE message_id = $2) AS votes,
+       (SELECT COUNT(*)::int FROM messages WHERE conversation_id = $3) AS message_count,
+       (SELECT poll->>'closedAt' FROM messages WHERE id = $2) AS closed_at`,
+    [oldMessageId, oldPollId, oldConversationId],
+  )
+  assert.deepEqual(sideEffects[0], {
+    reactions: 0, votes: 0, message_count: 2, closed_at: null,
+  })
+  const forbiddenConversations = await pool.query(
+    `SELECT 1 FROM conversations
+      WHERE company_id = $1
+        AND (
+          pulled_by ->> 'agentId' = $2
+          OR (
+            kind = 'direct'
+            AND members @> to_jsonb(ARRAY[$2::text])
+            AND members @> to_jsonb(ARRAY[$3::text])
+          )
+        )`,
+    [currentTenant.companyId, originalTenant.agentId, oldPeerId],
+  )
+  assert.equal(forbiddenConversations.rowCount, 0)
+})
+
 test('[integration] runtime: /cli rejects email server-path attachments before storage or mail side effects', async () => {
   const { token } = await seedAgent()
   const root = await mkdtemp(join(tmpdir(), 'cumora-email-attachment-'))

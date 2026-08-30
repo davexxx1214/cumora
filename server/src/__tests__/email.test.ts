@@ -19,6 +19,7 @@ import {
   formatAddress,
   normalizeMessageId,
   computeAgentAddress,
+  sendViaProvider,
 } from '../email.js'
 
 /* ============================== sanitizeSubject ============================ */
@@ -206,4 +207,36 @@ test('computeAgentAddress strips dots from id portion', () => {
   // The id portion ("a.b.c") gets sanitized — dots removed (replaced with -).
   // The slug separator remains the LAST dot only.
   assert.equal(addr.split('@')[0].split('.').length, 2, `expected exactly one dot separator, got: ${addr}`)
+})
+
+test('sendViaProvider derives a stable Resend idempotency key from Message-ID', async () => {
+  const savedFetch = globalThis.fetch
+  const savedKey = process.env.RESEND_API_KEY
+  const requestHeaders: Headers[] = []
+  process.env.RESEND_API_KEY = 're_test_only'
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestHeaders.push(new Headers(init?.headers))
+    return new Response(JSON.stringify({ id: 'provider-test-id' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }) as typeof fetch
+  try {
+    const result = await sendViaProvider({
+      from: 'sender@example.com',
+      to: ['recipient@example.com'],
+      subject: 'idempotent',
+      text: 'body',
+      messageId: 'stable-message@example.com',
+    })
+    assert.equal(result.ok, true)
+    assert.equal(
+      requestHeaders[0]?.get('idempotency-key'),
+      'cumora-email/stable-message@example.com',
+    )
+  } finally {
+    globalThis.fetch = savedFetch
+    if (savedKey === undefined) delete process.env.RESEND_API_KEY
+    else process.env.RESEND_API_KEY = savedKey
+  }
 })

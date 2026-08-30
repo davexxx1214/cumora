@@ -27,6 +27,9 @@ export const messages = pgTable(
     tool: jsonb('tool').$type<Record<string, unknown> | null>(),
     attachment: jsonb('attachment').$type<Record<string, unknown> | null>(),
     clientId: text('client_id'),
+    // Durable one-shot delivery for departure notices after membership is
+    // removed. Ordinary messages leave this null.
+    deliveryRecipientId: text('delivery_recipient_id'),
     poll: jsonb('poll').$type<PollPayload | null>(),
     // Reply-to / quote target: id of another message in THIS conversation that
     // this message is quoting. Soft FK to messages.id with ON DELETE SET NULL
@@ -42,6 +45,9 @@ export const messages = pgTable(
     clientIdIdx: uniqueIndex('uniq_messages_client_id')
       .on(table.conversationId, table.authorId, table.clientId)
       .where(sql`${table.clientId} IS NOT NULL`),
+    deliveryRecipientIdx: index('idx_messages_delivery_recipient')
+      .on(table.deliveryRecipientId, table.createdAt, table.id)
+      .where(sql`${table.deliveryRecipientId} IS NOT NULL`),
   }),
 )
 

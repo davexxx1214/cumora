@@ -344,9 +344,10 @@ export interface AgentRuntimeClient {
    *  Body shape: `{ kind: 'notice', noticeKind, text }` — SystemRow renders
    *  the text as a centered italic line.
    *
-   *  `dedupeKey` + `dedupeTtlSec` deduplicate via Redis NX/EX so multiple
-   *  agents 429-ing in the same room don't all post the same notice. Returns
-   *  `{ posted }` — false when the dedupe window swallowed it. */
+   *  `dedupeKey` + `dedupeTtlSec` use a durable PostgreSQL idempotency marker
+   *  so multiple agents failing in the same room do not post duplicates, even
+   *  across Redis/process failures. Returns `{ posted }` — false when the
+   *  dedupe window swallowed it. */
   postSystemNotice(args: {
     conversationId: string
     companyId?: string | null
@@ -383,6 +384,7 @@ export interface AgentRuntimeClient {
    *  cursor is already past, this is a no-op. */
   markConversationRead(args: {
     agentId: string
+    companyId?: string | null
     conversationId: string
     upToMessageId: string
   }): Promise<void>

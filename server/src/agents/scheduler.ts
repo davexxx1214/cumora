@@ -24,7 +24,6 @@ import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { CH_MESSAGE_NEW, CH_POLLS, CH_TYPING, publish, redis, sub, type MessageNewEvent, type PollUpdatedEvent } from '../redis.js'
 import { notifyAlert } from '../alerting.js'
-import { isAgent } from './personas.js'
 import { ensurePod } from './runtime/orchestrator.js'
 import { resolveAgentHost, isByoaKind } from './computer/registry.js'
 import { companyTier } from '../tier.js'
@@ -272,6 +271,39 @@ export function _resetLowPriorityWakeBudgetForTests(): void {
   lowPriWindowStart = 0
   lowPriUsed = 0
   lowPriDroppedInWindow = 0
+}
+
+/** Resolve the exceptional recipient on a departure notice. The pubsub payload
+ * is only a hint: an attacker or buggy publisher cannot add an arbitrary wake
+ * target because the exact message, conversation, tenant, persisted recipient,
+ * and active-agent row must all agree in Postgres. Exported for the delivery
+ * contract regression test. */
+export async function resolveDurableDeliveryAgent(args: {
+  conversationId: string
+  messageId: string
+  companyId: string | undefined
+  claimedRecipientId: string | undefined
+}): Promise<string | null> {
+  if (!args.companyId || !args.claimedRecipientId) return null
+  const { rows } = await pool.query<{ delivery_recipient_id: string }>(
+    `SELECT dm.delivery_recipient_id
+       FROM messages dm
+       JOIN conversations c
+         ON c.id = dm.conversation_id
+        AND c.company_id = $3
+       JOIN participants p
+         ON p.id = dm.delivery_recipient_id
+        AND p.company_id = c.company_id
+        AND p.kind = 'agent'
+        AND p.departed_at IS NULL
+      WHERE dm.id = $1
+        AND dm.conversation_id = $2
+        AND dm.kind = 'system'
+        AND dm.delivery_recipient_id = $4
+      LIMIT 1`,
+    [args.messageId, args.conversationId, args.companyId, args.claimedRecipientId],
+  )
+  return rows[0]?.delivery_recipient_id ?? null
 }
 
 async function wakeOne(
@@ -551,8 +583,14 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     steerPayload = { messageId, conversationId, authorName, body: messageBody, companyId: payload.companyId ?? '' }
   }
 
-  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string; muted_agent_ids: string[]; agent_recipient_ids: string[] | null }>(
-    `SELECT c.members, c.kind, msg.agent_recipient_ids,
+  const { rows: convoRows } = await pool.query<{
+    members: string[]
+    kind: string
+    company_id: string
+    muted_agent_ids: string[]
+    agent_recipient_ids: string[] | null
+  }>(
+    `SELECT c.members, c.kind, c.company_id, msg.agent_recipient_ids,
             COALESCE(array_agg(mu.user_id) FILTER (WHERE mu.user_id IS NOT NULL), ARRAY[]::text[]) AS muted_agent_ids
        FROM conversations c
        LEFT JOIN messages msg ON msg.id = $2 AND msg.conversation_id = c.id
@@ -563,7 +601,9 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     [conversationId, messageId],
   )
   const conversation = convoRows[0]
+  if (!conversation) return
   const members = conversation?.members ?? []
+  if (steerPayload) steerPayload.companyId = conversation.company_id
   const mutedAgentIds = new Set(conversation?.muted_agent_ids ?? [])
   // The DB row is authoritative so a daemon restart or missed SSE cannot
   // turn a named mention back into a broadcast. Synthetic/legacy rows have
@@ -578,10 +618,19 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     )
     quotedAuthorId = rows[0]?.author_id ?? null
   }
+  const { rows: currentAgentRows } = await pool.query<{ id: string }>(
+    `SELECT id FROM participants
+      WHERE company_id = $1 AND kind = 'agent' AND departed_at IS NULL
+        AND id = ANY($2::text[])`,
+    [conversation.company_id, members],
+  )
+  const currentAgents = new Set(currentAgentRows.map((row) => row.id))
   const agentRecipients: string[] = []
   for (const m of members) {
     if (m === authorId) continue
-    if (!(await isAgent(m))) continue
+    // Treat conversations.members as untrusted denormalized data. A malformed
+    // cross-tenant id must never become a wake/steer recipient for this tenant.
+    if (!currentAgents.has(m)) continue
     if (routedAgentSet && !routedAgentSet.has(m)) continue
     if (mutedAgentIds.has(m) && !shouldDeliverToMutedAgent({
       agentId: m,
@@ -598,7 +647,12 @@ async function wake(payload: MessageNewEvent): Promise<void> {
   // floor: when an AGENT's message would wake peers, drop the wake for any
   // recipient that is over its activation budget, so a runaway can't burn
   // unbounded cost. Human-driven wakes are NEVER throttled.
-  const authorIsAgent = await isAgent(authorId)
+  const authorIsAgent = currentAgents.has(authorId) || Boolean((await pool.query(
+    `SELECT 1 FROM participants
+      WHERE id = $1 AND company_id = $2
+        AND kind = 'agent' AND departed_at IS NULL`,
+    [authorId, conversation.company_id],
+  )).rowCount)
   let recipients = agentRecipients
   if (authorIsAgent) {
     const allowed = await Promise.all(
@@ -609,6 +663,23 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     if (dropped > 0) {
       console.warn(`[scheduler] turn-rate floor: dropped ${dropped} agent-driven wake(s) in ${conversationId} (over ${AGENT_TURN_RATE_PER_MINUTE}/min)`)
     }
+  }
+
+  // A leave/kick commits the membership removal before this event is
+  // published, so the departing agent no longer appears in `members`. The
+  // persisted message may name one durable delivery recipient; the query
+  // above validates that it is an active agent in this conversation's tenant
+  // before we restore it to fan-out. Departure explanations bypass mute and
+  // the agent-authored cost floor because this is the final access-revocation
+  // notice, not ordinary conversation chatter.
+  const deliveryAgentId = await resolveDurableDeliveryAgent({
+    conversationId,
+    messageId,
+    companyId: conversation.company_id,
+    claimedRecipientId: payload.message.deliveryRecipientId,
+  })
+  if (deliveryAgentId && !recipients.includes(deliveryAgentId)) {
+    recipients = [...recipients, deliveryAgentId]
   }
 
   // ROUTING (#70). A human message that explicitly NAMES agents is usually for
@@ -631,7 +702,7 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     const uniqueTargets = [...new Set(targets)]
     if (uniqueTargets.length > 0) {
       const mode = await routeMessage({
-        companyId: payload.companyId ?? null,
+        companyId: conversation.company_id,
         body: messageBody,
         conversationKind: conversation?.kind ?? 'group',
         candidates: recipients,
@@ -655,7 +726,12 @@ async function wake(payload: MessageNewEvent): Promise<void> {
   // ordinary messages wake every subscribed, non-muted agent at the same
   // time, like a Slack room. Explicit named mentions are narrowed before
   // fan-out. A muted agent only passes through for an exact mention or quote.
-  await fanOutWake(recipients, conversationId, steerPayload)
+  await fanOutWake(
+    recipients,
+    conversationId,
+    steerPayload,
+    deliveryAgentId ? { recipientId: deliveryAgentId, messageId } : null,
+  )
 }
 
 /** Muted rooms are genuinely absent from an agent's delivery stream. The
@@ -702,12 +778,35 @@ function renderTriageNote(verdict: InboxTriageVerdict): string {
   return `Small-brain inbox triage (${state}, ${verdict.source}): ${verdict.promptNote.trim()}${reason}`
 }
 
-async function triageWakeRecipient(agentId: string): Promise<WakeOptions | null> {
+export async function triageWakeRecipient(
+  agentId: string,
+  durableDelivery: { conversationId: string; messageId: string } | null = null,
+): Promise<WakeOptions | null> {
   try {
     const persona = await inprocClient.loadPersona(agentId)
     if (!persona) return null
-    const inbox = await inprocClient.loadInbox(agentId)
+    let inbox = await inprocClient.loadInbox(agentId)
     if (inbox.length === 0) return null
+    if (durableDelivery) {
+      const terminal = inbox.find((row) =>
+        row.id === durableDelivery.messageId &&
+        row.conversation_id === durableDelivery.conversationId)
+      if (terminal) {
+        // Managed/cloud agents do not need an expensive main-brain turn for an
+        // informational departure. Consume the exact persisted row here, which
+        // mirrors the BYOA daemon's system-only snapshot+ack path and prevents
+        // the terminal notice from replaying forever or resurfacing after a
+        // later re-invite. Other unread work remains eligible for normal triage.
+        await inprocClient.markConversationRead({
+          agentId,
+          conversationId: terminal.conversation_id,
+          upToMessageId: terminal.id,
+        })
+        console.log(`[scheduler] ${agentId} acknowledged durable departure notice ${terminal.id}`)
+        inbox = inbox.filter((row) => row.id !== terminal.id)
+        if (inbox.length === 0) return null
+      }
+    }
     const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
     const context = await inprocClient.loadContext(agentId, persona.companyId, convoIds)
     const verdict = await classifyInboxTriage({
@@ -737,6 +836,7 @@ export async function fanOutWake(
   recipients: string[],
   conversationId: string,
   steerPayload: SteerWakePayload | null,
+  durableDelivery: { recipientId: string; messageId: string } | null = null,
 ): Promise<void> {
   // Bounded fan-out (env.WAKE_FANOUT_CONCURRENCY). Each recipient's work
   // — host resolve, the support-model triage (3 DB reads + a model call)
@@ -761,7 +861,12 @@ export async function fanOutWake(
       const host = await resolveAgentHost(m).catch(() => ({ kind: null, companyId: null }))
       let triageOptions: WakeOptions | undefined
       if (!isByoaKind(host.kind)) {
-        const verdict = await triageWakeRecipient(m)
+        const verdict = await triageWakeRecipient(
+          m,
+          durableDelivery?.recipientId === m
+            ? { conversationId, messageId: durableDelivery.messageId }
+            : null,
+        )
         if (!verdict) return       // cloud triage said "not relevant" → no wake
         triageOptions = verdict
       }
@@ -847,24 +952,32 @@ export function startScheduler(): void {
 const POLL_VOTE_WAKE_DEBOUNCE_SECONDS = 8
 const POLL_CLOSE_WAKE_CLAIM_SECONDS = 600
 
-async function handlePollUpdated(event: PollUpdatedEvent): Promise<void> {
-  if (!event.companyId) return
+export async function handlePollUpdated(event: PollUpdatedEvent): Promise<boolean> {
+  if (!event.companyId) return false
   const { rows } = await pool.query<{ author_id: string; members: string[] }>(
     `SELECT m.author_id, c.members
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
-      WHERE m.id = $1 AND m.company_id = $2`,
-    [event.messageId, event.companyId],
+       JOIN participants author
+         ON author.id = m.author_id
+        AND author.company_id = c.company_id
+        AND author.kind = 'agent'
+        AND author.departed_at IS NULL
+      WHERE m.id = $1 AND m.company_id = $2
+        AND m.conversation_id = $3
+        AND c.company_id = $2
+        AND c.members @> to_jsonb(ARRAY[m.author_id])`,
+    [event.messageId, event.companyId, event.conversationId],
   )
   const row = rows[0]
-  if (!row) return
+  if (!row) return false
   const authorId = row.author_id
-  // Skip if author isn't an active agent — humans see the tally
-  // update through the WS bridge already.
-  if (!(await isAgent(authorId))) return
+  // The join above is the disclosure boundary: a departed, moved, or kicked
+  // poll author must not receive a later tally containing room membership,
+  // voter identities, or option text.
   // Skip self-wake: if the agent voted on (or closed) their own poll,
   // they already know.
-  if (event.actorId && event.actorId === authorId) return
+  if (event.actorId && event.actorId === authorId) return false
 
   const isClose = Boolean(event.poll.closedAt)
   const claimKey = isClose
@@ -872,7 +985,7 @@ async function handlePollUpdated(event: PollUpdatedEvent): Promise<void> {
     : `cumora:poll-vote-wake-claim:${event.messageId}`
   const claimTtl = isClose ? POLL_CLOSE_WAKE_CLAIM_SECONDS : POLL_VOTE_WAKE_DEBOUNCE_SECONDS
   const claimed = await redis.set(claimKey, '1', 'EX', claimTtl, 'NX').catch(() => null)
-  if (claimed === null) return     // another replica owned this wake, or debounce window still open
+  if (claimed === null) return false // another replica owned this wake, or debounce window still open
 
   // Resolve display names for everyone we plan to surface in the
   // brief — author already excluded, voters from the tallies, and
@@ -881,10 +994,13 @@ async function handlePollUpdated(event: PollUpdatedEvent): Promise<void> {
   for (const t of event.tallies) {
     for (const v of t.voterIds) voterSet.add(v)
   }
-  const pendingIds = row.members.filter((m) => m !== authorId && !voterSet.has(m))
-  const idsToResolve = new Set<string>([...voterSet, ...pendingIds])
+  const idsToResolve = new Set<string>([...row.members, ...voterSet])
   if (event.actorId) idsToResolve.add(event.actorId)
-  const names = await resolveParticipantNames([...idsToResolve])
+  const names = await resolveCurrentParticipantNames([...idsToResolve], event.companyId)
+  const currentIds = new Set(names.keys())
+  const currentVoters = new Set([...voterSet].filter((id) => currentIds.has(id)))
+  const pendingIds = row.members.filter((id) =>
+    id !== authorId && currentIds.has(id) && !currentVoters.has(id))
 
   const brief: PollWakeBrief = {
     messageId: event.messageId,
@@ -894,58 +1010,50 @@ async function handlePollUpdated(event: PollUpdatedEvent): Promise<void> {
     status: isClose ? 'closed' : 'open',
     closedReason: event.poll.closedReason,
     expiresAt: event.poll.expiresAt,
-    totalVotes: event.tallies.reduce((s, t) => s + t.count, 0),
+    totalVotes: event.tallies.reduce(
+      (sum, tally) => sum + tally.voterIds.filter((id) => currentIds.has(id)).length,
+      0,
+    ),
     tallies: event.poll.options.map((opt) => {
       const tally = event.tallies.find((t) => t.optionId === opt.id)
-      const count = tally?.count ?? 0
-      const voters = (tally?.voterIds ?? []).map((id) => ({
+      const voters = (tally?.voterIds ?? []).filter((id) => currentIds.has(id)).map((id) => ({
         id, name: names.get(id) ?? id,
       }))
-      return { optionId: opt.id, text: opt.text, count, voters }
+      return { optionId: opt.id, text: opt.text, count: voters.length, voters }
     }),
     pending: pendingIds.map((id) => ({ id, name: names.get(id) ?? id })),
     actor: {
-      id: event.actorId,
-      name: event.actorId ? (names.get(event.actorId) ?? event.actorId) : null,
+      id: event.actorId && currentIds.has(event.actorId) ? event.actorId : null,
+      name: event.actorId && currentIds.has(event.actorId) ? (names.get(event.actorId) ?? event.actorId) : null,
     },
     phase: isClose ? 'close' : 'vote',
   }
 
   await wakeAgent(authorId, 'poll.updated', event.conversationId, null, { pollBrief: brief })
+  return true
 }
 
-/** Batch-lookup participant display names. Falls back to the id on
- *  miss/error so the brief is always renderable. Uses the same cache
- *  as resolveAuthorName for any ids already there. */
-async function resolveParticipantNames(ids: string[]): Promise<Map<string, string>> {
+/** Resolve only current participants in the poll conversation's tenant.
+ * Conversation member arrays and historical vote rows are denormalized and
+ * may contain legacy foreign/departed ids; never disclose those through a
+ * poll wake. */
+async function resolveCurrentParticipantNames(
+  ids: string[],
+  companyId: string,
+): Promise<Map<string, string>> {
   const out = new Map<string, string>()
   if (ids.length === 0) return out
-  const now = Date.now()
-  const missing: string[] = []
-  for (const id of ids) {
-    const hit = authorNameCache.get(id)
-    if (hit && hit.expiresAt > now) {
-      out.set(id, hit.name)
-    } else {
-      missing.push(id)
-    }
-  }
-  if (missing.length === 0) return out
   try {
     const { rows } = await pool.query<{ id: string; name: string | null }>(
-      `SELECT id, name FROM participants WHERE id = ANY($1::text[])`,
-      [missing],
+      `SELECT id, name FROM participants
+        WHERE company_id = $1 AND id = ANY($2::text[])
+          AND kind IN ('agent', 'human') AND departed_at IS NULL`,
+      [companyId, ids],
     )
     for (const r of rows) {
       const name = r.name || r.id
-      authorNameCache.set(r.id, { name, expiresAt: now + AUTHOR_NAME_CACHE_TTL_MS })
       out.set(r.id, name)
     }
-    for (const id of missing) {
-      if (!out.has(id)) out.set(id, id)     // unresolved → fall back to id
-    }
-  } catch {
-    for (const id of missing) out.set(id, id)
-  }
+  } catch { /* fail closed: an empty map yields no identity disclosure */ }
   return out
 }

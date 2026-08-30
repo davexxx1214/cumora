@@ -186,47 +186,86 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
       display: { name: 'react', arg: '', status: 'error', detail: 'missing args' } }
   }
 
-  // Toggle: if already reacted with this emoji, remove; else add
-  const existing = await pool.query<{ count: string }>(
-    `SELECT COUNT(*)::text AS count FROM message_reactions
-      WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-    [messageId, agentId, emoji],
-  )
-  const action = Number(existing.rows[0]?.count ?? '0') > 0 ? 'removed' : 'added'
-  if (action === 'removed') {
-    await pool.query(
-      `DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-      [messageId, agentId, emoji],
+  // Authorize and toggle in one transaction. Lock order matches membership
+  // mutations (participant first, conversation second), so a concurrent kick,
+  // offboarding, or tenant move either commits first and rejects this reaction,
+  // or waits until this already-authorized write commits.
+  const client = await pool.connect()
+  let action: 'removed' | 'added'
+  let agg: Array<{ emoji: string; count: number; users: string[] }>
+  let conversationId: string
+  let companyId: string
+  try {
+    await client.query('BEGIN')
+    const { rows: authorized } = await client.query<{ conversation_id: string; company_id: string }>(
+      `SELECT m.conversation_id, c.company_id
+         FROM participants requester
+         JOIN conversations c
+           ON c.company_id = requester.company_id
+          AND c.members @> to_jsonb(ARRAY[$2::text])
+         JOIN messages m
+           ON m.conversation_id = c.id
+          AND m.company_id = c.company_id
+        WHERE m.id = $1
+          AND requester.id = $2
+          AND requester.kind = 'agent'
+          AND requester.departed_at IS NULL
+        FOR SHARE OF requester, c, m`,
+      [messageId, agentId],
     )
-  } else {
-    await pool.query(
-      `INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)
-       ON CONFLICT DO NOTHING`,
-      [messageId, agentId, emoji],
-    )
-  }
+    if (!authorized[0]) {
+      await client.query('ROLLBACK')
+      return {
+        ok: false,
+        output: null,
+        error: 'message not found or no longer authorized',
+        durationMs: Date.now() - t0,
+        display: {
+          name: 'react', arg: `${emoji} ${messageId.slice(0, 12)}`,
+          status: 'forbidden', detail: 'message not found or no longer authorized', icon: 'web',
+        },
+      }
+    }
+    conversationId = authorized[0].conversation_id
+    companyId = authorized[0].company_id
 
-  // Aggregate + broadcast. We DON'T compute a `mine` flag server-side:
-  // this row is broadcast to every WS client in the tenant, and "is this
-  // mine" is recipient-specific. The renderer derives it from `users` +
-  // the local user id. (Pre-fix, this query hardcoded user_id = 'yetone'
-  // — dev-seed leakage that made the badge wrong for every real user.)
-  const { rows: agg } = await pool.query<{ emoji: string; count: number; users: string[] }>(
-    `SELECT emoji,
-            COUNT(*)::int AS count,
-            array_agg(user_id ORDER BY user_id) AS users
-       FROM message_reactions WHERE message_id = $1
-       GROUP BY emoji ORDER BY count DESC, emoji ASC`,
-    [messageId],
-  )
-  const { rows: cv } = await pool.query<{ conversation_id: string; company_id: string }>(
-    `SELECT m.conversation_id, c.company_id
-       FROM messages m
-       JOIN conversations c ON c.id = m.conversation_id
-      WHERE m.id = $1`, [messageId],
-  )
-  const conversationId = cv[0]?.conversation_id ?? ''
-  const companyId = cv[0]?.company_id
+    const existing = await client.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM message_reactions
+        WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+      [messageId, agentId, emoji],
+    )
+    action = Number(existing.rows[0]?.count ?? '0') > 0 ? 'removed' : 'added'
+    if (action === 'removed') {
+      await client.query(
+        `DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+        [messageId, agentId, emoji],
+      )
+    } else {
+      await client.query(
+        `INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)
+         ON CONFLICT DO NOTHING`,
+        [messageId, agentId, emoji],
+      )
+    }
+
+    // Aggregate while the authorization locks are still held. We DON'T
+    // compute a `mine` flag server-side: that is recipient-specific.
+    const aggregate = await client.query<{ emoji: string; count: number; users: string[] }>(
+      `SELECT emoji,
+              COUNT(*)::int AS count,
+              array_agg(user_id ORDER BY user_id) AS users
+         FROM message_reactions WHERE message_id = $1
+         GROUP BY emoji ORDER BY count DESC, emoji ASC`,
+      [messageId],
+    )
+    agg = aggregate.rows
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
 
   // Do NOT advance conversation_reads here. A reaction can be a lightweight
   // acknowledgement for long work, and marking the request read before the
@@ -239,6 +278,8 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
     companyId,
     messageId,
     reactions: agg,
+  }).catch((error) => {
+    console.warn(`[react] durable reaction on ${messageId} committed but publish failed`, error)
   })
 
   return {

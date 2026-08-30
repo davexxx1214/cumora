@@ -63,6 +63,22 @@ async function seedFailedOutbound(): Promise<{
   return { messageId, conversationId: conv.conversationId, companyId, agentId }
 }
 
+async function seedSendingOutbound(): Promise<{ messageId: string }> {
+  const { companyId, agentId, agentEmail } = await seedCompanyWithAgent()
+  const conv = await findOrCreateEmailConversation({
+    companyId, inReplyTo: null, references: [], subject: 'outbox pending',
+    memberIds: [agentId],
+  })
+  const { messageId } = await persistEmailMessage({
+    conversationId: conv.conversationId, companyId, authorId: agentId,
+    direction: 'out', transportStatus: 'sending', transportError: null,
+    smtpMessageId: `outbox-${Date.now()}@host`, inReplyTo: null, references: [],
+    subject: 'outbox pending', fromAddr: agentEmail,
+    toAddrs: ['external@example.com'], body: 'recover me', autoSubmitted: true,
+  })
+  return { messageId }
+}
+
 test('[integration] retry worker promotes a failed row to sent when the provider succeeds', async (t) => {
   const { messageId } = await seedFailedOutbound()
   // Swap sendViaProvider via env-mock: empty RESEND_API_KEY → mock mode
@@ -86,6 +102,36 @@ test('[integration] retry worker promotes a failed row to sent when the provider
   assert.equal(rows[0].transport_error, null)
   assert.equal(rows[0].retry_attempts, 1)
   assert.equal(rows[0].next_retry_at, null, 'sent rows must clear next_retry_at to stay out of the retry set')
+})
+
+test('[integration] retry worker recovers a crash-stale sending outbox row', async () => {
+  const { messageId } = await seedSendingOutbound()
+  const scheduled = await pool.query<{ next_retry_at: string | null }>(
+    `SELECT next_retry_at FROM email_messages WHERE message_id = $1`,
+    [messageId],
+  )
+  assert.ok(scheduled.rows[0].next_retry_at, 'sending row must have a recovery deadline')
+  assert.ok(new Date(scheduled.rows[0].next_retry_at!).getTime() > Date.now())
+  await pool.query(
+    `UPDATE email_messages SET next_retry_at = NOW() - INTERVAL '1 second' WHERE message_id = $1`,
+    [messageId],
+  )
+
+  delete process.env.RESEND_API_KEY
+  delete process.env.EMAIL_MOCK_FAIL_RATE
+  const { runRetryTick } = await import('../email-retry.js')
+  const result = await runRetryTick(8)
+  assert.equal(result.attempted, 1)
+  const recovered = await pool.query<{
+    transport_status: string; retry_attempts: number; next_retry_at: string | null;
+  }>(
+    `SELECT transport_status, retry_attempts, next_retry_at
+       FROM email_messages WHERE message_id = $1`,
+    [messageId],
+  )
+  assert.deepEqual(recovered.rows[0], {
+    transport_status: 'sent', retry_attempts: 1, next_retry_at: null,
+  })
 })
 
 test('[integration] retry worker advances backoff on a still-failing send', async () => {

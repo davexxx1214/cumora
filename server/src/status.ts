@@ -37,6 +37,8 @@ export async function setStatus(participantId: string, status: ParticipantStatus
       status,
       statusUpdatedAt: toIso(r.status_updated_at),
       companyId: r.company_id,
+    }).catch((error) => {
+      console.warn(`[status] durable ${participantId}=${status} update committed but publish failed`, error)
     })
   }
 }
@@ -57,5 +59,7 @@ export async function heartbeatStatus(participantId: string, status: Extract<Par
     status,
     statusUpdatedAt: toIso(rows[0].status_updated_at),
     companyId: rows[0].company_id,
+  }).catch((error) => {
+    console.warn(`[status] durable ${participantId} heartbeat committed but publish failed`, error)
   })
 }
