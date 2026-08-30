@@ -1,18 +1,18 @@
-import { randomUUID, createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { CH_CONVO_UPDATED, publish } from '../redis.js'
-import { emptyProjectState, fail, type FileActor, type ProjectFileState } from './model.js'
+import { emptyProjectState, type FileActor, fail, type ProjectFileState } from './model.js'
 import { LocalProjectObjects } from './objects.js'
-import { ProjectFileWorkspace, type FileScope, type FileTransaction } from './workspace.js'
-import { readyProjectGit } from '../project-git/service.js'
+import { type FileScope, type FileTransaction, ProjectFileWorkspace } from './workspace.js'
 
 const SERVER_INSTANCE = randomUUID()
 export const filesEnabled = () => env.PROJECT_FILES_ENABLED
 export type ProjectFileIdentity =
   | { kind: 'human'; id: string; companyId: string; bindingVersion?: string }
   | { kind: 'lease'; token: string }
+  | { kind: 'system'; companyId: string; projectId: string }
 interface ProjectRow { id: string; company_id: string; status: string; file_binding_version: string; file_switching: boolean }
 interface LeaseRow { id: string; agent_id: string; company_id: string; project_id: string; conversation_id: string; binding_version: string; run_id: string }
 const hashToken = (token: string) => createHash('sha256').update(token).digest('hex')
@@ -50,8 +50,7 @@ export async function currentAgentProject(agentId: string, companyId: string, co
     [agentId, conversationId, companyId, JSON.stringify([agentId])])
   if (!rows[0]) fail('NOT_FOUND', 404, 'Conversation not found.')
   const projectId = rows[0].project_id
-  return { projectId, bindingVersion: projectId ? `${projectId}:${rows[0].file_binding_version}` : null,
-    git: projectId ? await readyProjectGit(companyId, projectId) : null }
+  return { projectId, bindingVersion: projectId ? `${projectId}:${rows[0].file_binding_version}` : null }
 }
 
 async function authorize(client: PoolClient, project: ProjectRow, identity: ProjectFileIdentity): Promise<FileScope> {
@@ -62,7 +61,10 @@ async function authorize(client: PoolClient, project: ProjectRow, identity: Proj
   let actor: FileActor
   let admin = false
   let leaseId: string | null = null
-  if (identity.kind === 'human') {
+  if (identity.kind === 'system') {
+    if (identity.companyId !== project.company_id || identity.projectId !== project.id) fail('NOT_FOUND', 404, 'Project not found.')
+    actor = { id: 'git-service', kind: 'human', name: 'Git service' }; admin = true
+  } else if (identity.kind === 'human') {
     if (identity.companyId !== project.company_id) fail('NOT_FOUND', 404, 'Project not found.')
     const { rows } = await client.query<{ role: string; display_name: string }>(
       `SELECT cm.role, u.display_name FROM company_members cm JOIN users u ON u.id = cm.user_id
@@ -81,7 +83,7 @@ async function authorize(client: PoolClient, project: ProjectRow, identity: Proj
     if (!rows[0]) fail('REVOKED', 403, 'Agent no longer belongs to this workspace.')
     actor = { id: lease.agent_id, kind: 'agent', name: rows[0].name }; leaseId = lease.id
   }
-  return { projectId: project.id, actor, admin, leaseId, bindingVersion: bindingVersionOf(project),
+  return { projectId: project.id, actor, admin, leaseId, bindingVersion: bindingVersionOf(project), system: identity.kind === 'system',
     readOnly: project.status !== 'active' || project.file_switching }
 }
 
@@ -95,7 +97,7 @@ export function projectFilesFor(identity: ProjectFileIdentity): ProjectFileWorks
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
-        const companyId = identity.kind === 'human' ? identity.companyId : (await leaseByToken(client, identity.token)).company_id
+        const companyId = identity.kind === 'lease' ? (await leaseByToken(client, identity.token)).company_id : identity.companyId
         await client.query('SELECT id FROM companies WHERE id = $1 FOR SHARE', [companyId])
         const { rows } = await client.query<ProjectRow>(
           'SELECT id, company_id, status, file_binding_version::text, file_switching FROM projects WHERE id = $1 AND company_id = $2 FOR UPDATE', [projectId, companyId])

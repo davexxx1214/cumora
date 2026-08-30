@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, ApiError, type ApiProject, ws } from '@/api/client'
-import { fileAsBase64, projectFileAttachment, projectFilesApi, saveDownloadedBlob, type ProjectFileEntry, type ProjectFileListing } from '@/api/project-files'
+import { ApiError, type ApiProject, api, ws } from '@/api/client'
+import { fileAsBase64, type ProjectFileEntry, type ProjectFileListing, projectFileAttachment, projectFilesApi, saveDownloadedBlob } from '@/api/project-files'
+import { useT } from '@/lib/i18n'
 import { useAuth, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations } from '@/stores/conversations'
-import { useT } from '@/lib/i18n'
 import type { Conversation } from '@/types'
 import { ProjectGitPanel } from './ProjectGitPanel'
 
@@ -161,7 +161,7 @@ export function ProjectFilesDialog({ conversation, onClose }: { conversation: Co
           if (name?.trim()) { const created = await api.createProject({ name: name.trim() }); await switchProject(created.id) }
         })}>{t('projectFiles.createProject')}</button>
       </div>}
-      {canManage && projectId && <ProjectGitPanel key={projectId} projectId={projectId} />}
+      {projectId && <ProjectGitPanel key={projectId} projectId={projectId} />}
       {error && <p role="alert" className="m-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
       {projectId ? <>
         <div className="flex flex-wrap items-center gap-2 px-4 pt-4">
@@ -190,8 +190,8 @@ export function ProjectFilesDialog({ conversation, onClose }: { conversation: Co
           </nav>}
         </div>}
         <div className="min-h-[180px] overflow-y-auto border-t border-ink-100 p-4">
-          {!listing ? <p className="text-sm text-ink-500">{error ? t('projectFiles.unavailable') : busy ? t('projectFiles.working') : t('projectFiles.loading')}</p> : listing.entries.length === 0 ? <p className="py-8 text-center text-ink-500">{t('projectFiles.empty')}</p> :
-            <ul className="divide-y divide-ink-100">{listing.entries.map(item => <li key={item.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
+          {!listing ? <p className="text-sm text-ink-500">{error ? t('projectFiles.unavailable') : busy ? t('projectFiles.working') : t('projectFiles.loading')}</p> : listing.entries.filter(item => item.source?.kind !== 'git').length === 0 ? <p className="py-8 text-center text-ink-500">{t('projectFiles.empty')}</p> :
+            <ul className="divide-y divide-ink-100">{listing.entries.filter(item => item.source?.kind !== 'git').map(item => <li key={item.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
               <div className="min-w-0 flex-1 basis-[200px]">
                 <button className="max-w-full truncate text-left font-medium text-skype-ink hover:underline" disabled={trash || busy} onClick={() => item.kind === 'directory' ? setParentId(item.id) : fileAction(item, 'download')}>
                   {item.kind === 'directory' ? '▣ ' : '▤ '}{item.name}

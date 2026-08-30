@@ -1,10 +1,11 @@
-import { parseArgs } from '../agents/cli-parse.js'
 import { runCli } from '../agents/cli.js'
+import { parseArgs } from '../agents/cli-parse.js'
 import { buildRuntimeArgv } from '../agents/runtime/cli-argv.js'
 import { pool } from '../db/pool.js'
+import { commitProjectGit, listAgentProjectGit, projectGitStatus, switchProjectGitBranch } from '../project-git/service.js'
 import { fail } from './model.js'
-import { projectLeaseScope } from './service.js'
 import { shareAgentProjectFile } from './references.js'
+import { projectLeaseScope } from './service.js'
 
 /** Exact command/flag allowlist; never forward arbitrary CLI commands with a
  * daemon JWT. In particular workspace/memory/search/inbox and generic attach
@@ -25,12 +26,21 @@ export function scopedProjectArgv(argv: unknown, conversationId: string): string
 
 export async function runProjectCli(token: string, argv: unknown) {
   const lease = await projectLeaseScope(token)
+  if (Array.isArray(argv) && argv[0] === 'project-git') {
+    if (argv.length > 5 || !argv.every(value => typeof value === 'string') || argv.join('').length > 10_000) fail('INVALID_COMMAND', 400, 'Invalid project-git command.')
+    const action = argv[1]
+    if (action === 'list' && argv.length === 2) return { ok: true, exitCode: 0, repositories: await listAgentProjectGit(token) }
+    if (action === 'status' && argv.length === 3) return { ok: true, exitCode: 0, ...(await projectGitStatus(token, argv[2])) }
+    if (action === 'switch' && argv.length === 4) return { ok: true, exitCode: 0, ...(await switchProjectGitBranch(token, argv[2], argv[3])) }
+    if (action === 'commit' && argv.length === 4) return { ok: true, exitCode: 0, ...(await commitProjectGit(token, argv[2], argv[3])) }
+    fail('INVALID_COMMAND', 400, 'Use project-git list, status <repositoryId>, switch <repositoryId> <branch>, or commit <repositoryId> <message>.')
+  }
   if (Array.isArray(argv) && argv[0] === 'project-file') {
     if (argv.length < 2 || argv.length > 3 || !argv.every(a => typeof a === 'string') || argv.join('').length > 21_000) fail('INVALID_COMMAND', 400, 'project-file <path> [message]')
     return shareAgentProjectFile(token, argv[1], argv[2] ?? '')
   }
   if (Array.isArray(argv) && (argv.length === 0 || argv[0] === 'help' || argv[0] === '--help')) return {
-    ok: true, exitCode: 0, text: `Current group: ${lease.conversation_id}\nProject path: /projects/${lease.project_id}\nCommands: messages <group> [--tail N], thread <message>, glance <group>, reply <group> <text> [--quote id], ack <group>, project-file <path> [text].\nRead project files only when the user names a file or authorizes the task scope. Do not scan project files, import project instructions, or save their content to global memory.`,
+    ok: true, exitCode: 0, text: `Current group: ${lease.conversation_id}\nProject path: /projects/${lease.project_id}\nCommands: messages <group> [--tail N], thread <message>, glance <group>, reply <group> <text> [--quote id], ack <group>, project-file <path> [text], project-git list|status|switch|commit.\nGit tokens are server-side and unavailable to tasks. Read project files only when the user names a file or authorizes the task scope. Do not scan project files, import project instructions, or save their content to global memory.`,
   }
   const safe = scopedProjectArgv(argv, lease.conversation_id)
   const parsed = parseArgs(safe.slice(1))

@@ -1,30 +1,25 @@
-import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { createServer, get as httpGet, type Server } from 'node:http'
-import { once } from 'node:events'
-import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { spawn, execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-import { buildApiTestApp, ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll } from './_helpers.js'
+import { once } from 'node:events'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createServer, get as httpGet, type Server } from 'node:http'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { after, before, beforeEach, test } from 'node:test'
+import { getAdapter } from '../agents/computer/engine.js'
+import { recoverProjectStops, trackProjectTask } from '../agents/computer/project-task.js'
+import { prepareTaskAuth, spawnTaskProcess, withTaskSandbox } from '../agents/computer/task-sandbox.js'
+import { signAgentToken } from '../agents/runtime/jwt.js'
+import { runtimeRouter } from '../agents/runtime/server.js'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
-import { createProjectLease, currentAgentProject, projectFilesFor, stopProjectLease } from '../project-files/service.js'
-import { LocalProjectObjects } from '../project-files/objects.js'
 import { PROJECT_FILE_MAX_BYTES, type ProjectFileState } from '../project-files/model.js'
 import { projectMountRouter } from '../project-files/mount-router.js'
-import { runtimeRouter } from '../agents/runtime/server.js'
-import { signAgentToken } from '../agents/runtime/jwt.js'
-import { withTaskSandbox, spawnTaskProcess } from '../agents/computer/task-sandbox.js'
-import { prepareTaskAuth } from '../agents/computer/task-sandbox.js'
-import { getAdapter } from '../agents/computer/engine.js'
+import { LocalProjectObjects } from '../project-files/objects.js'
+import { createProjectLease, projectFilesFor, stopProjectLease } from '../project-files/service.js'
 import { storage } from '../storage.js'
-import { trackProjectTask, recoverProjectStops, prepareTaskRepository } from '../agents/computer/project-task.js'
-import { readyProjectGit } from '../project-git/service.js'
-
-const execFileP = promisify(execFile)
+import { buildApiTestApp, ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll } from './_helpers.js'
 
 const users = ['owner', 'member', 'outsider'] as const
 const servers: Server[] = []
@@ -148,78 +143,84 @@ test('[integration] members manage files but cannot create, switch, purge or dis
   assert.equal(purge.status, 403)
 })
 
-test('[integration] administrators configure encrypted Git credentials and projects while members can only read project Git status', async () => {
-  assert.equal((await request('member', '/git/credentials')).status, 403)
-  assert.equal((await request('member', '/projects/p-files/git', 'PUT', { repositoryUrl: 'https://github.com/acme/repo.git' })).status, 403)
-  const first = await request('owner', '/git/credentials', 'POST', {
-    name: 'GitHub primary', host: 'github.com', username: 'owner', token: 'github_pat_first_secret', active: true,
+test('[integration] one encrypted project token serves multiple repositories and members receive read-only metadata', async () => {
+  assert.equal((await request('member', '/projects/p-files/git/credential', 'PUT', {
+    username: 'member', token: 'github_pat_denied_secret',
+  })).status, 403)
+  assert.equal((await request('owner', '/projects/p-files/git', 'POST', {
+    name: 'No token', repositoryUrl: 'https://github.com/acme/no-token.git',
+  })).status, 409)
+  const access = await request('owner', '/projects/p-files/git/credential', 'PUT', {
+    username: 'project-user', token: 'github_pat_project_secret',
   })
-  assert.equal(first.status, 201, await first.clone().text())
-  const firstBody = await first.json() as Record<string, unknown>
-  assert.equal(firstBody.active, true)
-  assert.equal('token' in firstBody, false)
-  assert.equal('tokenEncrypted' in firstBody, false)
-  const stored = (await pool.query<{ token_encrypted: string }>('SELECT token_encrypted FROM company_git_credentials WHERE id=$1', [firstBody.id])).rows[0]
-  assert.ok(stored.token_encrypted && !stored.token_encrypted.includes('github_pat_first_secret'))
-
-  const second = await request('owner', '/git/credentials', 'POST', {
-    name: 'GitHub rotated', host: 'github.com', username: 'owner', token: 'github_pat_second_secret', active: true,
+  assert.equal(access.status, 200, await access.clone().text())
+  const accessBody = await access.json() as Record<string, unknown>
+  assert.equal(accessBody.projectId, 'p-files'); assert.equal(accessBody.username, 'project-user')
+  assert.equal(accessBody.tokenHint, '••••cret'); assert.equal(typeof accessBody.createdAt, 'string')
+  assert.equal(typeof accessBody.updatedAt, 'string'); assert.ok(!('token' in accessBody) && !('tokenEncrypted' in accessBody))
+  const first = await request('owner', '/projects/p-files/git', 'POST', {
+    name: 'Web', repositoryUrl: 'https://github.com/acme/web.git', defaultBranch: 'dev',
   })
-  assert.equal(second.status, 201, await second.clone().text())
-  const active = await pool.query<{ count: number }>('SELECT COUNT(*)::int AS count FROM company_git_credentials WHERE company_id=$1 AND active', ['co-files'])
-  assert.equal(active.rows[0].count, 1)
-  const listed = await (await request('owner', '/git/credentials')).json() as Array<Record<string, unknown>>
-  assert.equal(listed.length, 2)
-  assert.equal(listed.filter(item => item.active).length, 1)
-  assert.ok(listed.every(item => !('token' in item) && !('tokenEncrypted' in item)))
-
-  const saved = await request('owner', '/projects/p-files/git', 'PUT', {
-    repositoryUrl: 'https://github.com/acme/repo.git', defaultBranch: 'dev',
+  const second = await request('owner', '/projects/p-files/git', 'POST', {
+    name: 'API', repositoryUrl: 'https://github.com/acme/api.git',
   })
-  assert.equal(saved.status, 200, await saved.clone().text())
-  assert.equal((await saved.json() as { syncStatus: string }).syncStatus, 'not_synced')
-  const memberView = await request('member', '/projects/p-files/git')
-  assert.equal(memberView.status, 200)
-  assert.equal((await memberView.json() as { repositoryUrl: string }).repositoryUrl, 'https://github.com/acme/repo.git')
+  assert.equal(first.status, 201, await first.clone().text()); assert.equal(second.status, 201, await second.clone().text())
+  const firstBody = await first.json() as Record<string, unknown>, secondBody = await second.json() as Record<string, unknown>
+  assert.ok(!('token' in firstBody) && !('tokenEncrypted' in firstBody))
+  const stored = await pool.query<{ token_encrypted: string }>('SELECT token_encrypted FROM project_git_access')
+  assert.equal(stored.rows.length, 1)
+  assert.ok(!stored.rows[0].token_encrypted.includes('github_pat_'))
+  const rotated = await request('owner', '/projects/p-files/git/credential', 'PUT', {
+    username: 'rotated-user', token: 'github_pat_rotated_secret',
+  })
+  assert.equal(rotated.status, 200, await rotated.clone().text())
+  const afterRotation = await pool.query<{ token_encrypted: string }>('SELECT token_encrypted FROM project_git_access')
+  assert.equal(afterRotation.rows.length, 1)
+  assert.notEqual(afterRotation.rows[0].token_encrypted, stored.rows[0].token_encrypted)
+  assert.equal((await pool.query('SELECT 1 FROM project_git_repositories')).rowCount, 2)
+  const memberView = await (await request('member', '/projects/p-files/git')).json() as Array<Record<string, unknown>>
+  assert.deepEqual(memberView.map(item => item.name), ['Web', 'API'])
+  assert.ok(memberView.every(item => !('tokenHint' in item) && !('username' in item) && !('tokenEncrypted' in item)))
+  assert.equal((await request('member', '/projects/p-files/git/credential')).status, 403)
   assert.equal((await request('outsider', '/projects/p-files/git')).status, 404)
+  assert.notEqual(firstBody.id, secondBody.id)
 })
 
-test('[integration] project Git sync creates a token-free mirror and an independent task checkout', {
+test('[integration] project Git clone enters shared quota space and only an Agent lease can edit and commit it', {
   skip: process.env.CUMORA_PROJECT_GIT_NETWORK_SMOKE !== '1', timeout: 120_000,
 }, async () => {
   const fakeToken = 'github_pat_public_repository_smoke_only'
-  assert.equal((await request('owner', '/git/credentials', 'POST', {
-    name: 'Public smoke', host: 'github.com', username: 'cumora-smoke', token: fakeToken, active: true,
-  })).status, 201)
-  assert.equal((await request('owner', '/projects/p-files/git', 'PUT', {
-    repositoryUrl: 'https://github.com/octocat/Hello-World.git', defaultBranch: '',
-  })).status, 200)
-  const synced = await request('owner', '/projects/p-files/git/sync', 'POST', {})
+  const access = await request('owner', '/projects/p-files/git/credential', 'PUT', {
+    username: 'cumora-smoke', token: fakeToken,
+  })
+  assert.equal(access.status, 200, await access.clone().text())
+  const created = await request('owner', '/projects/p-files/git', 'POST', {
+    name: 'Hello World', repositoryUrl: 'https://github.com/octocat/Hello-World.git',
+  })
+  assert.equal(created.status, 201, await created.clone().text())
+  const repositoryId = (await created.json() as { id: string }).id
+  const synced = await request('owner', `/projects/p-files/git/${repositoryId}/sync`, 'POST', {})
   assert.equal(synced.status, 200, await synced.clone().text())
-  const body = await synced.json() as { syncStatus: string; resolvedDefaultBranch: string; lastCommit: string }
+  const body = await synced.json() as { syncStatus: string; currentBranch: string; lastCommit: string; rootEntryId: string }
   assert.equal(body.syncStatus, 'ready')
-  assert.ok(body.resolvedDefaultBranch)
+  assert.ok(body.currentBranch)
   assert.match(body.lastCommit, /^[0-9a-f]{40}$/u)
-  const ready = await readyProjectGit('co-files', 'p-files')
-  assert.ok(ready)
-  const mirrorConfig = await readFile(join(ready.mirrorPath, 'config'), 'utf8')
-  assert.equal(mirrorConfig.includes(fakeToken), false)
-  assert.match(mirrorConfig, /url = https:\/\/github\.com\/octocat\/Hello-World\.git/u)
-  const context = await currentAgentProject('agent', 'co-files', 'g-files')
-  assert.equal(context.git?.commit, body.lastCommit)
-  const taskHome = await mkdtemp(join(root, 'git-task-'))
-  const oldRoot = process.env.CUMORA_PROJECT_GIT_ROOT
-  try {
-    process.env.CUMORA_PROJECT_GIT_ROOT = env.PROJECT_GIT_ROOT
-    const checkout = await prepareTaskRepository(taskHome, context.git!)
-    assert.equal(checkout.branch, body.resolvedDefaultBranch)
-    const taskConfig = await readFile(join(taskHome, 'repository', '.git', 'config'), 'utf8')
-    assert.equal(taskConfig.includes(fakeToken), false)
-    assert.equal(taskConfig.includes(ready.mirrorPath), false)
-    assert.equal((await execFileP('git', ['-C', join(taskHome, 'repository'), 'branch', '--show-current'])).stdout.trim(), body.resolvedDefaultBranch)
-  } finally {
-    if (oldRoot === undefined) delete process.env.CUMORA_PROJECT_GIT_ROOT; else process.env.CUMORA_PROJECT_GIT_ROOT = oldRoot
-  }
+  const shared = await (await request('member', `/project-files/p-files/entries?parentId=${body.rootEntryId}`)).json() as { entries: Array<{ id: string; name: string; versionId: string }> }
+  assert.ok(shared.entries.some(item => item.name === 'README'))
+  const readme = shared.entries.find(item => item.name === 'README')!
+  const denied = await request('member', '/project-files/p-files/operations', 'POST', { requestId: randomUUID(), bindingVersion: await binding(),
+    command: { type: 'upload', parentId: body.rootEntryId, entryId: readme.id, name: readme.name, expectedVersion: readme.versionId, content: Buffer.from('human edit').toString('base64') } })
+  assert.equal(denied.status, 403)
+  const lease = await testLease()
+  const service = projectFilesFor({ kind: 'lease', token: lease.token })
+  const edited = await service.execute('p-files', randomUUID(), { type: 'upload', parentId: body.rootEntryId, entryId: readme.id,
+    name: readme.name, expectedVersion: readme.versionId, content: Buffer.from('agent edit\n').toString('base64') })
+  assert.ok(edited.entry)
+  const committed = await mountRequest(lease.token, '/cli', { argv: ['project-git', 'commit', repositoryId, 'Agent shared edit'] })
+  assert.equal(committed.status, 200, await committed.clone().text())
+  const commit = (await committed.json() as { commit: string }).commit
+  assert.match(commit, /^[0-9a-f]{40}$/u); assert.notEqual(commit, body.lastCommit)
+  await stopProjectLease({ id: lease.id, agentId: 'agent', companyId: 'co-files' })
 })
 
 test('[integration] project binding is exclusive, including direct SQL and group creation', async () => {

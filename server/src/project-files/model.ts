@@ -22,6 +22,9 @@ export interface ProjectEntry {
   modifiedAt: string; modifiedBy: FileActor; deletedAt: string | null
   /** The root of a recursively trashed tree. Children retain their parent IDs. */
   trashRoot: string | null; missing: boolean
+  /** Git worktrees live in the same versioned/quota-controlled space. The
+   * private Git database and credentials never appear in this tree. */
+  source?: { kind: 'git'; repositoryId: string; basePath: string | null; baseVersionId: string | null; baseDeleted: boolean }
 }
 export interface FileWrite {
   id: string; entryId: string; expectedVersion: string | null; reserved: number
@@ -109,11 +112,14 @@ export function recordEvent(state: ProjectFileState, actor: FileActor, action: s
   if (state.events.length > 1000) state.events.splice(0, state.events.length - 1000)
 }
 export function newEntry(state: ProjectFileState, actor: FileActor, parentId: string, name: string, kind: ProjectEntry['kind']): ProjectEntry {
-  directory(state, parentId); name = validName(name); depth(state, parentId)
+  const parent = directory(state, parentId); name = validName(name); depth(state, parentId)
   if (childNamed(state, parentId, name)) fail('ALREADY_EXISTS', 409, 'A file or directory already uses that name.')
   if (Object.keys(state.entries).length >= PROJECT_MAX_ENTRIES) fail('ENTRY_LIMIT', 409, 'Project entry limit reached; an administrator can clear trash or unavailable file history.')
   const item: ProjectEntry = { id: randomUUID(), parentId, name, kind, revision: randomUUID(), versionId: null,
     versions: [], modifiedAt: new Date().toISOString(), modifiedBy: actor, deletedAt: null, trashRoot: null, missing: false }
+  if (parent.source?.kind === 'git' && parent.source.repositoryId !== '__container__') {
+    item.source = { kind: 'git', repositoryId: parent.source.repositoryId, basePath: null, baseVersionId: null, baseDeleted: false }
+  }
   state.entries[item.id] = item
   recordEvent(state, actor, 'create', item.id)
   return item
@@ -134,5 +140,6 @@ export function viewEntry(item: ProjectEntry) {
   const version = item.versions.find(v => v.id === item.versionId)
   return { id: item.id, parentId: item.parentId, name: item.name, kind: item.kind, revision: item.revision,
     versionId: item.versionId, size: version?.size ?? 0, modifiedAt: item.modifiedAt, modifiedBy: item.modifiedBy,
-    deletedAt: item.deletedAt, trashRoot: item.trashRoot }
+    deletedAt: item.deletedAt, trashRoot: item.trashRoot,
+    source: item.source ? { kind: item.source.kind, repositoryId: item.source.repositoryId } : undefined }
 }

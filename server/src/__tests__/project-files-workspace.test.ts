@@ -1,12 +1,12 @@
-import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, rm, readdir, unlink, symlink, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { chmod, mkdtemp, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { type TestContext, test } from 'node:test'
 import { emptyProjectState, ProjectFileError, type ProjectFileState } from '../project-files/model.js'
 import { LocalProjectObjects } from '../project-files/objects.js'
-import { ProjectFileWorkspace, type FileScope, type FileCommand, type FileTransaction } from '../project-files/workspace.js'
+import { type FileCommand, type FileScope, type FileTransaction, ProjectFileWorkspace } from '../project-files/workspace.js'
 
 async function fixture(t: TestContext, quotaBytes = 100_000) {
   const root = await mkdtemp(join(tmpdir(), 'cumora-project-files-test-'))
@@ -56,6 +56,44 @@ test('project files: binary files, Unicode directories, empty files and idempote
   assert.deepEqual(await f.run(cmd, key), await f.run(cmd, key))
   assert.equal((await f.api.list('p-test')).entries.length, 2)
   await assert.rejects(f.run({ ...cmd, name: 'different.txt' }, key), error('IDEMPOTENCY_CONFLICT'))
+})
+
+test('project files: Git worktrees share quota, are human read-only and remain Agent-writable with dirty tracking', async t => {
+  const f = await fixture(t)
+  f.scope.system = true; f.scope.admin = true; f.scope.actor = { id: 'git-service', name: 'Git service', kind: 'human' }
+  const imported = await f.api.importGitTree('p-test', 'repo-one', 'Web', [
+    { path: 'README.md', content: Buffer.from('base') }, { path: 'src/app.ts', content: Buffer.from('export {}') },
+  ])
+  assert.equal((await f.api.list('p-test')).usedBytes, 13)
+  f.scope.system = false; f.scope.admin = false; f.scope.actor = { id: 'alice', name: 'Alice', kind: 'human' }
+  const root = await f.api.list('p-test', imported.rootEntryId)
+  const readme = root.entries.find(item => item.name === 'README.md')!
+  assert.equal((await f.api.read('p-test', readme.id)).content.toString(), 'base')
+  f.scope.system = true
+  await assert.rejects(f.api.importGitTree('p-test', 'repo-one', 'Web', [
+    { path: 'too-large-for-test-quota.bin', content: Buffer.alloc(100_001) },
+  ]), error('QUOTA_EXCEEDED'))
+  assert.equal((await f.api.read('p-test', readme.id)).content.toString(), 'base', 'a failed replacement keeps the previous worktree bytes')
+  f.scope.system = false
+  await assert.rejects(f.run({ type: 'upload', parentId: imported.rootEntryId, entryId: readme.id, name: readme.name,
+    expectedVersion: readme.versionId!, content: Buffer.from('human').toString('base64') }), error('GIT_READ_ONLY'))
+  await assert.rejects(f.run({ type: 'mkdir', parentId: imported.rootEntryId, name: 'human-folder' }), error('GIT_READ_ONLY'))
+  f.scope.actor = { id: 'agent', name: 'Agent', kind: 'agent' }; f.scope.leaseId = 'lease-one'
+  await f.run({ type: 'upload', parentId: imported.rootEntryId, entryId: readme.id, name: readme.name,
+    expectedVersion: readme.versionId!, content: Buffer.from('agent').toString('base64') })
+  assert.equal((await f.api.exportGitTree('p-test', 'repo-one')).dirty, true)
+  f.scope.system = true; f.scope.actor = { id: 'git-service', name: 'Git service', kind: 'human' }; f.scope.leaseId = null
+  await f.api.markGitCommitted('p-test', 'repo-one')
+  assert.equal((await f.api.exportGitTree('p-test', 'repo-one')).dirty, false)
+})
+
+test('project files: the Git worktree container name is reserved at the project root', async t => {
+  const f = await fixture(t)
+  await assert.rejects(f.run({ type: 'mkdir', parentId: 'root', name: 'Repositories' }), error('RESERVED_NAME'))
+  await assert.rejects(f.upload('Repositories', 'ordinary file'), error('RESERVED_NAME'))
+  const ordinary = await f.upload('ordinary', 'content')
+  await assert.rejects(f.run({ type: 'move', entryId: ordinary.id, expectedRevision: ordinary.revision,
+    parentId: 'root', name: 'Repositories' }), error('RESERVED_NAME'))
 })
 
 test('project files: concurrent overwrites conflict; independent mount writes retain conflicting bytes', async t => {

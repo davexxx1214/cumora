@@ -39,8 +39,8 @@ import { projectAttachment } from '../project-files/references.js'
 import { resolveAgentRecipientIds } from '../agents/message-routing.js'
 import { openInviteToken, sealInviteToken } from '../invitations/token-vault.js'
 import {
-  activateGitCredential, clearProjectGitSettings, createGitCredential, deleteGitCredential,
-  getProjectGitSettings, listGitCredentials, saveProjectGitSettings, syncProjectGit, updateGitCredential,
+  createProjectGitRepository, deleteProjectGitRepository, getProjectGitCredential,
+  listProjectGitRepositories, saveProjectGitCredential, syncProjectGitRepository, updateProjectGitRepository,
 } from '../project-git/service.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
@@ -2106,65 +2106,53 @@ api.post('/projects/:id/archive', async (req, res) => {
   res.json({ ok: true, status: archive ? 'archived' : 'active' })
 })
 
-api.get('/git/credentials', async (req, res) => {
-  const { companyId } = await requireCompanyRole(req)
-  res.json(await listGitCredentials(companyId))
-})
-
-api.post('/git/credentials', async (req, res) => {
-  const { userId, companyId } = await requireCompanyRole(req)
-  const credential = await createGitCredential({ companyId, userId, name: req.body?.name, host: req.body?.host,
-    username: req.body?.username, token: req.body?.token, active: req.body?.active !== false })
-  await audit({ kind: 'git_credential_create', userId, companyId, detail: { credentialId: credential.id, host: credential.host, active: credential.active } })
-  res.status(201).json(credential)
-})
-
-api.put('/git/credentials/:id', async (req, res) => {
-  const { userId, companyId } = await requireCompanyRole(req)
-  const credential = await updateGitCredential({ companyId, id: String(req.params.id), name: req.body?.name,
-    host: req.body?.host, username: req.body?.username, token: req.body?.token })
-  await audit({ kind: 'git_credential_update', userId, companyId, detail: { credentialId: credential.id, host: credential.host } })
-  res.json(credential)
-})
-
-api.post('/git/credentials/:id/activate', async (req, res) => {
-  const { userId, companyId } = await requireCompanyRole(req)
-  await activateGitCredential(companyId, String(req.params.id))
-  await audit({ kind: 'git_credential_activate', userId, companyId, detail: { credentialId: String(req.params.id) } })
-  res.json({ ok: true })
-})
-
-api.delete('/git/credentials/:id', async (req, res) => {
-  const { userId, companyId } = await requireCompanyRole(req)
-  await deleteGitCredential(companyId, String(req.params.id))
-  await audit({ kind: 'git_credential_delete', userId, companyId, detail: { credentialId: String(req.params.id) } })
-  res.json({ ok: true })
-})
-
 api.get('/projects/:id/git', async (req, res) => {
   const { userId, companyId } = await requireCompany(req)
-  res.json(await getProjectGitSettings(companyId, userId, String(req.params.id)))
+  res.json(await listProjectGitRepositories(companyId, userId, String(req.params.id)))
 })
 
-api.put('/projects/:id/git', async (req, res) => {
+api.get('/projects/:id/git/credential', async (req, res) => {
   const { userId, companyId } = await requireCompanyRole(req)
-  const value = await saveProjectGitSettings({ companyId, userId, projectId: String(req.params.id),
-    repositoryUrl: req.body?.repositoryUrl, defaultBranch: req.body?.defaultBranch })
-  await audit({ kind: 'project_git_configure', userId, companyId, detail: { projectId: String(req.params.id), repositoryUrl: value.repositoryUrl, defaultBranch: value.defaultBranch } })
+  res.json(await getProjectGitCredential(companyId, userId, String(req.params.id)))
+})
+
+api.put('/projects/:id/git/credential', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  const value = await saveProjectGitCredential({ companyId, userId, projectId: String(req.params.id),
+    username: req.body?.username, token: req.body?.token })
+  await audit({ kind: 'project_git_credential_update', userId, companyId,
+    detail: { projectId: String(req.params.id) } })
   res.json(value)
 })
 
-api.delete('/projects/:id/git', async (req, res) => {
+api.post('/projects/:id/git', async (req, res) => {
   const { userId, companyId } = await requireCompanyRole(req)
-  await clearProjectGitSettings(companyId, userId, String(req.params.id))
-  await audit({ kind: 'project_git_clear', userId, companyId, detail: { projectId: String(req.params.id) } })
+  const value = await createProjectGitRepository({ companyId, userId, projectId: String(req.params.id), name: req.body?.name,
+    repositoryUrl: req.body?.repositoryUrl, defaultBranch: req.body?.defaultBranch })
+  await audit({ kind: 'project_git_create', userId, companyId, detail: { projectId: String(req.params.id), repositoryId: value.id, host: value.host } })
+  res.status(201).json(value)
+})
+
+api.put('/projects/:id/git/:repositoryId', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  const value = await updateProjectGitRepository({ companyId, userId, projectId: String(req.params.id),
+    repositoryId: String(req.params.repositoryId), name: req.body?.name, repositoryUrl: req.body?.repositoryUrl,
+    defaultBranch: req.body?.defaultBranch })
+  await audit({ kind: 'project_git_update', userId, companyId, detail: { projectId: String(req.params.id), repositoryId: value.id, host: value.host } })
+  res.json(value)
+})
+
+api.delete('/projects/:id/git/:repositoryId', async (req, res) => {
+  const { userId, companyId } = await requireCompanyRole(req)
+  await deleteProjectGitRepository(companyId, userId, String(req.params.id), String(req.params.repositoryId))
+  await audit({ kind: 'project_git_delete', userId, companyId, detail: { projectId: String(req.params.id), repositoryId: String(req.params.repositoryId) } })
   res.json({ ok: true })
 })
 
-api.post('/projects/:id/git/sync', async (req, res) => {
+api.post('/projects/:id/git/:repositoryId/sync', async (req, res) => {
   const { userId, companyId } = await requireCompanyRole(req)
-  const value = await syncProjectGit(companyId, userId, String(req.params.id))
-  await audit({ kind: 'project_git_sync', userId, companyId, detail: { projectId: String(req.params.id), commit: value.lastCommit } })
+  const value = await syncProjectGitRepository(companyId, userId, String(req.params.id), String(req.params.repositoryId))
+  await audit({ kind: 'project_git_sync', userId, companyId, detail: { projectId: String(req.params.id), repositoryId: value.id, commit: value.lastCommit } })
   res.json(value)
 })
 

@@ -1,25 +1,16 @@
 import { isIP } from 'node:net'
 import { fail } from '../project-files/model.js'
 
-export interface ProjectGitSettings {
-  projectId: string
-  repositoryUrl: string
-  defaultBranch: string | null
-  resolvedDefaultBranch: string | null
-  syncStatus: 'not_synced' | 'syncing' | 'ready' | 'failed'
-  syncError: string | null
-  lastSyncedAt: string | null
-  lastCommit: string | null
+export interface ProjectGitRepository {
+  id: string; projectId: string; name: string; repositoryUrl: string; host: string
+  defaultBranch: string | null; currentBranch: string | null
+  syncStatus: 'not_synced' | 'syncing' | 'ready' | 'failed'; syncError: string | null
+  lastSyncedAt: string | null; lastCommit: string | null; rootEntryId: string | null
+  createdAt: string; updatedAt: string
 }
 
-export function normalizeGitHost(value: unknown): string {
-  const raw = String(value ?? '').trim().toLowerCase()
-  if (!raw || raw.length > 255 || raw.includes('/') || raw.includes('@')) fail('INVALID_GIT_HOST', 400, 'Enter a Git host such as github.com.')
-  let url: URL
-  try { url = new URL(`https://${raw}`) } catch { fail('INVALID_GIT_HOST', 400, 'Enter a valid Git host.') }
-  if (url.pathname !== '/' || url.search || url.hash || url.username || url.password) fail('INVALID_GIT_HOST', 400, 'Enter only the Git host and optional port.')
-  if (isPrivateLiteral(url.hostname)) fail('INVALID_GIT_HOST', 400, 'Private and local Git hosts are not supported by this deployment.')
-  return url.host.toLowerCase()
+export interface ProjectGitCredential {
+  projectId: string; username: string; tokenHint: string; createdAt: string; updatedAt: string
 }
 
 export function normalizeRepositoryUrl(value: unknown): { url: string; host: string } {
@@ -43,6 +34,14 @@ export function normalizeBranch(value: unknown): string | null {
     fail('INVALID_GIT_BRANCH', 400, 'Enter a valid Git branch name.')
   }
   return branch
+}
+
+export function normalizeRepositoryName(value: unknown): string {
+  const name = String(value ?? '').trim().normalize('NFC')
+  if (!name || Buffer.byteLength(name) > 120 || /[\x00-\x1f\x7f/\\]/u.test(name) || name === '.' || name === '..') {
+    fail('INVALID_GIT_NAME', 400, 'Use a repository name of 1–120 bytes without slashes or control characters.')
+  }
+  return name
 }
 
 export function isPrivateLiteral(hostname: string): boolean {

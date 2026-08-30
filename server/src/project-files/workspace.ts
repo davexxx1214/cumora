@@ -2,14 +2,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { LocalProjectObjects } from './objects.js'
 import {
   checkRevision, childNamed, depth, descendants, directory, entry, expireWrites, fail, newEntry, own,
-  PROJECT_FILE_MAX_BYTES, PROJECT_MAX_DEPTH, PROJECT_MAX_VERSIONS, PROJECT_QUOTA_BYTES, recordEvent, referencedObjects,
+  PROJECT_FILE_MAX_BYTES, PROJECT_MAX_DEPTH, PROJECT_MAX_ENTRIES, PROJECT_MAX_VERSIONS, PROJECT_QUOTA_BYTES, recordEvent, referencedObjects,
   reservedBytes, touch, validName, viewEntry, WRITE_TTL_MS,
   type FileActor, type FileVersion, type FileWrite, type ProjectEntry, type ProjectFileState,
 } from './model.js'
 
 export interface FileScope {
   projectId: string; actor: FileActor; admin: boolean; bindingVersion: string; leaseId: string | null
-  readOnly?: boolean; quotaBytes?: number
+  readOnly?: boolean; quotaBytes?: number; system?: boolean
 }
 export type FileCommand =
   | { type: 'mkdir'; parentId: string; name: string }
@@ -74,6 +74,166 @@ export class ProjectFileWorkspace {
     const used = [...inventory.values()].reduce((a, b) => a + b, 0)
     const reserved = reservedBytes(tx.state, exceptWrite)
     if (used + reserved + bytes > (tx.scope.quotaBytes ?? PROJECT_QUOTA_BYTES)) fail('QUOTA_EXCEEDED', 413, 'Project storage is full, including trash, history and pending writes.')
+  }
+
+  private gitRepository(item: ProjectEntry | undefined): string | null {
+    return item?.source?.kind === 'git' ? item.source.repositoryId : null
+  }
+
+  private requireGitWrite(tx: FileTransaction, item?: ProjectEntry): void {
+    if (this.gitRepository(item) && !tx.scope.system && tx.scope.actor.kind !== 'agent') {
+      fail('GIT_READ_ONLY', 403, 'Git repository files are read-only for people. Ask an Agent to edit and commit them.')
+    }
+  }
+
+  private requireUnreservedRootName(parentId: string, value: unknown): void {
+    if (parentId === 'root' && typeof value === 'string' && value.normalize('NFC') === 'Repositories') {
+      fail('RESERVED_NAME', 409, 'Repositories is reserved for project Git worktrees.')
+    }
+  }
+
+  /** Replace one repository worktree from a trusted Git snapshot. Git metadata
+   * stays outside the project filesystem; only normal files count toward the
+   * same project quota and are exposed to members. */
+  async importGitTree(projectId: string, repositoryId: string, name: string,
+    files: Array<{ path: string; content: Buffer }>): Promise<{ rootEntryId: string; usedBytes: number }> {
+    return this.repository.withProject(projectId, async tx => {
+      if (!tx.scope.system) fail('ADMIN_REQUIRED', 403, 'A trusted Git service is required.')
+      let inventory = await this.reconcile(tx)
+      const filePaths = new Set<string>(), directoryPaths = new Set<string>()
+      for (const file of files) {
+        const parts = file.path.split('/')
+        if (!parts.length || parts.some(part => !part || part === '.' || part === '..')) fail('INVALID_GIT_TREE', 422, 'The repository contains an invalid path.')
+        if (parts.length > PROJECT_MAX_DEPTH - 2) fail('DEPTH_LIMIT', 422, 'The repository exceeds the project directory depth limit.')
+        if (file.content.length > PROJECT_FILE_MAX_BYTES) fail('FILE_TOO_LARGE', 413, `Repository file ${file.path} exceeds 25MiB.`)
+        if (filePaths.has(file.path) || directoryPaths.has(file.path)) fail('INVALID_GIT_TREE', 422, 'The repository contains overlapping paths.')
+        for (let i = 1; i < parts.length; i++) {
+          const parent = parts.slice(0, i).join('/')
+          if (filePaths.has(parent)) fail('INVALID_GIT_TREE', 422, 'The repository contains overlapping file and directory paths.')
+          directoryPaths.add(parent)
+        }
+        filePaths.add(file.path)
+      }
+      let container = Object.values(tx.state.entries).find(item => item.parentId === 'root' && !item.deletedAt &&
+        item.source?.kind === 'git' && item.source.repositoryId === '__container__')
+      if (!container) {
+        if (childNamed(tx.state, 'root', 'Repositories')) {
+          fail('RESERVED_NAME', 409, 'Rename the existing Repositories entry before cloning a Git repository.')
+        }
+        container = newEntry(tx.state, tx.scope.actor, 'root', 'Repositories', 'directory')
+        container.source = { kind: 'git', repositoryId: '__container__', basePath: '', baseVersionId: null, baseDeleted: false }
+      }
+      const existing = Object.values(tx.state.entries).find(item => item.parentId === container!.id &&
+        item.source?.kind === 'git' && item.source.repositoryId === repositoryId)
+      if (existing) for (const item of descendants(tx.state, existing.id)) delete tx.state.entries[item.id]
+      if (Object.keys(tx.state.entries).length + files.length + directoryPaths.size + 1 > PROJECT_MAX_ENTRIES) {
+        fail('ENTRY_LIMIT', 409, 'The repository exceeds the project entry limit.')
+      }
+      // Remove replaced bytes from quota accounting now, but do not physically
+      // delete them before the metadata transaction commits. A failed import
+      // must leave the previous worktree readable; the next reconcile safely
+      // collects unreferenced objects after the new state is durable.
+      const retained = referencedObjects(tx.state)
+      inventory = new Map([...inventory].filter(([objectId]) => retained.has(objectId)))
+      const root = newEntry(tx.state, tx.scope.actor, container.id, validName(name), 'directory')
+      root.source = { kind: 'git', repositoryId, basePath: '', baseVersionId: null, baseDeleted: false }
+      const folders = new Map<string, ProjectEntry>([['', root]])
+      const ordered = [...files].sort((a, b) => a.path.localeCompare(b.path))
+      for (const file of ordered) {
+        const parts = file.path.split('/')
+        let parent = root
+        for (let i = 0; i < parts.length - 1; i++) {
+          const path = parts.slice(0, i + 1).join('/')
+          let folder = folders.get(path)
+          if (!folder) {
+            folder = newEntry(tx.state, tx.scope.actor, parent.id, parts[i], 'directory')
+            folder.source = { kind: 'git', repositoryId, basePath: path, baseVersionId: null, baseDeleted: false }
+            folders.set(path, folder)
+          }
+          parent = folder
+        }
+        const item = newEntry(tx.state, tx.scope.actor, parent.id, parts.at(-1)!, 'file')
+        item.source = { kind: 'git', repositoryId, basePath: file.path, baseVersionId: null, baseDeleted: false }
+        await this.commit(tx, item, file.content, inventory)
+        item.source.baseVersionId = item.versionId
+      }
+      recordEvent(tx.state, tx.scope.actor, 'git-import', root.id)
+      await tx.authorize()
+      return { rootEntryId: root.id, usedBytes: [...inventory.values()].reduce((a, b) => a + b, 0) }
+    })
+  }
+
+  async exportGitTree(projectId: string, repositoryId: string): Promise<{
+    rootEntryId: string; dirty: boolean; files: Array<{ path: string; content: Buffer }>
+  }> {
+    return this.repository.withProject(projectId, async tx => {
+      const root = Object.values(tx.state.entries).find(item => !item.deletedAt &&
+        item.source?.kind === 'git' && item.source.repositoryId === repositoryId && item.source.basePath === '')
+      if (!root) fail('GIT_NOT_SYNCED', 409, 'The repository worktree is unavailable.')
+      const all = descendants(tx.state, root.id)
+      const pathOf = (item: ProjectEntry): string => {
+        const names: string[] = []
+        let current = item
+        while (current.id !== root.id) {
+          names.unshift(current.name)
+          const parent = own(tx.state.entries, current.parentId ?? '')
+          if (!parent) fail('INVALID_TREE', 500, 'Invalid repository tree.')
+          current = parent
+        }
+        return names.join('/')
+      }
+      let dirty = false
+      const files: Array<{ path: string; content: Buffer }> = []
+      for (const item of all) {
+        if (item.source?.repositoryId !== repositoryId) fail('INVALID_TREE', 500, 'Repository trees cannot overlap.')
+        const path = pathOf(item)
+        if (item.source.basePath !== path || item.source.baseDeleted !== Boolean(item.deletedAt) ||
+            item.kind === 'file' && item.source.baseVersionId !== item.versionId) dirty = true
+        if (item.kind === 'file' && !item.deletedAt) {
+          const version = item.versions.find(value => value.id === item.versionId)
+          if (!version) fail('CONTENT_MISSING', 410, 'A repository file is unavailable.')
+          files.push({ path, content: await this.objects.read(projectId, version.objectId, version) })
+        }
+      }
+      await tx.authorize()
+      return { rootEntryId: root.id, dirty, files }
+    })
+  }
+
+  async markGitCommitted(projectId: string, repositoryId: string): Promise<void> {
+    await this.repository.withProject(projectId, async tx => {
+      if (!tx.scope.system) fail('ADMIN_REQUIRED', 403, 'A trusted Git service is required.')
+      const root = Object.values(tx.state.entries).find(item => item.source?.repositoryId === repositoryId && item.source.basePath === '')
+      if (!root) fail('GIT_NOT_SYNCED', 409, 'The repository worktree is unavailable.')
+      const pathOf = (item: ProjectEntry): string => {
+        const names: string[] = []
+        let current = item
+        while (current.id !== root.id) {
+          names.unshift(current.name)
+          current = entry(tx.state, current.parentId!, true)
+        }
+        return names.join('/')
+      }
+      for (const item of descendants(tx.state, root.id)) if (item.source?.repositoryId === repositoryId) {
+        item.source.basePath = pathOf(item); item.source.baseVersionId = item.versionId
+        item.source.baseDeleted = Boolean(item.deletedAt)
+      }
+      recordEvent(tx.state, tx.scope.actor, 'git-commit', root.id)
+      await tx.authorize()
+    })
+  }
+
+  async removeGitTree(projectId: string, repositoryId: string): Promise<void> {
+    await this.repository.withProject(projectId, async tx => {
+      if (!tx.scope.system) fail('ADMIN_REQUIRED', 403, 'A trusted Git service is required.')
+      const root = Object.values(tx.state.entries).find(item => item.source?.repositoryId === repositoryId && item.source.basePath === '')
+      if (!root) return
+      for (const item of descendants(tx.state, root.id)) delete tx.state.entries[item.id]
+      // Object cleanup happens on the next authorized list/import after this
+      // metadata deletion commits; never delete bytes before the transaction.
+      recordEvent(tx.state, tx.scope.actor, 'git-remove', root.id)
+      await tx.authorize()
+    })
   }
 
   async list(projectId: string, parentId = 'root', trash = false) {
@@ -211,10 +371,19 @@ export class ProjectFileWorkspace {
         for (const item of lost) for (const version of item.versions) if (!retained.has(version.objectId)) await this.objects.remove(scope.projectId, version.objectId)
         return { ok: true }
       }
-      case 'mkdir': return { entry: viewEntry(newEntry(state, scope.actor, command.parentId, command.name, 'directory')) }
+      case 'mkdir': {
+        const parent = directory(state, command.parentId); this.requireGitWrite(tx, parent)
+        if (parent.source?.repositoryId === '__container__') fail('GIT_READ_ONLY', 403, 'Repositories are added through project Git settings.')
+        this.requireUnreservedRootName(command.parentId, command.name)
+        return { entry: viewEntry(newEntry(state, scope.actor, command.parentId, command.name, 'directory')) }
+      }
       case 'upload': {
         const bytes = this.decode(command.content)
+        const parent = directory(state, command.parentId); this.requireGitWrite(tx, parent)
+        if (parent.source?.repositoryId === '__container__') fail('GIT_READ_ONLY', 403, 'Repositories are added through project Git settings.')
+        if (!command.entryId) this.requireUnreservedRootName(command.parentId, command.name)
         const item = command.entryId ? entry(state, command.entryId) : newEntry(state, scope.actor, command.parentId, command.name, 'file')
+        this.requireGitWrite(tx, item)
         if (item.kind !== 'file') fail('IS_DIRECTORY', 400, 'Cannot overwrite a directory.')
         if (command.entryId && (!command.expectedVersion || item.versionId !== command.expectedVersion)) fail('CONFLICT', 409, 'The file changed; upload a separate copy or refresh.')
         await this.commit(tx, item, bytes, inventory)
@@ -222,6 +391,7 @@ export class ProjectFileWorkspace {
       }
       case 'begin-write': {
         const item = entry(state, command.entryId)
+        this.requireGitWrite(tx, item)
         if (item.kind !== 'file') fail('IS_DIRECTORY', 400, 'Cannot open a directory for writing.')
         if (item.versionId !== command.expectedVersion) fail('CONFLICT', 409, 'The file changed before it was opened.')
         if (Object.keys(state.writes).length >= 64) fail('TOO_MANY_WRITES', 429, 'Too many pending project writes.')
@@ -262,9 +432,13 @@ export class ProjectFileWorkspace {
       }
       case 'move': {
         const item = entry(state, command.entryId)
+        const destination = directory(state, command.parentId)
+        this.requireGitWrite(tx, item); this.requireGitWrite(tx, destination)
+        this.requireUnreservedRootName(command.parentId, command.name)
+        const sourceRepo = this.gitRepository(item), targetRepo = this.gitRepository(destination)
+        if (sourceRepo !== targetRepo || sourceRepo === '__container__') fail('GIT_BOUNDARY', 409, 'Files cannot move into or out of a Git repository.')
         if (item.id === 'root') fail('ROOT_PROTECTED', 400, 'The project root cannot be moved.')
         checkRevision(item, command.expectedRevision)
-        directory(state, command.parentId)
         const name = validName(command.name)
         const subtree = descendants(state, item.id)
         if (subtree.some(child => child.id === command.parentId)) fail('DIRECTORY_CYCLE', 400, 'A directory cannot be moved into itself.')
@@ -294,13 +468,17 @@ export class ProjectFileWorkspace {
       }
       case 'trash': {
         const item = entry(state, command.entryId); checkRevision(item, command.expectedRevision)
+        this.requireGitWrite(tx, item)
         this.trash(tx, item, command.recursive === true)
         return { ok: true }
       }
       case 'restore': {
         const item = entry(state, command.entryId, true); checkRevision(item, command.expectedRevision)
+        const destination = directory(state, command.parentId)
+        this.requireGitWrite(tx, item); this.requireGitWrite(tx, destination)
+        this.requireUnreservedRootName(command.parentId, command.name)
+        if (this.gitRepository(item) !== this.gitRepository(destination)) fail('GIT_BOUNDARY', 409, 'Files cannot move into or out of a Git repository.')
         if (item.trashRoot !== item.id) fail('NOT_TRASH_ROOT', 409, 'Restore the containing deleted folder first.')
-        directory(state, command.parentId)
         const name = validName(command.name)
         if (childNamed(state, command.parentId, name)) fail('ALREADY_EXISTS', 409, 'A file already uses that name; restore under another name.')
         const subtree = descendants(state, item.id)
@@ -320,6 +498,7 @@ export class ProjectFileWorkspace {
         // Missing files remain clearable by admins even when their contents are lost.
         const item = own(state.entries, command.entryId)
         if (!item || item.id === 'root') fail('NOT_FOUND', 404, 'File not found.')
+        this.requireGitWrite(tx, item)
         checkRevision(item, command.expectedRevision)
         if (command.type === 'purge') {
           if (!item.deletedAt && !item.missing) fail('NOT_IN_TRASH', 409, 'Move the item to trash before permanent deletion.')

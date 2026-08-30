@@ -12,7 +12,7 @@
 
 一阶段完成项目、群组、文件、权限、容量、版本、回收站及 Agent 任务生命周期的闭环。不能用仅有 API/CLI 的方案替代真实目录，也不能用开放底层磁盘目录的方式绕过这些控制。
 
-二阶段才处理 Git 仓库关联、克隆、分支、独立任务工作目录、worktree、合并和推送。一阶段不自动 clone 仓库，不建设代码运行平台。
+二阶段处理 Git 仓库关联、克隆、共享工作树、分支和提交；推送及远端合并继续后置。一阶段本身不自动 clone 仓库。
 
 ## 2. 已确认的产品规则
 
@@ -342,29 +342,30 @@ cd agent-fuse && go test ./...
 - 回滚到旧版时必须阻止旧的宽松项目关联接口、创建群聊入口重新修改受保护项目；不能留下新数据却让旧代码绕过权限和独占约束。必要时保留兼容保护层或暂时关闭相关入口。
 - 远程现有部署仍是开发服务，且 `agent.md` 记录未使用 systemd 自动启动；文件持久化、服务监管和重启恢复必须实测，不能从源码中存在 Docker/FUSE 配置推断线上已经具备。
 
-## 13. 二阶段：关联 Git 仓库
+## 13. 二阶段：项目共享 Git 仓库
 
-2026-08-30 开始实施二阶段首批范围：每个项目可配置一个 HTTPS Git 地址和可选默认分支；工作区管理员可保存多个 Git 用户名/token，但数据库约束同一工作区同时最多启用一个。token 使用服务端 AES-256-GCM 加密，只在受信服务同步私有 mirror 时通过一次性 `GIT_ASKPASS` 环境使用，不进入 URL、参数、日志、浏览器响应、Agent 环境或仓库配置。凭据绑定 Git Host，防止把一个站点的 token 发给另一个站点。
+2026-08-30 按最新产品决定调整二阶段模型：一个 Cumora 项目持有一套 Git 用户名和 token，并可配置多个共用该凭据的 HTTPS Git 仓库。不再使用工作区全局凭据、每仓库独立 token 或“同一时间仅一个工作区 token 生效”的规则。token 使用服务端 AES-256-GCM 加密，只在受信 Git 服务 clone 时通过一次性 `GIT_ASKPASS` 使用；不进入 URL、参数、日志、浏览器响应、Agent 环境或仓库配置。
 
 实现边界如下：
 
-- 私有 mirror 位于 `CUMORA_PROJECT_GIT_ROOT`，Grok Bot 主机固定为 `/workspace/cumora-data/project-git`；启动脚本与项目正文相同，拒绝 `/workspace` 外的配置。
-- Agent 不共享 checkout。每个受控项目任务从已同步 mirror 复制新的 `/home/agent/repository`，remote URL 不含凭据；共享文档继续挂载在 `/projects/<projectId>`，两者互不替代。
-- 任务从管理员配置或远端解析出的默认分支开始。用户明确要求后，Agent 可在自己的 checkout 内执行 `git switch <branch>`；切换不改变其他任务，也不把旧任务目录改指向新项目。
-- 首批不向 Agent 提供 token，因此任务内 fetch/pull/push 默认不可用；管理员在界面显式“同步仓库”后，新任务才使用新的 mirror 快照。push、提交审查、成果回存继续作为后续增量。
-- Git 仓库不是常驻上下文。Agent 只在用户任务明确要求查看代码或某个范围时读取，不因存在 `AGENTS.md`、脚本、hook 或其他指令文件就自动执行。
-- 代码 checkout 的空间和依赖不计入共享文档 5GB/25MiB 配额；首版需继续测量 mirror 与每任务完整 clone 的磁盘成本，再决定对象池、partial clone 或安全 worktree 优化。
+- 仓库普通文件进入项目的共享版本文件空间，与共享文档共同计入项目 5GB；单文件仍受 25MiB 限制。界面把“共享文档”和“Git 仓库”分区展示，但两者属于同一项目。
+- Agent 在稳定路径 `/projects/<projectId>/Repositories/<仓库名>` 读写共享工作树。仓库不是 Agent 常驻上下文；只有用户明确要求查看或修改代码时才读取，不自动执行仓库里的脚本、hook 或指令文件。
+- 群内真人和 Agent 都能浏览及下载工作树。真人没有修改入口，后端也拒绝真人上传、覆盖、移动、重命名、删除或恢复 Git 区域；只有持有当前项目任务租约的 Agent 能修改。
+- `.git` 数据库和 token 位于私有 `CUMORA_PROJECT_GIT_ROOT`，Grok Bot 固定为 `/workspace/cumora-data/project-git`。它们不挂给 Agent。Agent 通过受控 `cumora project-git list/status/switch/commit` 操作共享仓库。
+- 分支切换是共享状态变化。切换前必须工作树干净，且没有另一条活动 Agent 项目任务；不会把已运行任务目录静默改指向其他项目。提交同样串行化，并记录 Agent 作者和提交时间。
+- 第一批支持 clone、浏览、Agent 编辑、切换本地已有分支和本地 commit；不提供 fetch/pull/push、远端合并、PR 或真人在线编辑。已经 clone 的仓库不能由管理员“重新同步”覆盖本地提交。
+- 不支持符号链接、硬链接、设备文件和 submodule。工作树使用现有版本检查、冲突副本和回收站规则；服务端 mirror 不作为用户可见文件，也不进入模型上下文。
 
 实施清单：
 
-- [x] 添加 Git 凭据加密存储、Host 绑定、多个凭据和单一启用约束。
-- [x] 添加项目 Git 地址/默认分支、同步状态、固定提交和管理员 API/界面。
-- [x] 添加私有 mirror 同步及 token-free remote 配置；拒绝含凭据 URL、非 HTTPS、直接本地/私网目标和重定向。
-- [x] 添加每任务独立 checkout、默认分支和任务内分支切换能力；mirror 不挂入任务。
-- [x] 在远程 Linux 隔离环境完成迁移、权限、mirror、checkout、分支切换和 token 不泄漏验证。
-- [ ] 部署 `dev`，配置持久 Git root，完成线上管理员界面和新任务验收。
+- [x] 将数据库改为项目级单一加密 token 加多仓库，并移除运行路径中的工作区全局 active token 和每仓库 token。
+- [x] 将工作树导入共享文件版本层，共享 5GB 计量；添加 Git 来源标记和真人只读的服务端强制校验。
+- [x] 移除每任务私有 checkout；Agent 通过共享 FUSE 路径编辑，并使用受控 Git 状态、切分支和提交命令。
+- [x] 将界面改为共享文档与多个 Git 仓库分区；所有群成员可浏览/下载，只有管理员配置仓库。
+- [ ] 完成独立 PostgreSQL/Redis、真实 HTTPS clone、共享编辑/commit、分支切换、冲突、配额及 Linux FUSE 回归。
+- [ ] 推送修订后的 `dev`，配置持久 Git root，部署并完成线上管理员与 Agent 验收。
 
-隔离验证记录：Git/项目任务/项目文件与 API 集成共 41 项通过，另用公开小仓库完成真实 HTTPS 同步、默认分支解析、私有 mirror、任务 checkout 和 token/私有路径不进入两个仓库配置的闭环。首次网络 smoke 发现远端 HEAD 已创建同名本地分支时不能重复 `--track`，实现已按 ref 是否存在分别使用普通 `switch` 或 tracking switch，并对两种分支重测通过。测试使用独立 PostgreSQL、Redis、文件根和 Git 根，未连接或修改线上业务库。
+旧的“一个项目一个仓库、工作区多 token 但仅一个全局生效、每任务私有 checkout”，以及短暂出现过的“每仓库独立 token”实现保留在 Git 历史中，仅作为开发过程记录；它们不再是交付行为，后续 `dev` 以本节规则为准。
 
 ## 14. 开始实施时的第一步
 

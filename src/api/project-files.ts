@@ -1,12 +1,13 @@
-import { api, ApiError, getServerOrigin, http, type ApiAttachment } from './client'
 import { getActiveCompanyId, getAuthToken } from '@/stores/auth'
 import { useConversations } from '@/stores/conversations'
+import { type ApiAttachment, ApiError, api, getServerOrigin, http } from './client'
 
 export interface ProjectFileEntry {
   id: string; parentId: string | null; name: string; kind: 'file' | 'directory'
   revision: string; versionId: string | null; size: number; modifiedAt: string
   modifiedBy: { id: string; name: string; kind: 'human' | 'agent' }
   deletedAt: string | null; trashRoot: string | null
+  source?: { kind: 'git'; repositoryId: string }
 }
 export interface ProjectFileListing {
   entries: ProjectFileEntry[]; ancestors: ProjectFileEntry[]; usedBytes: number; reservedBytes: number

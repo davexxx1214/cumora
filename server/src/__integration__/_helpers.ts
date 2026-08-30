@@ -14,8 +14,8 @@
  * subsume).
  */
 import { createHmac, randomUUID } from 'node:crypto'
-import { pool } from '../db/pool.js'
 import { ensureSchema } from '../db/migrate.js'
+import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 
 let schemaReady: Promise<void> | null = null
@@ -57,6 +57,8 @@ const TABLES_TO_WIPE: readonly string[] = [
   'conversation_reads',
   'conversation_counters',
   'messages',
+  'project_git_repositories',
+  'project_git_access',
   'project_git_settings',
   'company_git_credentials',
   'conversations',

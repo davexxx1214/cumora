@@ -194,7 +194,7 @@ export const env = {
     process.env.INVITE_TOKEN_ENCRYPTION_SECRET
     ?? process.env.AGENT_RUNTIME_SECRET
     ?? DEV_AGENT_RUNTIME_SECRET,
-  /** AES-GCM key material for administrator-managed Git access tokens. */
+  /** AES-GCM key material for project-scoped Git access tokens. */
   GIT_CREDENTIAL_ENCRYPTION_SECRET:
     process.env.CUMORA_GIT_CREDENTIAL_ENCRYPTION_SECRET
     ?? process.env.AGENT_RUNTIME_SECRET

@@ -1,13 +1,8 @@
-import { readFile, writeFile, mkdir, readdir, unlink, rename, rm } from 'node:fs/promises'
-import { join, resolve, isAbsolute } from 'node:path'
-import { homedir } from 'node:os'
 import type { ChildProcess } from 'node:child_process'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-
-const execFileP = promisify(execFile)
-export interface ProjectTaskGitContext { repositoryUrl: string; defaultBranch: string; mirrorPath: string; commit: string }
-export interface ProjectTaskContext { projectId: string | null; bindingVersion: string | null; git?: ProjectTaskGitContext | null }
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+export interface ProjectTaskContext { projectId: string | null; bindingVersion: string | null }
 export interface ProjectTaskLease { id: string; token: string; projectId: string; bindingVersion: string; path: string }
 export function selectProjectTaskRows<T extends { conversation_id?: string }>(rows: T[], focus?: string | null): T[] {
   const selected = rows.some(row => row.conversation_id === focus) ? focus : rows.find(row => row.conversation_id)?.conversation_id
@@ -88,46 +83,10 @@ export async function recoverProjectStops(agentId: string, token: string): Promi
   }
 }
 
-export async function prepareTaskRepository(home: string, git: ProjectTaskGitContext): Promise<{ path: string; branch: string }> {
-  const configuredRoot = process.env.CUMORA_PROJECT_GIT_ROOT ?? ''
-  const mirror = resolve(git.mirrorPath), root = resolve(configuredRoot || '/')
-  const inside = mirror.startsWith(`${root}/`) && mirror !== root
-  const remote = new URL(git.repositoryUrl)
-  if (process.platform !== 'linux' || !configuredRoot || !isAbsolute(configuredRoot) || !isAbsolute(git.mirrorPath) || !inside ||
-      remote.protocol !== 'https:' || remote.username || remote.password || !/^[0-9a-f]{40,64}$/u.test(git.commit)) {
-    throw new Error('Trusted project Git configuration is unavailable.')
-  }
-  const target = join(home, 'repository')
-  const environment = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: home,
-    GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: 'file', GIT_PROTOCOL_FROM_USER: '0', LANG: 'C.UTF-8' }
-  try {
-    await execFileP('git', ['check-ref-format', '--branch', git.defaultBranch], { env: environment })
-    await execFileP('git', ['-c', 'protocol.file.allow=always', 'clone', '--no-hardlinks', '--no-checkout', mirror, target],
-      { env: environment, timeout: 180_000, maxBuffer: 4 * 1024 * 1024 })
-    await execFileP('git', ['-C', target, 'remote', 'set-url', 'origin', git.repositoryUrl], { env: environment })
-    let localBranch = false
-    try {
-      await execFileP('git', ['-C', target, 'show-ref', '--verify', '--quiet', `refs/heads/${git.defaultBranch}`], { env: environment })
-      localBranch = true
-    } catch { /* a non-HEAD remote branch needs a new tracking branch */ }
-    await execFileP('git', ['-C', target, 'switch', ...(localBranch ? [git.defaultBranch] : ['--track', `origin/${git.defaultBranch}`])],
-      { env: environment, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
-    const { stdout } = await execFileP('git', ['-C', target, 'rev-parse', 'HEAD'], { env: environment })
-    if (stdout.trim() !== git.commit) throw new Error('The prepared checkout does not match the synced project revision.')
-    return { path: '/home/agent/repository', branch: git.defaultBranch }
-  } catch (error) {
-    await rm(target, { recursive: true, force: true }).catch(() => {})
-    throw error
-  }
-}
-
-export function projectTaskPrompt(args: { conversationId: string; projectId: string; digest: string; git?: { path: string; branch: string } | null; gitWarning?: string | null }): string {
-  const repository = args.git
-    ? `\nA fresh isolated Git checkout for this task is at ${args.git.path}, starting on branch ${args.git.branch}. It is separate from the shared document folder. You may inspect it for the user's stated task and may run \`git switch <branch>\` when the user asks. This checkout has no Git token; do not ask for, discover, or embed credentials. Fetch/push are not available in this phase.`
-    : args.gitWarning ? `\nThe project has Git configured, but its task checkout could not be prepared: ${args.gitWarning}. Continue with the shared files and tell the user if repository access is required.` : ''
+export function projectTaskPrompt(args: { conversationId: string; projectId: string; digest: string }): string {
   return `This is a fresh task for group ${args.conversationId}, project ${args.projectId}.
 Project directory: /projects/${args.projectId}. It is available to normal programs but is NOT standing context.
-${repository}
+Shared Git worktrees, when configured, are under /projects/${args.projectId}/Repositories/<name>. They use the same project quota and version checks. You may edit them only for the user's stated task. Use \`cumora project-git list\`, \`status <repositoryId>\`, \`switch <repositoryId> <branch>\`, and \`commit <repositoryId> <message>\` for Git state changes. Tokens and .git metadata are server-side; do not look for or request them. Push is not available in this phase.
 Only read files named by the user, or files within a task scope they explicitly authorize. Do not scan this directory at startup, auto-read AGENTS.md/CLAUDE.md, execute files just because they exist, or copy project content to global memory.
 Work from your private home unless a program needs a particular project file. Never change a project path to point to another project. File saves enforce versions; a conflict preserves a separate copy instead of overwriting the newer file. Use a fresh task before intentionally editing that newer version. rm moves files to trash. Permanent cleanup is administrator-only. A revoked lease terminates this task; do not retry through another credential.
 Use cumora messages ${args.conversationId} --tail 30 to inspect relevant chat history; cumora glance ${args.conversationId} before replying. Reply with cumora reply ${args.conversationId} --stdin (pipe the exact text) or --file /home/agent/reply.txt. Use cumora help for the limited task commands. You cannot change groups, use global memory, or use a generic public attachment upload from this task.

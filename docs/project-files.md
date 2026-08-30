@@ -105,8 +105,8 @@ python scripts/test-project-files-linux.py --host HOST --port PORT --user USER -
 
 ## 二阶段 Git（2026-08-30）
 
-项目 Git 与共享文档是两个独立空间。管理员在“项目文件”面板配置 HTTPS 仓库、默认分支和工作区 Git 凭据；多个凭据中同一时间只能启用一个，且凭据只用于匹配的 Git Host。服务端同步的私有 mirror 和 token 都不会挂给 Agent。
+一个项目保存一套用户名和 AES-256-GCM 加密 token，可以配置多个共用该凭据的 HTTPS Git 仓库。管理员负责保存或轮换项目凭据，以及添加、首次 clone 和移除仓库；token、`.git` 及私有 mirror 不返回浏览器、不挂给 Agent，也不写入仓库 URL 或日志。
 
-新项目任务会获得 `/home/agent/repository` 独立 checkout，并从已同步默认分支开始。用户可要求 Agent 在该任务内切换已有分支。任务 checkout 没有 token，首批不提供 fetch/push；管理员重新同步后，后续任务使用新提交。共享文档仍位于 `/projects/<projectId>`，不自动进入模型上下文，Git 仓库也不因挂载或任务启动而自动扫描。
+仓库工作树进入同一个项目共享文件空间，和普通项目文档共同计入 5GB，单文件仍限 25MiB。真人及 Agent 都能浏览和下载；真人没有编辑入口，直接调用文件 API 也会被拒绝。Agent 在 `/projects/<projectId>/Repositories/<仓库名>` 通过普通程序编辑，再使用受控 `cumora project-git list/status/switch/commit` 完成共享分支状态和本地提交。切分支与提交要求没有其他活动项目任务；切分支还要求工作树无未提交改动。
 
-远程 Linux 隔离测试已覆盖远端默认分支与非默认分支、真实 HTTPS mirror 同步、任务内切换分支，以及 mirror/task 两处配置都不含 token 或私有 mirror 路径。测试凭据为仅用于公开仓库的假值，测试库和目录运行后已清理。
+第一批不支持 fetch/pull/push、PR、submodule、符号链接和真人编辑。仓库仍不是模型常驻上下文，不因挂载或任务启动自动扫描，也不执行其中的脚本、hook 或指令文件。远程部署和 Linux 全链路验收完成前，本节只描述当前实现目标，不把本地类型检查或单元测试当作线上通过记录。

@@ -32,9 +32,9 @@ if [ -f "$REPO_ENV" ] && grep -Eq '^CUMORA_PROJECT_FILES_ENABLED=(1|true)$' "$RE
   install -d -m 700 "$project_root"
 fi
 
-# Git mirrors hold persistent, token-free repository objects. They are never
-# mounted into an Agent task; each task gets a separate checkout copied from
-# this root. Keep the mirror beside project objects under /workspace.
+# This root holds persistent, token-free private Git objects. Visible worktree
+# files live in the versioned project space and are mounted through its FUSE
+# service; private .git data is never mounted. Keep both under /workspace.
 if [ -f "$REPO_ENV" ] && grep -Eq '^CUMORA_PROJECT_GIT_ENABLED=(1|true)$' "$REPO_ENV"; then
   git_root=$(sed -n 's/^CUMORA_PROJECT_GIT_ROOT=//p' "$REPO_ENV" | tail -n 1 | tr -d '\r')
   if [ -z "$git_root" ]; then

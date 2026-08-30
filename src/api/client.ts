@@ -206,26 +206,29 @@ export interface ApiProject {
   conversationCount: number
 }
 
-export interface ApiGitCredential {
+export interface ApiProjectGitRepository {
   id: string
-  name: string
-  host: string
-  username: string
-  tokenHint: string
-  active: boolean
-  createdAt: string
-  updatedAt: string
-}
-
-export interface ApiProjectGitSettings {
   projectId: string
+  name: string
   repositoryUrl: string
+  host: string
   defaultBranch: string | null
-  resolvedDefaultBranch: string | null
+  currentBranch: string | null
   syncStatus: 'not_synced' | 'syncing' | 'ready' | 'failed'
   syncError: string | null
   lastSyncedAt: string | null
   lastCommit: string | null
+  rootEntryId: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ApiProjectGitCredential {
+  projectId: string
+  username: string
+  tokenHint: string
+  createdAt: string
+  updatedAt: string
 }
 
 export interface ApiParticipant {
@@ -866,15 +869,6 @@ export const api = {
   listCompanies: () =>
     http<Array<{ id: string; name: string; slug: string; createdAt: string; role: string }>>('/companies'),
   listProjects: () => http<ApiProject[]>('/projects'),
-  listGitCredentials: () => http<ApiGitCredential[]>('/git/credentials'),
-  createGitCredential: (input: { name: string; host: string; username: string; token: string; active?: boolean }) =>
-    http<ApiGitCredential>('/git/credentials', { method: 'POST', body: JSON.stringify(input) }),
-  updateGitCredential: (id: string, input: { name?: string; host?: string; username?: string; token?: string }) =>
-    http<ApiGitCredential>(`/git/credentials/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) }),
-  activateGitCredential: (id: string) =>
-    http<{ ok: boolean }>(`/git/credentials/${encodeURIComponent(id)}/activate`, { method: 'POST' }),
-  deleteGitCredential: (id: string) =>
-    http<{ ok: boolean }>(`/git/credentials/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   getShippingOverview: () => http<ShippingOverview>('/shipping/overview'),
   getShippingFeature: (id: string) => http<ShippingFeatureDetail>(`/shipping/features/${encodeURIComponent(id)}`),
   createShippingFeature: (input: {
@@ -923,13 +917,18 @@ export const api = {
     http<{ ok: boolean; status: string }>(`/projects/${encodeURIComponent(id)}/archive`, {
       method: 'POST', body: JSON.stringify({ archive }),
     }),
-  getProjectGit: (id: string) => http<ApiProjectGitSettings | null>(`/projects/${encodeURIComponent(id)}/git`),
-  saveProjectGit: (id: string, input: { repositoryUrl: string; defaultBranch?: string | null }) =>
-    http<ApiProjectGitSettings>(`/projects/${encodeURIComponent(id)}/git`, { method: 'PUT', body: JSON.stringify(input) }),
-  clearProjectGit: (id: string) =>
-    http<{ ok: boolean }>(`/projects/${encodeURIComponent(id)}/git`, { method: 'DELETE' }),
-  syncProjectGit: (id: string) =>
-    http<ApiProjectGitSettings>(`/projects/${encodeURIComponent(id)}/git/sync`, { method: 'POST' }),
+  listProjectGit: (id: string) => http<ApiProjectGitRepository[]>(`/projects/${encodeURIComponent(id)}/git`),
+  getProjectGitCredential: (id: string) => http<ApiProjectGitCredential | null>(`/projects/${encodeURIComponent(id)}/git/credential`),
+  saveProjectGitCredential: (id: string, input: { username: string; token: string }) =>
+    http<ApiProjectGitCredential>(`/projects/${encodeURIComponent(id)}/git/credential`, { method: 'PUT', body: JSON.stringify(input) }),
+  createProjectGit: (id: string, input: { name: string; repositoryUrl: string; defaultBranch?: string | null }) =>
+    http<ApiProjectGitRepository>(`/projects/${encodeURIComponent(id)}/git`, { method: 'POST', body: JSON.stringify(input) }),
+  updateProjectGit: (id: string, repositoryId: string, input: Partial<{ name: string; repositoryUrl: string; defaultBranch: string | null }>) =>
+    http<ApiProjectGitRepository>(`/projects/${encodeURIComponent(id)}/git/${encodeURIComponent(repositoryId)}`, { method: 'PUT', body: JSON.stringify(input) }),
+  deleteProjectGit: (id: string, repositoryId: string) =>
+    http<{ ok: boolean }>(`/projects/${encodeURIComponent(id)}/git/${encodeURIComponent(repositoryId)}`, { method: 'DELETE' }),
+  syncProjectGit: (id: string, repositoryId: string) =>
+    http<ApiProjectGitRepository>(`/projects/${encodeURIComponent(id)}/git/${encodeURIComponent(repositoryId)}/sync`, { method: 'POST' }),
   attachProject: (conversationId: string, projectId: string | null) =>
     http<{ ok: boolean; projectId: string | null }>(`/conversations/${encodeURIComponent(conversationId)}/project`, {
       method: 'POST', body: JSON.stringify({ projectId }),
