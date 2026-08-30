@@ -7,6 +7,7 @@ import argparse
 import io
 from pathlib import Path, PurePosixPath
 import shlex
+import socket
 import sys
 import tarfile
 import uuid
@@ -84,6 +85,8 @@ try:
     if GROK_SMOKE:
         env['CUMORA_PROJECT_GROK_SMOKE'] = '1'
         env['CUMORA_PROJECT_GROK_BINARY'] = str((pathlib.Path.home() / '.grok/bin/grok').resolve())
+    if GIT_NETWORK_SMOKE:
+        env['CUMORA_PROJECT_GIT_NETWORK_SMOKE'] = '1'
     if any('project-files.test.ts' in t for t in TESTS):
         document_libs = root / 'python-documents'
         run(['python3', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-cache-dir', '--quiet', '--target', str(document_libs),
@@ -119,12 +122,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', required=True)
     parser.add_argument('--port', type=int, default=22)
+    parser.add_argument('--connect-host', default='',
+                        help='Optional TCP endpoint for a pre-established SSH forward; host-key identity stays --host')
+    parser.add_argument('--connect-port', type=int, default=0)
     parser.add_argument('--user', required=True)
     parser.add_argument('--key', type=Path, required=True)
+    parser.add_argument('--proxy-command', default='',
+                        help='Optional SSH ProxyCommand; %h and %p are replaced with host and port')
     parser.add_argument('--test', action='append', default=[])
     parser.add_argument('--unit', action='store_true', help='Also run the existing unit suite in the isolated Linux environment')
     parser.add_argument('--engine-smoke', action='store_true', help='Opt in to one real Codex task using host model authentication, isolated test files only')
     parser.add_argument('--grok-smoke', action='store_true', help='Opt in to one real Grok task using host model authentication, isolated test files only')
+    parser.add_argument('--git-network-smoke', action='store_true',
+                        help='Opt in to cloning a small public HTTPS repository through the project Git service')
     parser.add_argument('--match', default='', help='Only run tests matching this Node test-name pattern')
     parser.add_argument('--repeat', type=int, default=1, choices=range(1, 21))
     args = parser.parse_args()
@@ -168,13 +178,21 @@ def main():
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     # RejectPolicy is intentional. Do not accept an unknown/changed host key.
-    client.connect(args.host, port=args.port, username=args.user, pkey=key, look_for_keys=False, allow_agent=False, timeout=15)
+    proxy = None
+    forwarded = None
+    if args.proxy_command:
+        command = args.proxy_command.replace('%h', args.host).replace('%p', str(args.port))
+        proxy = paramiko.ProxyCommand(command)
+    elif args.connect_host:
+        forwarded = socket.create_connection((args.connect_host, args.connect_port or args.port), timeout=15)
+    client.connect(args.host, port=args.port, username=args.user, pkey=key, look_for_keys=False,
+                   allow_agent=False, timeout=15, sock=proxy or forwarded)
     try:
         with client.open_sftp() as sftp:
             payload.seek(0)
             sftp.putfo(payload, remote_archive)
             sftp.chmod(remote_archive, 0o600)
-        code = 'ARCHIVE = ' + repr(remote_archive) + '\nTESTS = ' + repr(tests) + '\nUNIT = ' + repr(args.unit) + '\nENGINE_SMOKE = ' + repr(args.engine_smoke) + '\nGROK_SMOKE = ' + repr(args.grok_smoke) + '\nMATCH = ' + repr(args.match) + '\nREPEAT = ' + repr(args.repeat) + '\n' + REMOTE
+        code = 'ARCHIVE = ' + repr(remote_archive) + '\nTESTS = ' + repr(tests) + '\nUNIT = ' + repr(args.unit) + '\nENGINE_SMOKE = ' + repr(args.engine_smoke) + '\nGROK_SMOKE = ' + repr(args.grok_smoke) + '\nGIT_NETWORK_SMOKE = ' + repr(args.git_network_smoke) + '\nMATCH = ' + repr(args.match) + '\nREPEAT = ' + repr(args.repeat) + '\n' + REMOTE
         channel = client.get_transport().open_session()
         channel.set_combine_stderr(True)
         channel.exec_command('python3 -u -c ' + shlex.quote(code))
@@ -184,6 +202,10 @@ def main():
         return channel.recv_exit_status()
     finally:
         client.close()
+        if proxy is not None:
+            proxy.close()
+        if forwarded is not None:
+            forwarded.close()
 
 
 if __name__ == '__main__':

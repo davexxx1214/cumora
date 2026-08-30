@@ -105,7 +105,12 @@ export async function prepareTaskRepository(home: string, git: ProjectTaskGitCon
     await execFileP('git', ['-c', 'protocol.file.allow=always', 'clone', '--no-hardlinks', '--no-checkout', mirror, target],
       { env: environment, timeout: 180_000, maxBuffer: 4 * 1024 * 1024 })
     await execFileP('git', ['-C', target, 'remote', 'set-url', 'origin', git.repositoryUrl], { env: environment })
-    await execFileP('git', ['-C', target, 'switch', '--track', `origin/${git.defaultBranch}`],
+    let localBranch = false
+    try {
+      await execFileP('git', ['-C', target, 'show-ref', '--verify', '--quiet', `refs/heads/${git.defaultBranch}`], { env: environment })
+      localBranch = true
+    } catch { /* a non-HEAD remote branch needs a new tracking branch */ }
+    await execFileP('git', ['-C', target, 'switch', ...(localBranch ? [git.defaultBranch] : ['--track', `origin/${git.defaultBranch}`])],
       { env: environment, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
     const { stdout } = await execFileP('git', ['-C', target, 'rev-parse', 'HEAD'], { env: environment })
     if (stdout.trim() !== git.commit) throw new Error('The prepared checkout does not match the synced project revision.')

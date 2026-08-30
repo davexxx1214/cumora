@@ -6,11 +6,12 @@ import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { spawn, execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { buildApiTestApp, ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll } from './_helpers.js'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
-import { createProjectLease, projectFilesFor, stopProjectLease } from '../project-files/service.js'
+import { createProjectLease, currentAgentProject, projectFilesFor, stopProjectLease } from '../project-files/service.js'
 import { LocalProjectObjects } from '../project-files/objects.js'
 import { PROJECT_FILE_MAX_BYTES, type ProjectFileState } from '../project-files/model.js'
 import { projectMountRouter } from '../project-files/mount-router.js'
@@ -20,7 +21,10 @@ import { withTaskSandbox, spawnTaskProcess } from '../agents/computer/task-sandb
 import { prepareTaskAuth } from '../agents/computer/task-sandbox.js'
 import { getAdapter } from '../agents/computer/engine.js'
 import { storage } from '../storage.js'
-import { trackProjectTask, recoverProjectStops } from '../agents/computer/project-task.js'
+import { trackProjectTask, recoverProjectStops, prepareTaskRepository } from '../agents/computer/project-task.js'
+import { readyProjectGit } from '../project-git/service.js'
+
+const execFileP = promisify(execFile)
 
 const users = ['owner', 'member', 'outsider'] as const
 const servers: Server[] = []
@@ -178,6 +182,44 @@ test('[integration] administrators configure encrypted Git credentials and proje
   assert.equal(memberView.status, 200)
   assert.equal((await memberView.json() as { repositoryUrl: string }).repositoryUrl, 'https://github.com/acme/repo.git')
   assert.equal((await request('outsider', '/projects/p-files/git')).status, 404)
+})
+
+test('[integration] project Git sync creates a token-free mirror and an independent task checkout', {
+  skip: process.env.CUMORA_PROJECT_GIT_NETWORK_SMOKE !== '1', timeout: 120_000,
+}, async () => {
+  const fakeToken = 'github_pat_public_repository_smoke_only'
+  assert.equal((await request('owner', '/git/credentials', 'POST', {
+    name: 'Public smoke', host: 'github.com', username: 'cumora-smoke', token: fakeToken, active: true,
+  })).status, 201)
+  assert.equal((await request('owner', '/projects/p-files/git', 'PUT', {
+    repositoryUrl: 'https://github.com/octocat/Hello-World.git', defaultBranch: '',
+  })).status, 200)
+  const synced = await request('owner', '/projects/p-files/git/sync', 'POST', {})
+  assert.equal(synced.status, 200, await synced.clone().text())
+  const body = await synced.json() as { syncStatus: string; resolvedDefaultBranch: string; lastCommit: string }
+  assert.equal(body.syncStatus, 'ready')
+  assert.ok(body.resolvedDefaultBranch)
+  assert.match(body.lastCommit, /^[0-9a-f]{40}$/u)
+  const ready = await readyProjectGit('co-files', 'p-files')
+  assert.ok(ready)
+  const mirrorConfig = await readFile(join(ready.mirrorPath, 'config'), 'utf8')
+  assert.equal(mirrorConfig.includes(fakeToken), false)
+  assert.match(mirrorConfig, /url = https:\/\/github\.com\/octocat\/Hello-World\.git/u)
+  const context = await currentAgentProject('agent', 'co-files', 'g-files')
+  assert.equal(context.git?.commit, body.lastCommit)
+  const taskHome = await mkdtemp(join(root, 'git-task-'))
+  const oldRoot = process.env.CUMORA_PROJECT_GIT_ROOT
+  try {
+    process.env.CUMORA_PROJECT_GIT_ROOT = env.PROJECT_GIT_ROOT
+    const checkout = await prepareTaskRepository(taskHome, context.git!)
+    assert.equal(checkout.branch, body.resolvedDefaultBranch)
+    const taskConfig = await readFile(join(taskHome, 'repository', '.git', 'config'), 'utf8')
+    assert.equal(taskConfig.includes(fakeToken), false)
+    assert.equal(taskConfig.includes(ready.mirrorPath), false)
+    assert.equal((await execFileP('git', ['-C', join(taskHome, 'repository'), 'branch', '--show-current'])).stdout.trim(), body.resolvedDefaultBranch)
+  } finally {
+    if (oldRoot === undefined) delete process.env.CUMORA_PROJECT_GIT_ROOT; else process.env.CUMORA_PROJECT_GIT_ROOT = oldRoot
+  }
 })
 
 test('[integration] project binding is exclusive, including direct SQL and group creation', async () => {

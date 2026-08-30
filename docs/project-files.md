@@ -108,3 +108,5 @@ python scripts/test-project-files-linux.py --host HOST --port PORT --user USER -
 项目 Git 与共享文档是两个独立空间。管理员在“项目文件”面板配置 HTTPS 仓库、默认分支和工作区 Git 凭据；多个凭据中同一时间只能启用一个，且凭据只用于匹配的 Git Host。服务端同步的私有 mirror 和 token 都不会挂给 Agent。
 
 新项目任务会获得 `/home/agent/repository` 独立 checkout，并从已同步默认分支开始。用户可要求 Agent 在该任务内切换已有分支。任务 checkout 没有 token，首批不提供 fetch/push；管理员重新同步后，后续任务使用新提交。共享文档仍位于 `/projects/<projectId>`，不自动进入模型上下文，Git 仓库也不因挂载或任务启动而自动扫描。
+
+远程 Linux 隔离测试已覆盖远端默认分支与非默认分支、真实 HTTPS mirror 同步、任务内切换分支，以及 mirror/task 两处配置都不含 token 或私有 mirror 路径。测试凭据为仅用于公开仓库的假值，测试库和目录运行后已清理。

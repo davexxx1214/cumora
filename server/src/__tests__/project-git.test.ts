@@ -41,10 +41,10 @@ test('Git configuration rejects credentials, non-HTTPS, local targets and malfor
 
 test('Linux project task gets a token-free independent checkout and can switch branches', { skip: process.platform !== 'linux', timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-project-git-'))
-  const source = join(root, 'source'), mirror = join(root, 'mirrors', 'project.git'), home = join(root, 'task-home')
+  const source = join(root, 'source'), mirror = join(root, 'mirrors', 'project.git'), home = join(root, 'task-home'), headHome = join(root, 'head-task-home')
   const oldRoot = process.env.CUMORA_PROJECT_GIT_ROOT
   try {
-    await Promise.all([mkdir(source, { recursive: true }), mkdir(join(root, 'mirrors'), { recursive: true }), mkdir(home)])
+    await Promise.all([mkdir(source, { recursive: true }), mkdir(join(root, 'mirrors'), { recursive: true }), mkdir(home), mkdir(headHome)])
     await execFileP('git', ['init', '-b', 'main'], { cwd: source })
     await execFileP('git', ['config', 'user.name', 'Cumora Test'], { cwd: source })
     await execFileP('git', ['config', 'user.email', 'cumora@test.local'], { cwd: source })
@@ -53,6 +53,7 @@ test('Linux project task gets a token-free independent checkout and can switch b
     const commit = (await execFileP('git', ['rev-parse', 'HEAD'], { cwd: source })).stdout.trim()
     await execFileP('git', ['switch', '-c', 'feature/test'], { cwd: source })
     await writeFile(join(source, 'feature.txt'), 'feature\n'); await execFileP('git', ['add', '.'], { cwd: source }); await execFileP('git', ['commit', '-m', 'feature'], { cwd: source })
+    const featureCommit = (await execFileP('git', ['rev-parse', 'HEAD'], { cwd: source })).stdout.trim()
     await execFileP('git', ['clone', '--mirror', source, mirror])
     process.env.CUMORA_PROJECT_GIT_ROOT = root
     const prepared = await prepareTaskRepository(home, { repositoryUrl: 'https://github.com/acme/repo.git', defaultBranch: 'main', mirrorPath: mirror, commit })
@@ -63,6 +64,9 @@ test('Linux project task gets a token-free independent checkout and can switch b
     assert.ok(!(await readFile(join(checkout, '.git', 'config'), 'utf8')).includes(root))
     await execFileP('git', ['switch', 'feature/test'], { cwd: checkout })
     assert.equal((await readFile(join(checkout, 'feature.txt'), 'utf8')).trim(), 'feature')
+    const headPrepared = await prepareTaskRepository(headHome, { repositoryUrl: 'https://github.com/acme/repo.git', defaultBranch: 'feature/test', mirrorPath: mirror, commit: featureCommit })
+    assert.equal(headPrepared.branch, 'feature/test')
+    assert.equal((await execFileP('git', ['branch', '--show-current'], { cwd: join(headHome, 'repository') })).stdout.trim(), 'feature/test')
   } finally {
     if (oldRoot === undefined) delete process.env.CUMORA_PROJECT_GIT_ROOT; else process.env.CUMORA_PROJECT_GIT_ROOT = oldRoot
     await rm(root, { recursive: true, force: true })

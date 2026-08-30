@@ -361,8 +361,10 @@ cd agent-fuse && go test ./...
 - [x] 添加项目 Git 地址/默认分支、同步状态、固定提交和管理员 API/界面。
 - [x] 添加私有 mirror 同步及 token-free remote 配置；拒绝含凭据 URL、非 HTTPS、直接本地/私网目标和重定向。
 - [x] 添加每任务独立 checkout、默认分支和任务内分支切换能力；mirror 不挂入任务。
-- [ ] 在远程 Linux 隔离环境完成迁移、权限、mirror、checkout、分支切换和 token 不泄漏验证。
+- [x] 在远程 Linux 隔离环境完成迁移、权限、mirror、checkout、分支切换和 token 不泄漏验证。
 - [ ] 部署 `dev`，配置持久 Git root，完成线上管理员界面和新任务验收。
+
+隔离验证记录：Git/项目任务/项目文件与 API 集成共 41 项通过，另用公开小仓库完成真实 HTTPS 同步、默认分支解析、私有 mirror、任务 checkout 和 token/私有路径不进入两个仓库配置的闭环。首次网络 smoke 发现远端 HEAD 已创建同名本地分支时不能重复 `--track`，实现已按 ref 是否存在分别使用普通 `switch` 或 tracking switch，并对两种分支重测通过。测试使用独立 PostgreSQL、Redis、文件根和 Git 根，未连接或修改线上业务库。
 
 ## 14. 开始实施时的第一步
 
