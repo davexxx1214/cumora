@@ -103,16 +103,11 @@ async function main() {
     }
     next()
   })
-  // Inbound-email webhook (Cloudflare Email Worker → here). Mount BEFORE
-  // the generic JSON parser — the router has its own express.json with a
-  // `verify` hook that captures rawBody for HMAC validation. Once it
-  // parses, body-parser flips req._body=true so the generic parser below
-  // becomes a no-op for these requests.
+  // Inbound-email webhook (Cloudflare Email Worker → here). It owns its
+  // endpoint-specific 25MB parser and raw-body HMAC capture; the API and
+  // runtime routers below own their smaller/authenticated JSON policies.
   app.use('/webhooks/email', inboundEmailRouter)
 
-  // A 25MiB file expands to 34,952,536 base64 bytes, plus its JSON envelope.
-  // Keep a narrow allowance above that exact supported boundary.
-  app.use(express.json({ limit: '36mb' }))
   if (storage.mode === 'local') {
     app.use('/uploads', express.static(UPLOAD_DIR, {
       fallthrough: false,

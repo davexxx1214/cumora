@@ -20,13 +20,14 @@
  * Mount at /webhooks/email/inbound (NOT /api/...) so the user-auth
  * middleware doesn't intercept and 401 the worker.
  */
-import express, { Router, type Request, type Response } from 'express'
+import express, { Router, type Request, type Response, type NextFunction } from 'express'
 import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { storage } from '../storage.js'
 import { inc } from '../metrics.js'
 import { alertDiscord } from '../alert.js'
+import { publicBodyParserError } from '../body-parser-errors.js'
 import {
   parseAddress,
   formatAddress,
@@ -41,23 +42,59 @@ import {
 
 export const inboundEmailRouter = Router()
 
-/** Capture the raw body bytes so we can HMAC-verify before the global
- *  express.json (in index.ts) gets to it — `verify` runs as part of
- *  body-parser's parse step, perfect spot to stash the raw buffer.
- *  Mount this router BEFORE the generic `express.json` in the app
- *  middleware chain; body-parser sets `req._body = true` after parsing,
- *  so the global parser becomes a no-op for these requests.
- *
- *  25mb mirrors the upload ceiling — same rationale (don't accept emails
- *  bigger than what we'd let a human upload). */
-inboundEmailRouter.use(
-  express.json({
-    limit: '25mb',
-    verify: (req, _res, buf) => {
-      (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf)
-    },
-  }),
-)
+// Reject disabled, missing, or malformed authentication before reading a
+// potentially large request body. A well-formed signature still requires the
+// raw bytes for HMAC, but JSON parsing and object allocation happen only after
+// the constant-time comparison succeeds.
+inboundEmailRouter.use((req, res, next) => {
+  if (!env.EMAIL_INBOUND_HMAC_SECRET) {
+    res.status(503).json({ error: 'inbound email disabled (EMAIL_INBOUND_HMAC_SECRET unset)' })
+    return
+  }
+  const signature = String(req.headers['x-cumora-signature'] ?? '')
+  if (!signature) {
+    res.status(400).json({ error: 'missing signature' })
+    return
+  }
+  if (!normalizeSignature(signature)) {
+    inc('email.inbound.bad_signature')
+    res.status(401).json({ error: 'bad signature' })
+    return
+  }
+  next()
+})
+
+// 25mb mirrors the upload ceiling. `raw` bounds bytes without JSON.parse;
+// the following middleware authenticates those exact bytes first.
+inboundEmailRouter.use(express.raw({ type: 'application/json', limit: '25mb' }))
+inboundEmailRouter.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  const parserError = publicBodyParserError(err)
+  if (parserError) {
+    res.status(parserError.status).json({ error: parserError.message })
+    return
+  }
+  next(err)
+})
+inboundEmailRouter.use((req, res, next) => {
+  const raw = Buffer.isBuffer(req.body) ? req.body : null
+  if (!raw) {
+    res.status(400).json({ error: 'missing JSON body' })
+    return
+  }
+  const signature = String(req.headers['x-cumora-signature'] ?? '')
+  if (!verifySignature(raw, signature)) {
+    inc('email.inbound.bad_signature')
+    res.status(401).json({ error: 'bad signature' })
+    return
+  }
+  try {
+    req.body = JSON.parse(raw.toString('utf8')) as unknown
+  } catch {
+    res.status(400).json({ error: 'invalid JSON body' })
+    return
+  }
+  next()
+})
 
 interface InboundPayload {
   /** The full RFC 5322 Message-ID, with or without angle brackets. */
@@ -92,13 +129,18 @@ interface InboundPayload {
 
 /** Verify a hex-encoded HMAC-SHA256 against the raw body bytes. Constant-
  *  time compare so no timing oracle. */
+function normalizeSignature(signature: string): string | null {
+  let normalized = signature.trim().toLowerCase()
+  if (normalized.startsWith('sha256=')) normalized = normalized.slice(7)
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : null
+}
+
 function verifySignature(rawBody: Buffer, signature: string): boolean {
   const secret = env.EMAIL_INBOUND_HMAC_SECRET
   if (!secret) return false
   const want = createHmac('sha256', secret).update(rawBody).digest('hex')
-  let got = signature.trim().toLowerCase()
-  if (got.startsWith('sha256=')) got = got.slice(7)
-  if (got.length !== want.length) return false
+  const got = normalizeSignature(signature)
+  if (!got) return false
   try {
     return timingSafeEqual(Buffer.from(want, 'hex'), Buffer.from(got, 'hex'))
   } catch {
@@ -212,23 +254,6 @@ async function resolveSender(args: {
 }
 
 inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
-  const raw = (req as Request & { rawBody?: Buffer }).rawBody
-  const sig = String(req.headers['x-cumora-signature'] ?? '')
-  if (!raw || !sig) {
-    res.status(400).json({ error: 'missing signature or body' })
-    return
-  }
-  if (!env.EMAIL_INBOUND_HMAC_SECRET) {
-    // Feature off — refuse so a misconfigured worker can't silently
-    // succeed and have the operator wonder why no mail appears.
-    res.status(503).json({ error: 'inbound email disabled (EMAIL_INBOUND_HMAC_SECRET unset)' })
-    return
-  }
-  if (!verifySignature(raw, sig)) {
-    inc('email.inbound.bad_signature')
-    res.status(401).json({ error: 'bad signature' })
-    return
-  }
   const payload = req.body as InboundPayload
   if (!payload || typeof payload.messageId !== 'string' || typeof payload.from !== 'string') {
     res.status(400).json({ error: 'bad payload — need messageId + from' })

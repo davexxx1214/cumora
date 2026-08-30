@@ -45,7 +45,6 @@ before(async () => {
   const express = expressMod.default
   const { runtimeRouter } = await import('../agents/runtime/server.js')
   const app = express()
-  app.use(express.json({ limit: '4mb' }))
   app.use('/runtime', runtimeRouter)
   await new Promise<void>((resolve) => {
     server = createServer(app).listen(0, () => {
@@ -79,6 +78,20 @@ async function call(
   let parsed: any = null
   try { parsed = text ? JSON.parse(text) : null } catch { parsed = text }
   return { status: res.status, body: parsed }
+}
+
+async function callRaw(
+  path: string,
+  opts: { method?: string; token?: string; body: string },
+): Promise<{ status: number; body: string }> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (opts.token) headers.authorization = `Bearer ${opts.token}`
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: opts.method ?? 'POST',
+    headers,
+    body: opts.body,
+  })
+  return { status: res.status, body: await res.text() }
 }
 
 async function seedAgent(): Promise<{ agentId: string; companyId: string; token: string }> {
@@ -143,6 +156,52 @@ test('[integration] runtime: missing Authorization → 401', async () => {
   const r = await call('/runtime/inbox', { method: 'GET' })
   assert.equal(r.status, 401)
   assert.match(String(r.body?.error ?? ''), /bearer/i)
+})
+
+test('[integration] runtime: authentication rejects malformed multi-megabyte JSON before parsing', async () => {
+  const r = await callRaw('/runtime/status', {
+    body: `{${'x'.repeat(5 * 1024 * 1024)}`,
+  })
+  assert.equal(r.status, 401)
+  assert.match(r.body, /missing bearer token/i)
+})
+
+test('[integration] runtime: authenticated JSON remains bounded to 4MB', async () => {
+  const { token } = await seedAgent()
+  const r = await callRaw('/runtime/status', {
+    token,
+    body: JSON.stringify({ status: 'avail', padding: 'x'.repeat(4 * 1024 * 1024) }),
+  })
+  assert.equal(r.status, 413)
+  assert.deepEqual(JSON.parse(r.body), { error: 'request entity too large' })
+})
+
+test('[integration] runtime: FUSE whole-file writes authenticate before their large parser', async () => {
+  const r = await callRaw('/runtime/fs/write', {
+    method: 'PUT',
+    body: `{${'x'.repeat(5 * 1024 * 1024)}`,
+  })
+  assert.equal(r.status, 401)
+  assert.match(r.body, /missing bearer token/i)
+})
+
+test('[integration] runtime: FUSE preserves authenticated whole-file writes above 4MB', async () => {
+  const { agentId, token } = await seedAgent()
+  const fileBody = 'x'.repeat(5 * 1024 * 1024)
+  const r = await call('/runtime/fs/write', {
+    method: 'PUT',
+    token,
+    body: { path: 'large-workspace-file.txt', body: fileBody },
+  })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.body, { ok: true })
+  const { rows } = await pool.query<{ bytes: number }>(
+    `SELECT OCTET_LENGTH(body)::int AS bytes
+       FROM agent_workspace
+      WHERE agent_id = $1 AND path = 'large-workspace-file.txt'`,
+    [agentId],
+  )
+  assert.equal(rows[0]?.bytes, Buffer.byteLength(fileBody))
 })
 
 test('[integration] runtime: wrong scheme (Basic instead of Bearer) → 401', async () => {

@@ -23,7 +23,7 @@
  *     existing row counts as a directory. There are no explicit
  *     directory rows in `agent_workspace`.
  */
-import type { Router, Response } from 'express'
+import { json, type Router, type Response } from 'express'
 import { pool } from '../../db/pool.js'
 import { isSafePath, likeEscape } from './fs-namespace.js'
 import type { AgentRuntimeClaims } from './jwt.js'
@@ -114,7 +114,10 @@ export function attachFsEndpoints(
   }))
 
   // PUT /runtime/fs/write   { path, body }   — upsert
-  router.put('/fs/write', withAgent(async (c, req, res) => {
+  // FUSE flushes the whole file in one JSON request. Preserve the historical
+  // 34MB compatibility ceiling, but install it here so runtime authentication
+  // and current-assignment validation always run before the body is consumed.
+  router.put('/fs/write', json({ limit: '34mb' }), withAgent(async (c, req, res) => {
     const body = req.body as { path?: string; body?: string; conversationId?: string } | undefined
     const p = ensureSafePath(body?.path, res)
     if (p === null) return

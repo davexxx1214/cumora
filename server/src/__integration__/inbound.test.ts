@@ -48,9 +48,13 @@ after(async () => {
 async function postInbound(body: unknown, opts?: { signature?: string }): Promise<{ status: number; body: any }> {
   const raw = JSON.stringify(body)
   const sig = opts?.signature ?? signInboundPayload(raw)
+  return postInboundRaw(raw, sig)
+}
+
+async function postInboundRaw(raw: string, signature: string): Promise<{ status: number; body: any }> {
   const res = await fetch(`${baseUrl}/webhooks/email/inbound`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-cumora-signature': sig },
+    headers: { 'content-type': 'application/json', 'x-cumora-signature': signature },
     body: raw,
   })
   const text = await res.text()
@@ -81,6 +85,29 @@ test('[integration] rejects requests missing the signature header', async () => 
     body: raw,
   })
   assert.equal(res.status, 400)
+})
+
+test('[integration] rejects a bad HMAC before attempting to parse malformed JSON', async () => {
+  const r = await postInboundRaw('{malformed', `sha256=${'0'.repeat(64)}`)
+  assert.equal(r.status, 401)
+  assert.deepEqual(r.body, { error: 'bad signature' })
+})
+
+test('[integration] parses JSON only after a valid HMAC succeeds', async () => {
+  const raw = '{malformed'
+  const r = await postInboundRaw(raw, signInboundPayload(raw))
+  assert.equal(r.status, 400)
+  assert.deepEqual(r.body, { error: 'invalid JSON body' })
+})
+
+test('[integration] rejects a missing signature before a multi-megabyte malformed body is parsed', async () => {
+  const res = await fetch(`${baseUrl}/webhooks/email/inbound`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: `{${'x'.repeat(1024 * 1024)}`,
+  })
+  assert.equal(res.status, 400)
+  assert.deepEqual(await res.json(), { error: 'missing signature' })
 })
 
 test('[integration] returns 404 when no recipient resolves to a known agent', async () => {

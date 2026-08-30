@@ -15,7 +15,7 @@
  * `/api` because the cookie-auth middleware on /api would reject these
  * (and we don't want pods sharing the human session cookie path).
  */
-import { type NextFunction, type Request, type Response, Router } from 'express'
+import { json, type NextFunction, type Request, type Response, Router } from 'express'
 import { ProjectFileError } from '../../project-files/model.js'
 import { requireProjectHost } from '../../project-files/runtime-host.js'
 import { createProjectLease, currentAgentProject, filesEnabled, stopProjectLease } from '../../project-files/service.js'
@@ -38,6 +38,7 @@ import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+import { publicBodyParserError } from '../../body-parser-errors.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -103,6 +104,17 @@ function withAgent(
 
 export const runtimeRouter: Router = Router()
 runtimeRouter.use(authMiddleware as never)
+// JWT signature, tenant claim, and current agent assignment are all checked
+// before any body parser reads JSON. Most runtime calls are small; the FUSE
+// whole-file write endpoint installs its compatibility parser at the route.
+const runtimeJsonParser = json({ limit: '4mb' })
+runtimeRouter.use((req, res, next) => {
+  if (req.method === 'PUT' && /^\/fs\/write\/?$/.test(req.path)) {
+    next()
+    return
+  }
+  runtimeJsonParser(req, res, next)
+})
 
 runtimeRouter.get('/project-files/capabilities', withAgent(async (_c, _req, res) => {
   res.json({ enabled: filesEnabled() })
@@ -790,3 +802,15 @@ runtimeRouter.post('/notices', withAgent(async (c, req, res) => {
   })
   res.json(out)
 }))
+
+// Keep body-parser failures machine-readable and avoid exposing its default
+// HTML error page to runtime clients. Authentication failures have already
+// returned before this parser can run.
+runtimeRouter.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  const parserError = publicBodyParserError(err)
+  if (parserError) {
+    res.status(parserError.status).json({ error: parserError.message })
+    return
+  }
+  next(err)
+})

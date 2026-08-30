@@ -155,7 +155,6 @@ export async function buildApiTestApp(userId: string): Promise<import('express')
   const expressMod = await import('express')
   const express = expressMod.default
   const app = express()
-  app.use(express.json({ limit: '36mb' }))
   // Fake auth middleware: stamp authUserId from the test's choice. Real
   // requireAuth() just reads this field, so handlers can't distinguish.
   app.use((req, _res, next) => {
