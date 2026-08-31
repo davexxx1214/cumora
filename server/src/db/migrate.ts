@@ -2179,60 +2179,84 @@ export async function releaseMigrationClient(client: MigrationClient): Promise<v
  * rather than crash-loop. Read-only, so it's fine to run on the same connection
  * right after the failed (auto-rolled-back) DDL.
  *
- * Keep this list pointing at the LATEST schema additions. The cost of forgetting
- * to update it is benign: a loaded prod simply won't take the skip shortcut and
- * falls back to today's retry behavior — it can never skip a migration that
- * hasn't actually been applied.
+ * The expectations are derived FROM `DDL` itself rather than hand-listed. A
+ * hand-kept list is a whitelist of things that must be present, so an entry
+ * nobody remembered to add does not block the shortcut — its absence is simply
+ * never checked. That is not benign, and this comment used to claim it was: on
+ * 2026-08-31 #133 added `messages.delivery_recipient_id` without a sentinel, a
+ * loaded prod lost the lock race on the hot `messages` table (55P03), this
+ * function answered "current", migrate exited 0, and every daemon's /inbox 500'd
+ * on the missing column until production was rolled back. The same shape had
+ * already been caught twice before (llm_calls, llm_calls_rollup) — hence
+ * deriving the list instead of remembering it.
  */
+/** Every table and column `DDL` promises, read out of the DDL text so this can
+ *  never fall behind it. Comments are stripped first so a commented-out example
+ *  cannot become a phantom expectation. */
+export function ddlExpectations(): { tables: string[]; columns: Array<{ table: string; column: string }> } {
+  const sql = DDL.replace(/--[^\n]*/g, '')
+  const tables = [...sql.matchAll(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
+    .map((m) => m[1] as string)
+  const columns = [...sql.matchAll(/ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
+    .map((m) => ({ table: m[1] as string, column: m[2] as string }))
+  return { tables: [...new Set(tables)], columns }
+}
+
 async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<boolean> {
   try {
-    const { rows } = await client.query<{ ok: boolean }>(`
-      SELECT
-        (SELECT count(*) FROM information_schema.columns
-           WHERE table_name = 'conversations' AND column_name = 'topic') > 0
-        AND (SELECT count(*) FROM information_schema.columns
-               WHERE table_name = 'participants' AND column_name = 'status_updated_at') > 0
-        AND (SELECT count(*) FROM information_schema.columns
-               WHERE table_name = 'participants' AND column_name = 'company_id') > 0
-        AND (SELECT count(*) FROM pg_class WHERE relname = 'participants_agent_id_unique') > 0
-        AND (SELECT count(*) FROM information_schema.columns
-               WHERE table_name = 'messages' AND column_name = 'client_id') > 0
-        AND (SELECT count(*) FROM information_schema.columns
-               WHERE table_name = 'messages' AND column_name = 'agent_recipient_ids') > 0
-        AND (SELECT count(*) FROM information_schema.columns
-               WHERE table_name = 'company_invitations' AND column_name = 'token_ciphertext') > 0
-        AND EXISTS (
-          SELECT 1 FROM pg_class c
-          JOIN pg_index i ON i.indexrelid = c.oid
-          WHERE c.relname = 'uniq_messages_client_id' AND i.indisvalid
-        )
-        -- llm_calls is the universal sub2api ledger added in the observability
-        -- rollout (29155c5). Without this sentinel, a 40P01 deadlock on the big
-        -- DDL batch would take the "already current" shortcut and silently
-        -- skip CREATE TABLE — every Observability page request then 500s with
-        -- relation "llm_calls" does not exist. Caught exactly that on prod
-        -- the day this shipped; sentinel added so the next new table can't
-        -- repeat it.
-        AND (SELECT count(*) FROM pg_class WHERE relname = 'llm_calls') > 0
-        -- llm_calls.daemon_version added so 40P01-fallback doesn't skip the
-        -- ALTER. Keep updating this list whenever a new column lands.
-        AND (SELECT count(*) FROM information_schema.columns
-               WHERE table_name = 'llm_calls' AND column_name = 'daemon_version') > 0
-        -- llm_calls_rollup: the Observability pre-aggregation table. Without
-        -- this sentinel a 40P01 fallback would skip CREATE TABLE and every
-        -- dashboard query would 500 on "relation llm_calls_rollup does not exist".
-        AND (SELECT count(*) FROM pg_class WHERE relname = 'llm_calls_rollup') > 0
-        -- Shipping is the latest product-domain addition. Never take the
-        -- lock-contention shortcut on a pod that has not created its core table.
-        AND (SELECT count(*) FROM pg_class WHERE relname = 'shipping_features') > 0
-        AND to_regclass('project_file_spaces') IS NOT NULL
-        AND to_regclass('project_file_bindings') IS NOT NULL
-        AND to_regclass('project_file_leases') IS NOT NULL
-        AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'projects' AND column_name = 'file_binding_version')
-        AND EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'project_binding_guard')
-        AS ok
-    `)
-    return rows[0]?.ok === true
+    const { tables, columns } = ddlExpectations()
+    // Indexes are not derivable the same way (partial/concurrent/renamed), so
+    // the few that gate correctness stay explicit.
+    const indexes = ['participants_agent_id_unique', 'uniq_messages_client_id']
+    // The project binding trigger is declared through a conditional DO block,
+    // so the table/column parser cannot derive it either.
+    const triggers = ['project_binding_guard']
+    const { rows } = await client.query<{
+      missing_tables: string[]; missing_columns: string[]; missing_indexes: string[]; missing_triggers: string[]
+    }>(
+      `WITH want_t(name) AS (SELECT unnest($1::text[])),
+            want_c(t, c) AS (SELECT unnest($2::text[]), unnest($3::text[])),
+            want_i(name) AS (SELECT unnest($4::text[])),
+            want_g(name) AS (SELECT unnest($5::text[]))
+       SELECT
+         COALESCE(ARRAY(
+           SELECT w.name FROM want_t w
+            WHERE NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = w.name)
+         ), '{}') AS missing_tables,
+         COALESCE(ARRAY(
+           SELECT w.t || '.' || w.c FROM want_c w
+            WHERE NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+               WHERE table_name = w.t AND column_name = w.c
+            )
+         ), '{}') AS missing_columns,
+         COALESCE(ARRAY(
+            SELECT w.name FROM want_i w
+            WHERE NOT EXISTS (
+              SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+               WHERE c.relname = w.name AND i.indisvalid
+            )
+         ), '{}') AS missing_indexes,
+         COALESCE(ARRAY(
+           SELECT w.name FROM want_g w
+            WHERE NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = w.name)
+         ), '{}') AS missing_triggers`,
+      [tables, columns.map((c) => c.table), columns.map((c) => c.column), indexes, triggers],
+    )
+    const missing = [
+      ...(rows[0]?.missing_tables ?? []),
+      ...(rows[0]?.missing_columns ?? []),
+      ...(rows[0]?.missing_indexes ?? []),
+      ...(rows[0]?.missing_triggers ?? []),
+    ]
+    if (missing.length > 0) {
+      // Say what is missing. The failure this replaces was invisible: migrate
+      // logged "schema ensured" and exited 0 while a column the app queries on
+      // every request did not exist.
+      console.warn(`[db] schema is NOT current — missing: ${missing.slice(0, 20).join(', ')}${missing.length > 20 ? ` (+${missing.length - 20} more)` : ''}`)
+      return false
+    }
+    return true
   } catch {
     return false
   }
