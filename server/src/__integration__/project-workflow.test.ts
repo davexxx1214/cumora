@@ -5,12 +5,18 @@ import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, beforeEach, test } from 'node:test'
+import { runCli } from '../agents/cli.js'
+import { buildSystemPrompt, invalidatePersonaCache } from '../agents/personas.js'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { runProjectCli } from '../project-files/scoped-cli.js'
 import { createProjectLease, stopProjectLease } from '../project-files/service.js'
 import {
-  findExplicitAgentExecutionForInbox, markAgentExecutionRunFinished, markAgentExecutionRunStarted,
+  findExplicitAgentExecutionForInbox,
+  listAgentWorkflowNotifications,
+  markAgentExecutionRunFinished,
+  markAgentExecutionRunStarted,
+  renderAgentWorkflowNotifications,
   updateAgentWorkflowStatus,
 } from '../project-workflow/agent-service.js'
 import { reconcileProjectWorkflowAssignees } from '../project-workflow/service.js'
@@ -40,6 +46,7 @@ before(async () => {
 
 beforeEach(async () => {
   await resetAllTables()
+  invalidatePersonaCache()
   await pool.query("INSERT INTO companies(id,name,slug,owner_user_id) VALUES ('co-flow','Flow','flow','owner')")
   for (const user of users) await seedUserMembership(user, 'co-flow', { displayName: user.toUpperCase() })
   await pool.query("UPDATE company_members SET role='member' WHERE user_id <> 'owner'")
@@ -147,8 +154,37 @@ test('[integration] assigning an Agent only records a notification; explicit exe
   await enable()
   const item = await create('member', { type: 'user_story', title: 'Agent work', assigneeId: 'agent' })
   assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM agent_runs')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM messages')).rowCount, 0)
   const notifications = await pool.query<{ kind: string; recipient_id: string }>('SELECT kind,recipient_id FROM project_workflow_notifications')
   assert.deepEqual(notifications.rows, [{ kind: 'assigned', recipient_id: 'agent' }])
+  const agentNotifications = await listAgentWorkflowNotifications('agent')
+  assert.equal(agentNotifications.length, 1)
+  assert.equal(agentNotifications[0].issueKey, item.issueKey)
+  assert.equal(agentNotifications[0].title, 'Agent work')
+  assert.equal(agentNotifications[0].conversationId, 'g-flow')
+  const notificationPrompt = await renderAgentWorkflowNotifications('agent')
+  assert.match(notificationPrompt, new RegExp(item.issueKey))
+  assert.match(notificationPrompt, /information only/i)
+  assert.match(notificationPrompt, /explicit human execution command/i)
+  const systemPrompt = await buildSystemPrompt('agent')
+  assert.match(systemPrompt ?? '', new RegExp(item.issueKey))
+  const cliNotices = await runCli(['--as', 'agent', 'workflow', 'notifications'])
+  assert.equal(cliNotices.ok, true)
+  assert.match(cliNotices.text, new RegExp(item.issueKey))
+  assert.match(cliNotices.text, /awareness-only/i)
+  const inbox = await runCli(['--as', 'agent', 'inbox'])
+  assert.equal(inbox.ok, true)
+  assert.match(inbox.text, new RegExp(item.issueKey))
+  assert.match(inbox.text, /does not authorize execution/i)
+  const ack = await runCli(['--as', 'agent', 'workflow', 'ack', agentNotifications[0].id])
+  assert.equal(ack.ok, true)
+  assert.match(ack.text, /acked 1/)
+  assert.equal((await listAgentWorkflowNotifications('agent')).length, 0)
+  assert.equal((await listAgentWorkflowNotifications('agent', { unreadOnly: false })).length, 1)
+  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM agent_runs')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM messages')).rowCount, 0)
   const payload = { idempotencyKey: 'explicit-command-1', instruction: 'Implement the acceptance criteria.' }
   const first = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', payload)
   const second = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', payload)

@@ -1719,7 +1719,7 @@ class AgentRunner {
   /** Per-turn CHAT delta — only the dynamic bits (the invariant HOW lives in the
    *  standing prompt). Kept small so the persistent session's transcript grows
    *  slowly and native compaction can keep up. */
-  private chatDelta(memoryDigest: string, triageNote: string, inboxDigest: string, roster?: string): string {
+  private chatDelta(memoryDigest: string, triageNote: string, inboxDigest: string, roster?: string, workflowNotifications?: string): string {
     return (
       `You've been woken because there's new activity in your Cumora conversations, and the cerebellum triage already ` +
       `decided you should respond — your job is to DO it (write the reply / take the action), not to re-judge whether to. ` +
@@ -1739,13 +1739,14 @@ class AgentRunner {
           `these; but DO \`cumora glance\` before posting in a group, to catch anything posted while you compose):\n${inboxDigest}\n\n`
         : `Run \`cumora inbox\`, then \`cumora messages <conversationId> --tail 30\`, to catch up.\n\n`) +
       (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
+      (workflowNotifications ? `${workflowNotifications}\n\n` : ``) +
       (roster ? `Your team right now (trust over memory — current roster; use these ids for @mentions and \`cumora dm\`):\n${roster}\n` : ``)
     ).trimEnd()
   }
 
   /** Per-turn AGENDA delta — dynamic bits for a proactive board-work wake; the
    *  invariant mechanics live in the standing prompt. */
-  private agendaDelta(brief: string, memoryDigest: string, roster?: string): string {
+  private agendaDelta(brief: string, memoryDigest: string, roster?: string, workflowNotifications?: string): string {
     return (
       `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
       `You've been woken by your OWN AGENDA — Kanban cards assigned to you (or @-mentioning you), calendar slots due now, ` +
@@ -1758,6 +1759,7 @@ class AgentRunner {
       `follow your standing instructions for mechanics.\n\n` +
       `${brief}\n\n` +
       (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
+      (workflowNotifications ? `${workflowNotifications}\n\n` : ``) +
       (roster ? `Your team (use these ids for @mentions):\n${roster}\n` : ``)
     ).trimEnd()
   }
@@ -1828,13 +1830,14 @@ class AgentRunner {
         exitCode = result.exitCode; turnUsage = result.usage; turnModel = result.model
         if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
       } else {
-      const [memoryDigest, roster] = await Promise.all([
+      const [memoryDigest, roster, workflowNotifications] = await Promise.all([
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
+        runtimeGet<{ prompt: string }>(this.cfg.serverUrl, '/workflow-notifications', token).then((r) => r?.prompt ?? '').catch(() => ''),
       ])
       const resumeSessionId = this.projectFilesMode ? null : this.sessionId
       const session = this.ensureEngineSession()
-      const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster))
+      const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster, workflowNotifications))
       const result = session
         ? await session.send(prompt)
         : await this.isolatedEngine(this.home, () => this.adapter.run({
@@ -2208,7 +2211,7 @@ class AgentRunner {
             exitCode = result.exitCode; turnUsage = result.usage; turnModel = result.model
             if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
           } else {
-          const [memoryDigest, triageNote, roster] = await Promise.all([
+          const [memoryDigest, triageNote, roster, workflowNotifications] = await Promise.all([
             this.memoryDigest(projectIds),
             Promise.resolve(this.formatTriageNote(triage)),
             // Live team roster (names + roles + ids), fetched fresh from the
@@ -2217,13 +2220,15 @@ class AgentRunner {
             // fetched here, right before a real turn, so no-op wakes pay nothing.
             runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
               .then((r) => r?.roster ?? '').catch(() => ''),
+            runtimeGet<{ prompt: string }>(this.cfg.serverUrl, '/workflow-notifications', token)
+              .then((r) => r?.prompt ?? '').catch(() => ''),
           ])
           const resumeSessionId = this.projectFilesMode ? null : this.sessionId
           let result: EngineRunResult
           const session = this.ensureEngineSession()
           // Standing scaffold rides the session's system-prompt file; send only the
           // small per-turn delta when it does (else inline it — see turnPrompt).
-          const prompt = this.turnPrompt(session, this.chatDelta(memoryDigest, triageNote, digest, roster))
+          const prompt = this.turnPrompt(session, this.chatDelta(memoryDigest, triageNote, digest, roster, workflowNotifications))
           if (session) {
             // PERSISTENT path: feed this turn into the long-lived process — no cold
             // start (the first turn paid it; turns 2..N reuse the booted process).

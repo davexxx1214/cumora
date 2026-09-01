@@ -19,7 +19,12 @@ import { type NextFunction, type Request, type Response, Router } from 'express'
 import { ProjectFileError } from '../../project-files/model.js'
 import { requireProjectHost } from '../../project-files/runtime-host.js'
 import { createProjectLease, currentAgentProject, filesEnabled, stopProjectLease } from '../../project-files/service.js'
-import { findExplicitAgentExecutionForInbox, markAgentExecutionRunFinished, markAgentExecutionRunStarted } from '../../project-workflow/agent-service.js'
+import {
+  findExplicitAgentExecutionForInbox,
+  markAgentExecutionRunFinished,
+  markAgentExecutionRunStarted,
+  renderAgentWorkflowNotifications,
+} from '../../project-workflow/agent-service.js'
 import { AGENDA_CLASSIFIER_ERROR, claimStallNudge, classifyAgendaActionable, gatherAgentAgenda, renderAgendaBrief } from '../agenda.js'
 import { runCli } from '../cli.js'
 import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
@@ -577,6 +582,13 @@ runtimeRouter.post('/runs/:runId/finish', withAgent(async (c, req, res) => {
   })
   await markAgentExecutionRunFinished(c.sub, runId, body.status)
   res.json({ ok: true })
+}))
+
+// Passive, durable assignment notices. This endpoint is only fetched while an
+// Agent is already entering a real turn; creating an assignment never calls it,
+// wakes a model, or grants an execution lease.
+runtimeRouter.get('/workflow-notifications', withAgent(async (c, _req, res) => {
+  res.json({ prompt: await renderAgentWorkflowNotifications(c.sub) })
 }))
 
 // ─── steering busy heartbeat ────────────────────────────────────────

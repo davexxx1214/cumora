@@ -11,8 +11,9 @@
  * companyId through these reads.
  */
 import { pool } from '../db/pool.js'
-import { SKYPE_EMOTICONS_GUIDE } from './skype-emoticons.js'
+import { renderAgentWorkflowNotifications } from '../project-workflow/agent-service.js'
 import { AGENT_VOICE_RULES } from './agent-voice.js'
+import { SKYPE_EMOTICONS_GUIDE } from './skype-emoticons.js'
 
 export interface Persona {
   id: string
@@ -320,9 +321,10 @@ export async function buildSystemPrompt(personaId: string): Promise<string | nul
   // be built outside of a turn too (e.g. preview / debug paths).
   // Falls back silently when files are missing — newly-onboarded
   // agents pick them up on the next turn after seeding completes.
-  const [identity, soul] = await Promise.all([
+  const [identity, soul, workflowNotifications] = await Promise.all([
     readWorkspaceFile(persona.id, 'IDENTITY.md'),
     readWorkspaceFile(persona.id, 'SOUL.md'),
+    renderAgentWorkflowNotifications(persona.id),
   ])
   const selfDefinition = [
     identity ? `## YOUR IDENTITY (from your workspace's IDENTITY.md — edit it via \`edit_file\` to evolve)\n\n${identity.trim()}` : null,
@@ -336,8 +338,10 @@ export async function buildSystemPrompt(personaId: string): Promise<string | nul
     '',
     GLOBAL_RULES.trim(),
     '',
+    workflowNotifications,
+    workflowNotifications ? '' : null,
     rosterSection(team, persona.id),
-  ].join('\n')
+  ].filter((part): part is string => part !== null).join('\n')
 }
 
 async function readWorkspaceFile(agentId: string, path: string): Promise<string | null> {

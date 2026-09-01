@@ -10,8 +10,12 @@
  */
 
 import { pool } from '../db/pool.js'
-import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
 import { env } from '../env.js'
+import {
+  listAgentWorkflowNotifications,
+  markAgentWorkflowNotificationsRead,
+} from '../project-workflow/agent-service.js'
+import { freshenAttachmentUrl, type StoredAttachment, storage } from '../storage.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { stripLoneSurrogates } from './text-safety.js'
 import {
@@ -159,6 +163,8 @@ USAGE:
 
 MAILBOX  (this is how you receive + send messages):
   inbox [<convo_id>]                — list new messages directed at you, grouped by conversation
+  workflow notifications [--all]    — list project-workflow assignments delivered to you
+  workflow ack <notice_id>|--all    — acknowledge assignment notifications (does not execute work)
   ack <convo_id>                    — mark that conversation read up to NOW (clear from inbox)
   ack --all                         — ack every conversation currently in your inbox
   mute <convo_id> [--for 1h|1d|1w] — stop delivery from a group (direct @mentions and quote-replies still arrive)
@@ -896,10 +902,16 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
 async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
   const filterConvo = parsed.positional[0] ?? null
-  const items = await loadInbox(me)
+  const [items, workflowNotices] = await Promise.all([
+    loadInbox(me),
+    listAgentWorkflowNotifications(me),
+  ])
   const filtered = filterConvo ? items.filter((m) => m.conversation_id === filterConvo) : items
+  const filteredNotices = filterConvo
+    ? workflowNotices.filter((notice) => notice.conversationId === filterConvo)
+    : workflowNotices
   if (parsed.flags.json) return ok(JSON.stringify(filtered, null, 2))
-  if (filtered.length === 0) return ok(`(inbox empty for ${me})`)
+  if (filtered.length === 0 && filteredNotices.length === 0) return ok(`(inbox empty for ${me})`)
 
   // Group by conversation
   const byConvo = new Map<string, InboxItem[]>()
@@ -907,7 +919,24 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
     if (!byConvo.has(it.conversation_id)) byConvo.set(it.conversation_id, [])
     byConvo.get(it.conversation_id)!.push(it)
   }
-  const lines: string[] = [`${filtered.length} unread message(s) for ${me}, across ${byConvo.size} conversation(s):`, '']
+  const lines: string[] = []
+  if (filteredNotices.length > 0) {
+    lines.push(`${filteredNotices.length} unread project-workflow assignment notification(s) for ${me}:`)
+    for (const notice of filteredNotices) {
+      const type = notice.itemType === 'user_story' ? 'User Story' : notice.itemType === 'defect' ? 'Defect' : 'Subtask'
+      const action = notice.kind === 'reassigned' ? 'reassigned' : 'assigned'
+      lines.push(
+        `  [${notice.id}]  ${notice.issueKey}  ${type}  ${JSON.stringify(notice.title)}  — ` +
+        `${action} by ${notice.actorName} in ${notice.conversationTitle}; ${notice.status}, ${notice.priority}`,
+      )
+    }
+    lines.push(
+      '  Assignment is notification only and does not authorize execution. Wait for an explicit human command.',
+      '  Acknowledge after reading: `cumora workflow ack <notification_id>` or `cumora workflow ack --all`.',
+      '',
+    )
+  }
+  lines.push(`${filtered.length} unread message(s) for ${me}, across ${byConvo.size} conversation(s):`, '')
   for (const [convoId, msgs] of byConvo) {
     const head = msgs[0]
     lines.push(`# ${convoId}  [${head.conversation_kind}]  "${head.conversation_title}"`)
@@ -935,8 +964,40 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
     }
     lines.push('')
   }
-  lines.push(`when you're done deciding what to do (reply / react / dm / nothing), run \`cumora ack <convo_id>\` to clear that conversation from your inbox so the next wake-up doesn't see it again. \`cumora ack --all\` clears everything in your inbox.`)
+  lines.push(`when you're done deciding what to do (reply / react / dm / nothing), run \`cumora ack <convo_id>\` to clear that conversation's messages. \`cumora ack --all\` clears all message conversations; workflow notices use \`cumora workflow ack …\`.`)
   return ok(lines.join('\n'))
+}
+
+async function cmdWorkflow(parsed: ParsedArgs): Promise<CliResult> {
+  const me = resolveAs(parsed)
+  const action = parsed.positional[0]
+  if (action === 'notifications') {
+    const notifications = await listAgentWorkflowNotifications(me, { unreadOnly: !parsed.flags.all })
+    if (parsed.flags.json) return ok(JSON.stringify(notifications, null, 2))
+    if (notifications.length === 0) return ok(`(no ${parsed.flags.all ? '' : 'unread '}project-workflow notifications for ${me})`)
+    const lines = [`${notifications.length} project-workflow notification(s) for ${me}:`]
+    for (const notice of notifications) {
+      const type = notice.itemType === 'user_story' ? 'User Story' : notice.itemType === 'defect' ? 'Defect' : 'Subtask'
+      lines.push(
+        `  [${notice.id}]  ${notice.issueKey}  ${type}  ${JSON.stringify(notice.title)}\n` +
+        `    ${notice.kind} by ${notice.actorName} in ${notice.conversationTitle}; ` +
+        `status=${notice.status}, priority=${notice.priority}, project=${notice.projectName}`,
+      )
+    }
+    lines.push(
+      '',
+      'These are awareness-only notices. Do not execute the item until a human explicitly commands you.',
+      'Acknowledge after reading with `cumora workflow ack <notification_id>` or `cumora workflow ack --all`.',
+    )
+    return ok(lines.join('\n'))
+  }
+  if (action === 'ack') {
+    const ids = parsed.positional.slice(1)
+    if (!parsed.flags.all && ids.length === 0) return err('usage: workflow ack <notification_id> [more_ids...]  OR  workflow ack --all')
+    const count = await markAgentWorkflowNotificationsRead(me, parsed.flags.all ? undefined : ids)
+    return ok(`acked ${count} project-workflow notification(s)`)
+  }
+  return err('usage: workflow notifications [--all] [--json]  OR  workflow ack <notification_id>|--all')
 }
 
 /** `cumora glance <convo>` — read the room before committing a reply.
@@ -6030,6 +6091,7 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       case 'calendar':            return await cmdCalendar(parsed)
       // ====== mailbox: how an agent reads + writes the world ======
       case 'inbox':               return await cmdInbox(parsed)
+      case 'workflow':            return await cmdWorkflow(parsed)
       case 'glance':              return await cmdGlance(parsed)
       case 'ack':                 return await cmdAck(parsed)
       case 'mute':                return await cmdMute(parsed)
