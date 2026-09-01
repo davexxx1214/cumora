@@ -3,7 +3,7 @@ import type { AuthedRequest } from '../auth.js'
 import { env } from '../env.js'
 import { type ProjectWorkflowChangedEvent, ProjectWorkflowError, type WorkflowEventKind } from '../project-workflow/model.js'
 import {
-  addComment, addCommitLink, addFileLink, createWorkflow, createWorkItem, deleteComment,
+  addComment, addCommitLink, addFileLink, type AgentExecutionDispatch, createWorkflow, createWorkItem, deleteComment,
   deleteLink, deleteWorkItem, getWorkflow, getWorkItem, listActivity, listComments, listLinks,
   listNotifications, listWorkItems, markNotificationsRead, requestAgentExecution,
   setWorkflowClosed, setWorkItemArchived, updateWorkItem,
@@ -39,6 +39,29 @@ async function emit(args: {
   const event: ProjectWorkflowChangedEvent = { type: 'project.workflow_changed', ...args }
   await publish(CH_PROJECT_WORKFLOW, event).catch((error) => {
     console.warn('[project-workflow] broadcast failed', error)
+  })
+}
+
+async function publishAgentExecutionMessage(args: {
+  companyId: string
+  conversationId: string
+  actorId: string
+  dispatch?: AgentExecutionDispatch
+}): Promise<void> {
+  const { dispatch } = args
+  if (!dispatch?.created || !dispatch.message) return
+  await publish(CH_MESSAGE_NEW, {
+    type: 'message.new', companyId: args.companyId, conversationId: args.conversationId,
+    message: {
+      id: dispatch.message.id, conversationId: args.conversationId, authorId: args.actorId,
+      kind: 'text', body: dispatch.message.body, sequence: dispatch.message.sequence,
+      at: dispatch.message.at, agentRecipientIds: dispatch.message.agentRecipientIds,
+      clientId: `workflow-command:${dispatch.command.id}`,
+    },
+  }).catch((error) => {
+    // The durable message + command are already committed. Agent inbox polling
+    // recovers delivery even when this transient Redis wake is unavailable.
+    console.warn('[project-workflow] Agent assignment wake failed', error)
   })
 }
 
@@ -96,6 +119,8 @@ export function createProjectWorkflowRouter(deps: ProjectWorkflowRouterDeps) {
     await emit({ companyId, conversationId: result.scope.conversationId, projectId: result.scope.projectId,
       workflowId: result.scope.workflow!.id, kind: result.eventKind, itemId: result.item.id, actorId: userId,
       notificationRecipientIds: result.notificationRecipientIds })
+    await publishAgentExecutionMessage({ companyId, conversationId: result.scope.conversationId,
+      actorId: userId, dispatch: result.agentExecution })
     res.status(201).json(result.item)
   }))
 
@@ -112,6 +137,8 @@ export function createProjectWorkflowRouter(deps: ProjectWorkflowRouterDeps) {
     await emit({ companyId, conversationId: result.scope.conversationId, projectId: result.scope.projectId,
       workflowId: result.scope.workflow!.id, kind: result.eventKind, itemId: result.item.id, actorId: userId,
       notificationRecipientIds: result.notificationRecipientIds })
+    await publishAgentExecutionMessage({ companyId, conversationId: result.scope.conversationId,
+      actorId: userId, dispatch: result.agentExecution })
     res.json(result.item)
   }))
 
@@ -217,17 +244,8 @@ export function createProjectWorkflowRouter(deps: ProjectWorkflowRouterDeps) {
       await emit({ companyId, conversationId: result.scope.conversationId, projectId: result.scope.projectId,
         workflowId: result.scope.workflow!.id, kind: 'agent.execution_requested', itemId: result.item.id,
         actorId: userId, notificationRecipientIds: [result.command.agentId] })
-      if (result.message) {
-        await publish(CH_MESSAGE_NEW, {
-          type: 'message.new', companyId, conversationId: result.scope.conversationId,
-          message: {
-            id: result.message.id, conversationId: result.scope.conversationId, authorId: userId,
-            kind: 'text', body: result.message.body, sequence: result.message.sequence,
-            at: result.message.at, agentRecipientIds: result.message.agentRecipientIds,
-            clientId: `workflow-command:${result.command.id}`,
-          },
-        })
-      }
+      await publishAgentExecutionMessage({ companyId, conversationId: result.scope.conversationId,
+        actorId: userId, dispatch: result })
     }
     res.status(202).json(result.command)
   }))

@@ -931,7 +931,7 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
       )
     }
     lines.push(
-      '  Assignment is notification only and does not authorize execution. Wait for an explicit human command.',
+      '  Agent assignments also deliver a targeted group @message that starts the controlled execution. This notice alone must not start a duplicate run.',
       '  Acknowledge after reading: `cumora workflow ack <notification_id>` or `cumora workflow ack --all`.',
       '',
     )
@@ -986,7 +986,7 @@ async function cmdWorkflow(parsed: ParsedArgs): Promise<CliResult> {
     }
     lines.push(
       '',
-      'These are awareness-only notices. Do not execute the item until a human explicitly commands you.',
+      'Agent assignments also deliver a targeted group @message that starts the controlled execution. This notice alone must not start a duplicate run.',
       'Acknowledge after reading with `cumora workflow ack <notification_id>` or `cumora workflow ack --all`.',
     )
     return ok(lines.join('\n'))

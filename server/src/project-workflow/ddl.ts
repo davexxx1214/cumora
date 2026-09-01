@@ -160,8 +160,8 @@ CREATE TABLE IF NOT EXISTS project_work_item_commit_links (
 CREATE INDEX IF NOT EXISTS idx_project_work_item_commit_links_item
   ON project_work_item_commit_links(item_id, created_at);
 
--- Durable in-app notification inbox. Assignment does not wake an Agent; the
--- explicit execute action is a separate operation and idempotency key.
+-- Durable in-app notification inbox. Assigning an Agent also creates a
+-- targeted group command; this table remains the deduplicated audit/read state.
 CREATE TABLE IF NOT EXISTS project_workflow_notifications (
   id                  TEXT PRIMARY KEY,
   company_id          TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,

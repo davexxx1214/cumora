@@ -17,7 +17,6 @@ import {
   markAgentExecutionRunFinished,
   markAgentExecutionRunStarted,
   renderAgentWorkflowNotifications,
-  updateAgentWorkflowStatus,
 } from '../project-workflow/agent-service.js'
 import { reconcileProjectWorkflowAssignees } from '../project-workflow/service.js'
 import { buildApiTestApp, ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll } from './_helpers.js'
@@ -51,10 +50,12 @@ beforeEach(async () => {
   for (const user of users) await seedUserMembership(user, 'co-flow', { displayName: user.toUpperCase() })
   await pool.query("UPDATE company_members SET role='member' WHERE user_id <> 'owner'")
   await pool.query("UPDATE company_members SET role='owner' WHERE user_id='owner'")
-  await pool.query("INSERT INTO participants(id,company_id,kind,name,initial,avatar_bg,status) VALUES ('agent','co-flow','agent','Agent','A','#000','avail')")
+  await pool.query(`INSERT INTO participants(id,company_id,kind,name,initial,avatar_bg,status) VALUES
+    ('agent','co-flow','agent','Agent','A','#000','avail'),
+    ('agent2','co-flow','agent','Agent Two','T','#111','avail')`)
   await pool.query("INSERT INTO projects(id,company_id,name) VALUES ('p-flow','co-flow','Easy AR'),('p-next','co-flow','Next'),('p-third','co-flow','Third')")
   await pool.query(`INSERT INTO conversations(id,kind,title,company_id,members,project_id) VALUES
-    ('g-flow','group','Flow','co-flow','["owner","member","peer","agent"]','p-flow'),
+    ('g-flow','group','Flow','co-flow','["owner","member","peer","agent","agent2"]','p-flow'),
     ('g-next','group','Next','co-flow','["owner","member"]','p-next')`)
 })
 
@@ -150,14 +151,30 @@ test('[integration] subtasks are one level and incomplete children block parent 
   assert.ok(events.some(event => event.eventType === 'item.force_completed' && event.reason === 'Accepted with follow-up work'))
 })
 
-test('[integration] assigning an Agent only records a notification; explicit execution is separate and idempotent', async () => {
+test('[integration] assigning an Agent posts one targeted @command and manual retries stay idempotent', async () => {
   await enable()
   const item = await create('member', { type: 'user_story', title: 'Agent work', assigneeId: 'agent' })
-  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 1)
   assert.equal((await pool.query('SELECT 1 FROM agent_runs')).rowCount, 0)
-  assert.equal((await pool.query('SELECT 1 FROM messages')).rowCount, 0)
-  const notifications = await pool.query<{ kind: string; recipient_id: string }>('SELECT kind,recipient_id FROM project_workflow_notifications')
-  assert.deepEqual(notifications.rows, [{ kind: 'assigned', recipient_id: 'agent' }])
+  const messages = await pool.query<{ id: string; body: string; author_id: string; agent_recipient_ids: string[]; client_id: string }>(
+    'SELECT id,body,author_id,agent_recipient_ids,client_id FROM messages')
+  assert.equal(messages.rowCount, 1)
+  assert.equal(messages.rows[0].author_id, 'member')
+  assert.deepEqual(messages.rows[0].agent_recipient_ids, ['agent'])
+  assert.match(messages.rows[0].body, /^@agent .*请开始执行/u)
+  assert.match(messages.rows[0].client_id, /^workflow-command:/)
+  const otherAgentInbox = await runCli(['--as', 'agent2', 'inbox'])
+  assert.equal(otherAgentInbox.ok, true)
+  assert.match(otherAgentInbox.text, /inbox empty/i)
+  const notifications = await pool.query<{ kind: string; recipient_id: string }>(
+    'SELECT kind,recipient_id FROM project_workflow_notifications ORDER BY kind')
+  assert.deepEqual(notifications.rows, [
+    { kind: 'agent_execute', recipient_id: 'agent' },
+    { kind: 'assigned', recipient_id: 'agent' },
+  ])
+  const explicit = await findExplicitAgentExecutionForInbox('agent', [messages.rows[0].id], 'g-flow')
+  assert.equal(explicit?.issueKey, item.issueKey)
+  assert.equal(explicit?.conversationId, 'g-flow')
   const agentNotifications = await listAgentWorkflowNotifications('agent')
   assert.equal(agentNotifications.length, 1)
   assert.equal(agentNotifications[0].issueKey, item.issueKey)
@@ -166,56 +183,52 @@ test('[integration] assigning an Agent only records a notification; explicit exe
   const notificationPrompt = await renderAgentWorkflowNotifications('agent')
   assert.match(notificationPrompt, new RegExp(item.issueKey))
   assert.match(notificationPrompt, /information only/i)
-  assert.match(notificationPrompt, /explicit human execution command/i)
+  assert.match(notificationPrompt, /targeted group @message/i)
   const systemPrompt = await buildSystemPrompt('agent')
   assert.match(systemPrompt ?? '', new RegExp(item.issueKey))
   const cliNotices = await runCli(['--as', 'agent', 'workflow', 'notifications'])
   assert.equal(cliNotices.ok, true)
   assert.match(cliNotices.text, new RegExp(item.issueKey))
-  assert.match(cliNotices.text, /awareness-only/i)
+  assert.match(cliNotices.text, /targeted group @message/i)
   const inbox = await runCli(['--as', 'agent', 'inbox'])
   assert.equal(inbox.ok, true)
   assert.match(inbox.text, new RegExp(item.issueKey))
-  assert.match(inbox.text, /does not authorize execution/i)
+  assert.match(inbox.text, /starts the controlled execution/i)
   const ack = await runCli(['--as', 'agent', 'workflow', 'ack', agentNotifications[0].id])
   assert.equal(ack.ok, true)
   assert.match(ack.text, /acked 1/)
   assert.equal((await listAgentWorkflowNotifications('agent')).length, 0)
   assert.equal((await listAgentWorkflowNotifications('agent', { unreadOnly: false })).length, 1)
-  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 1)
   assert.equal((await pool.query('SELECT 1 FROM agent_runs')).rowCount, 0)
-  assert.equal((await pool.query('SELECT 1 FROM messages')).rowCount, 0)
+  assert.equal((await pool.query('SELECT 1 FROM messages')).rowCount, 1)
+  const duplicateWhileActive = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', {
+    idempotencyKey: 'different-command-while-active', instruction: 'Do not start a duplicate.',
+  })
+  assert.equal(duplicateWhileActive.status, 409)
+  assert.equal((await duplicateWhileActive.json() as { code: string }).code, 'AGENT_EXECUTION_ACTIVE')
+  await pool.query("UPDATE project_work_item_agent_commands SET status='completed' WHERE item_id=$1", [item.id])
   const payload = { idempotencyKey: 'explicit-command-1', instruction: 'Implement the acceptance criteria.' }
   const first = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', payload)
   const second = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', payload)
   assert.equal(first.status, 202, await first.clone().text())
   assert.equal(second.status, 202, await second.clone().text())
   assert.equal((await first.json() as { id: string }).id, (await second.json() as { id: string }).id)
-  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 1)
+  assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 2)
   assert.equal((await pool.query('SELECT 1 FROM agent_runs')).rowCount, 0)
-  const messages = await pool.query<{ id: string; agent_recipient_ids: string[]; client_id: string }>(
-    'SELECT id,agent_recipient_ids,client_id FROM messages')
-  assert.equal(messages.rowCount, 1)
-  assert.deepEqual(messages.rows[0].agent_recipient_ids, ['agent'])
-  assert.match(messages.rows[0].client_id, /^workflow-command:/)
-  const explicit = await findExplicitAgentExecutionForInbox('agent', [messages.rows[0].id], 'g-flow')
-  assert.equal(explicit?.issueKey, item.issueKey)
-  assert.equal(explicit?.conversationId, 'g-flow')
-  assert.equal((await pool.query("SELECT 1 FROM project_work_item_events WHERE event_type='agent.execution_requested'")).rowCount, 1)
-  assert.equal((await pool.query("SELECT 1 FROM project_workflow_notifications WHERE kind='agent_execute'")).rowCount, 1)
+  assert.equal((await pool.query('SELECT 1 FROM messages')).rowCount, 2)
+  assert.equal((await pool.query("SELECT 1 FROM project_work_item_events WHERE event_type='agent.execution_requested'")).rowCount, 2)
+  assert.equal((await pool.query("SELECT 1 FROM project_workflow_notifications WHERE kind='agent_execute'")).rowCount, 2)
 })
 
-test('[integration] controlled Agent tools require explicit execution and keep completion human-owned', async () => {
+test('[integration] assignment authorizes controlled Agent tools while completion stays human-owned', async () => {
   await enable()
   const item = await create('member', { type: 'defect', title: 'Agent fixes it', assigneeId: 'agent' })
-  await assert.rejects(() => updateAgentWorkflowStatus('agent', item.issueKey, 'in_progress'), /explicitly command/i)
-  const executed = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', {
-    idempotencyKey: 'agent-tools-1', instruction: 'Fix and prepare for review.',
-  })
-  assert.equal(executed.status, 202, await executed.clone().text())
-  const command = await executed.json() as { id: string; messageId: string }
+  const command = (await pool.query<{ id: string; message_id: string }>(
+    'SELECT id,message_id FROM project_work_item_agent_commands WHERE item_id=$1', [item.id])).rows[0]
   await pool.query(`INSERT INTO agent_runs(id,agent_id,company_id,trigger,status,stage,input_message_ids,inbox_count)
-    VALUES('run-workflow','agent','co-flow','{}','running','created',$1::jsonb,1)`, [JSON.stringify([command.messageId])])
+    VALUES('run-workflow','agent','co-flow','{}','running','created',$1::jsonb,1)`, [JSON.stringify([command.message_id])])
+  assert.equal(await markAgentExecutionRunStarted('agent', 'co-flow', 'run-workflow', [command.message_id]), 1)
   const bindingRow = await pool.query<{ file_binding_version: string }>('SELECT file_binding_version::text FROM projects WHERE id=$1', ['p-flow'])
   const lease = await createProjectLease({ agentId: 'agent', companyId: 'co-flow', conversationId: 'g-flow',
     runId: 'run-workflow', bindingVersion: `p-flow:${bindingRow.rows[0].file_binding_version}` })
@@ -259,14 +272,11 @@ test('[integration] switching project scopes the view and membership revocation 
 test('[integration] reassignment cancels a running Agent command, revokes its lease and removes its inbox audience', async () => {
   await enable()
   const item = await create('member', { type: 'user_story', title: 'Do not run stale work', assigneeId: 'agent' })
-  const execution = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', {
-    idempotencyKey: 'cancel-on-reassign', instruction: 'This will be reassigned.',
-  })
-  assert.equal(execution.status, 202, await execution.clone().text())
-  const requested = await execution.json() as { messageId: string }
+  const requested = (await pool.query<{ message_id: string }>(
+    'SELECT message_id FROM project_work_item_agent_commands WHERE item_id=$1', [item.id])).rows[0]
   await pool.query(`INSERT INTO agent_runs(id,agent_id,company_id,trigger,status,stage,input_message_ids,inbox_count)
-    VALUES('run-reassigned','agent','co-flow','{}','running','created',$1::jsonb,1)`, [JSON.stringify([requested.messageId])])
-  assert.equal(await markAgentExecutionRunStarted('agent', 'co-flow', 'run-reassigned', [requested.messageId]), 1)
+    VALUES('run-reassigned','agent','co-flow','{}','running','created',$1::jsonb,1)`, [JSON.stringify([requested.message_id])])
+  assert.equal(await markAgentExecutionRunStarted('agent', 'co-flow', 'run-reassigned', [requested.message_id]), 1)
   const binding = await pool.query<{ file_binding_version: string }>('SELECT file_binding_version::text FROM projects WHERE id=$1', ['p-flow'])
   const lease = await createProjectLease({ agentId: 'agent', companyId: 'co-flow', conversationId: 'g-flow',
     runId: 'run-reassigned', bindingVersion: `p-flow:${binding.rows[0].file_binding_version}` })
@@ -288,15 +298,13 @@ test('[integration] reassignment cancels a running Agent command, revokes its le
 test('[integration] permanent deletion cancels a pending command before retaining only its harmless chat history', async () => {
   await enable()
   const item = await create('member', { type: 'defect', title: 'Delete safely', assigneeId: 'agent' })
-  const execution = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', {
-    idempotencyKey: 'cancel-on-delete', instruction: 'This item will be deleted.',
-  })
-  const command = await execution.json() as { messageId: string }
+  const command = (await pool.query<{ message_id: string }>(
+    'SELECT message_id FROM project_work_item_agent_commands WHERE item_id=$1', [item.id])).rows[0]
   const deleted = await request('owner', `/conversations/g-flow/items/${item.id}`, 'DELETE', { reason: 'Test cleanup' })
   assert.equal(deleted.status, 200, await deleted.clone().text())
   assert.equal((await pool.query('SELECT 1 FROM project_work_item_agent_commands')).rowCount, 0)
   const message = await pool.query<{ body: string; agent_recipient_ids: string[] }>(
-    'SELECT body,agent_recipient_ids FROM messages WHERE id=$1', [command.messageId])
+    'SELECT body,agent_recipient_ids FROM messages WHERE id=$1', [command.message_id])
   assert.deepEqual(message.rows[0].agent_recipient_ids, [])
   assert.match(message.rows[0].body, /^\[已取消，不要执行\]/u)
 })
@@ -304,17 +312,14 @@ test('[integration] permanent deletion cancels a pending command before retainin
 test('[integration] switching projects cancels the old workflow command and exposes only the new project workflow', async () => {
   await enable()
   const item = await create('member', { type: 'user_story', title: 'Belongs to the old project', assigneeId: 'agent' })
-  const execution = await request('member', `/conversations/g-flow/items/${item.id}/execute`, 'POST', {
-    idempotencyKey: 'cancel-on-project-switch', instruction: 'Do not carry this into the next project.',
-  })
-  assert.equal(execution.status, 202, await execution.clone().text())
-  const command = await execution.json() as { messageId: string }
+  const command = (await pool.query<{ message_id: string }>(
+    'SELECT message_id FROM project_work_item_agent_commands WHERE item_id=$1', [item.id])).rows[0]
 
   const switched = await apiRequest('owner', '/conversations/g-flow/project', 'POST', { projectId: 'p-third' })
   assert.equal(switched.status, 200, await switched.clone().text())
   const stored = await pool.query<{ status: string }>('SELECT status FROM project_work_item_agent_commands')
   assert.equal(stored.rows[0].status, 'canceled')
-  const message = await pool.query<{ agent_recipient_ids: string[] }>('SELECT agent_recipient_ids FROM messages WHERE id=$1', [command.messageId])
+  const message = await pool.query<{ agent_recipient_ids: string[] }>('SELECT agent_recipient_ids FROM messages WHERE id=$1', [command.message_id])
   assert.deepEqual(message.rows[0].agent_recipient_ids, [])
   const current = await request('member', '/conversations/g-flow')
   assert.equal(current.status, 200, await current.clone().text())

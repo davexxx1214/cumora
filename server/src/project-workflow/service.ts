@@ -109,6 +109,13 @@ export interface ItemMutationResult {
   item: ProjectWorkItemRecord
   notificationRecipientIds: string[]
   eventKind: 'item.created' | 'item.updated' | 'item.assigned' | 'item.status_changed' | 'item.force_completed'
+  agentExecution?: AgentExecutionDispatch
+}
+
+export interface AgentExecutionDispatch {
+  created: boolean
+  command: { id: string; status: string; createdAt: string; agentId: string; messageId: string | null }
+  message: { id: string; sequence: number; body: string; at: string; agentRecipientIds: string[] } | null
 }
 
 function workflowFromScope(row: ScopeRow, companyId: string): ProjectWorkflowRecord | null {
@@ -418,6 +425,92 @@ export async function getWorkItem(companyId: string, userId: string, conversatio
   return { scope, item: await fetchItem(pool, scope.workflow!.id, itemId) }
 }
 
+/**
+ * Create the durable execution command and its targeted group @message inside
+ * the caller's transaction. Assignment calls this automatically; the manual
+ * execute endpoint uses the same primitive for retries or added instructions.
+ */
+async function queueAgentExecution(
+  db: Queryable,
+  scope: HumanWorkflowScope,
+  item: ProjectWorkItemRecord,
+  idempotencyKey: string,
+  instruction: unknown,
+  source: 'assignment' | 'manual',
+): Promise<AgentExecutionDispatch> {
+  if (!item.assigneeId || item.assigneeKind !== 'agent') workflowFail('AGENT_ASSIGNEE_REQUIRED', 409, 'Assign this item to an Agent first.')
+  await validateAssignee(db, scope, item.assigneeId)
+  const cleanedInstruction = cleanText(instruction, 8000)
+  if (source === 'manual') {
+    const exact = await db.query<{ id: string }>(
+      'SELECT id FROM project_work_item_agent_commands WHERE item_id=$1 AND idempotency_key=$2',
+      [item.id, idempotencyKey],
+    )
+    if (!exact.rows[0]) {
+      const active = await db.query<{ id: string }>(
+        `SELECT id FROM project_work_item_agent_commands
+          WHERE item_id=$1 AND agent_id=$2 AND status IN ('pending','running')
+          ORDER BY created_at DESC LIMIT 1`,
+        [item.id, item.assigneeId],
+      )
+      if (active.rows[0]) workflowFail('AGENT_EXECUTION_ACTIVE', 409, 'This Agent already has an active execution for the item.')
+    }
+  }
+  const commandId = `wicmd-${randomUUID()}`
+  const { rows } = await db.query<{ id: string; status: string; created_at: string; message_id: string | null; agent_id: string }>(
+    `INSERT INTO project_work_item_agent_commands
+       (id,item_id,project_id,conversation_id,agent_id,requested_by,idempotency_key,instruction)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT(item_id,idempotency_key) DO NOTHING
+     RETURNING id,status,created_at,message_id,agent_id`,
+    [commandId, item.id, scope.projectId, scope.conversationId, item.assigneeId, scope.userId, idempotencyKey, cleanedInstruction],
+  )
+  const created = Boolean(rows[0])
+  const command = rows[0] ?? (await db.query<{ id: string; status: string; created_at: string; message_id: string | null; agent_id: string }>(
+    `SELECT id,status,created_at,message_id,agent_id FROM project_work_item_agent_commands
+      WHERE item_id=$1 AND idempotency_key=$2`, [item.id, idempotencyKey],
+  )).rows[0]
+  if (!command) throw new Error('agent command insert returned no row')
+
+  let message: AgentExecutionDispatch['message'] = null
+  if (created) {
+    const seq = await db.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence=conversation_counters.next_sequence+1
+       RETURNING next_sequence-1 AS seq`, [scope.conversationId],
+    )
+    const sequence = Number(seq.rows[0]?.seq ?? 1)
+    const messageId = `m-${randomUUID()}`
+    const body = [
+      source === 'assignment'
+        ? `@${item.assigneeId} 你已被分配项目流程事项 ${item.issueKey}：${item.title}，请开始执行。`
+        : `@${item.assigneeId} 请执行项目流程事项 ${item.issueKey}：${item.title}`,
+      cleanedInstruction || '请按事项描述和验收标准执行。',
+      `先运行 \`cumora workflow show ${item.issueKey}\` 获取受控详情；开始时更新为 in_progress，完成后更新为 in_review，不要自行标记 done。`,
+    ].join('\n')
+    const at = new Date().toISOString()
+    await db.query(
+      `INSERT INTO messages
+        (id,conversation_id,author_id,kind,body,sequence,company_id,client_id,agent_recipient_ids)
+       VALUES($1,$2,$3,'text',$4,$5,$6,$7,$8::jsonb)`,
+      [messageId, scope.conversationId, scope.userId, body, sequence, scope.companyId,
+        `workflow-command:${command.id}`, JSON.stringify([item.assigneeId])],
+    )
+    await db.query('UPDATE project_work_item_agent_commands SET message_id=$2,updated_at=NOW() WHERE id=$1', [command.id, messageId])
+    await db.query('UPDATE conversations SET updated_at=NOW() WHERE id=$1', [scope.conversationId])
+    command.message_id = messageId
+    message = { id: messageId, sequence, body, at, agentRecipientIds: [item.assigneeId] }
+    await addEvent(db, { workflowId: scope.workflow!.id, itemId: item.id, actorId: scope.userId, actorName: scope.actorName,
+      type: 'agent.execution_requested', changes: { commandId: command.id, agentId: item.assigneeId, messageId, source } })
+    await addNotification(db, scope, { itemId: item.id, recipientId: item.assigneeId, kind: 'agent_execute',
+      dedupeKey: `${item.id}:execute:${idempotencyKey}` })
+  }
+  return { created, message,
+    command: { id: command.id, status: command.status, createdAt: command.created_at,
+      agentId: command.agent_id, messageId: command.message_id } }
+}
+
 export async function createWorkItem(companyId: string, userId: string, conversationId: string, input: WorkItemInput): Promise<{ scope: HumanWorkflowScope } & ItemMutationResult> {
   const client = await pool.connect()
   try {
@@ -492,8 +585,12 @@ export async function createWorkItem(companyId: string, userId: string, conversa
     if (assignee && await addNotification(client, scope, { itemId: id, recipientId: assignee.id,
       kind: 'assigned', dedupeKey: `${id}:assigned:${assignee.id}:1` })) notificationRecipientIds.push(assignee.id)
     const item = await fetchItem(client, workflowId, id)
+    const agentExecution = assignee?.kind === 'agent' && !['done','canceled'].includes(item.status)
+      ? await queueAgentExecution(client, scope, item, `assignment:${id}:v${item.version}:${assignee.id}`,
+        '你已被分配此事项，请按事项描述和验收标准开始执行。', 'assignment')
+      : undefined
     await client.query('COMMIT')
-    return { scope, item, notificationRecipientIds, eventKind: 'item.created' }
+    return { scope, item, notificationRecipientIds, eventKind: 'item.created', agentExecution }
   } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error } finally { client.release() }
 }
 
@@ -620,8 +717,13 @@ export async function updateWorkItem(companyId: string, userId: string, conversa
         if (await addNotification(client, scope, { itemId, recipientId, kind: 'blocked', dedupeKey: `${itemId}:blocked:v${next.version}:${recipientId}` })) notificationRecipientIds.push(recipientId!)
       }
     }
+    const agentExecution = assigneeChanged && next.assigneeId && next.assigneeKind === 'agent'
+      && !['done','canceled'].includes(next.status)
+      ? await queueAgentExecution(client, scope, next, `assignment:${itemId}:v${next.version}:${next.assigneeId}`,
+        '你已被分配此事项，请按事项描述和验收标准开始执行。', 'assignment')
+      : undefined
     await client.query('COMMIT')
-    return { scope, item: next, notificationRecipientIds: [...new Set(notificationRecipientIds)], eventKind }
+    return { scope, item: next, notificationRecipientIds: [...new Set(notificationRecipientIds)], eventKind, agentExecution }
   } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error } finally { client.release() }
 }
 
@@ -842,64 +944,11 @@ export async function requestAgentExecution(companyId: string, userId: string, c
     await client.query('BEGIN')
     const scope = await requireHumanWorkflowScope(client, companyId, userId, conversationId, { workflow: true, mutation: true })
     const item = await fetchItem(client, scope.workflow!.id, itemId, true)
-    if (!item.assigneeId || item.assigneeKind !== 'agent') workflowFail('AGENT_ASSIGNEE_REQUIRED', 409, 'Assign this item to an Agent first.')
-    await validateAssignee(client, scope, item.assigneeId)
     const key = typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 160) : ''
     if (!key) workflowFail('IDEMPOTENCY_KEY_REQUIRED', 400, 'idempotencyKey required.')
-    const commandId = `wicmd-${randomUUID()}`
-    const cleanedInstruction = cleanText(instruction, 8000)
-    const { rows } = await client.query<{ id: string; status: string; created_at: string; message_id: string | null; agent_id: string }>(
-      `INSERT INTO project_work_item_agent_commands
-       (id,item_id,project_id,conversation_id,agent_id,requested_by,idempotency_key,instruction)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT(item_id,idempotency_key) DO NOTHING
-       RETURNING id,status,created_at,message_id,agent_id`,
-      [commandId, itemId, scope.projectId, conversationId, item.assigneeId, userId, key, cleanedInstruction],
-    )
-    const created = Boolean(rows[0])
-    const command = rows[0] ?? (await client.query<{ id: string; status: string; created_at: string; message_id: string | null; agent_id: string }>(
-      `SELECT id,status,created_at,message_id,agent_id FROM project_work_item_agent_commands
-        WHERE item_id=$1 AND idempotency_key=$2`, [itemId, key],
-    )).rows[0]
-    if (!command) throw new Error('agent command insert returned no row')
-
-    let message: { id: string; sequence: number; body: string; at: string; agentRecipientIds: string[] } | null = null
-    if (created) {
-      const seq = await client.query<{ seq: number }>(
-        `INSERT INTO conversation_counters (conversation_id, next_sequence)
-         VALUES ($1, 2)
-         ON CONFLICT (conversation_id) DO UPDATE SET next_sequence=conversation_counters.next_sequence+1
-         RETURNING next_sequence-1 AS seq`, [conversationId],
-      )
-      const sequence = Number(seq.rows[0]?.seq ?? 1)
-      const messageId = `m-${randomUUID()}`
-      const body = [
-        `@${item.assigneeId} 请执行项目流程事项 ${item.issueKey}：${item.title}`,
-        cleanedInstruction || '请按事项描述和验收标准执行。',
-        `先运行 \`cumora workflow show ${item.issueKey}\` 获取受控详情；开始时更新为 in_progress，完成后更新为 in_review，不要自行标记 done。`,
-      ].join('\n')
-      const at = new Date().toISOString()
-      await client.query(
-        `INSERT INTO messages
-          (id,conversation_id,author_id,kind,body,sequence,company_id,client_id,agent_recipient_ids)
-         VALUES($1,$2,$3,'text',$4,$5,$6,$7,$8::jsonb)`,
-        [messageId, conversationId, userId, body, sequence, companyId, `workflow-command:${command.id}`,
-          JSON.stringify([item.assigneeId])],
-      )
-      await client.query('UPDATE project_work_item_agent_commands SET message_id=$2,updated_at=NOW() WHERE id=$1', [command.id, messageId])
-      await client.query('UPDATE conversations SET updated_at=NOW() WHERE id=$1', [conversationId])
-      command.message_id = messageId
-      message = { id: messageId, sequence, body, at, agentRecipientIds: [item.assigneeId] }
-    }
-    if (created) {
-      await addEvent(client, { workflowId: scope.workflow!.id, itemId, actorId: userId, actorName: scope.actorName,
-        type: 'agent.execution_requested', changes: { commandId: command.id, agentId: item.assigneeId, messageId: command.message_id } })
-      await addNotification(client, scope, { itemId, recipientId: item.assigneeId, kind: 'agent_execute', dedupeKey: `${itemId}:execute:${key}` })
-    }
+    const dispatch = await queueAgentExecution(client, scope, item, key, instruction, 'manual')
     await client.query('COMMIT')
-    return { scope, item, created, message,
-      command: { id: command.id, status: command.status, createdAt: command.created_at, agentId: command.agent_id,
-        messageId: command.message_id } }
+    return { scope, item, ...dispatch }
   } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error } finally { client.release() }
 }
 
