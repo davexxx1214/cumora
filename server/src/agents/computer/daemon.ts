@@ -2019,9 +2019,21 @@ class AgentRunner {
         // The poll just no-ops until the window passes; unread messages are
         // untouched and get triaged then.
         if (Date.now() < this.triageBackoffUntil) {
-          const leftS = Math.round((this.triageBackoffUntil - Date.now()) / 1000)
-          console.log(`[computer] ${this.agent.id} skip (${reason}): triage backoff, ${leftS}s left`)
-          break
+          await this.ensureToken()
+          const explicit = await runtimeGet<{ explicit?: boolean }>(
+            this.cfg.serverUrl,
+            `/inbox-triage/explicit${this.lastWakeConvo ? `?conversationId=${encodeURIComponent(this.lastWakeConvo)}` : ''}`,
+            this.token,
+          ).catch(() => null)
+          if (explicit?.explicit) {
+            this.triageTroubleStreak = 0
+            this.triageBackoffUntil = 0
+            console.log(`[computer] ${this.agent.id} explicit workflow command bypassed triage backoff`)
+          } else {
+            const leftS = Math.round((this.triageBackoffUntil - Date.now()) / 1000)
+            console.log(`[computer] ${this.agent.id} skip (${reason}): triage backoff, ${leftS}s left`)
+            break
+          }
         }
         // Big-brain rate-limit cooldown: the last attempt got throttled by the
         // provider. Skip this turn cleanly (no triage call either — even small

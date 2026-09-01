@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
+import { cancelProjectWorkflowExecutions } from '../project-workflow/service.js'
 import { fail } from './model.js'
 
 export async function requireProjectAdmin(client: PoolClient, companyId: string, userId: string): Promise<void> {
@@ -56,6 +57,7 @@ export async function validateNewProjectBinding(client: PoolClient, companyId: s
 export async function prepareGroupProjectStop(companyId: string, userId: string, conversationId: string): Promise<void> {
   const client = await pool.connect()
   let pending = 0
+  let previousProjectId: string | null = null
   try {
     await client.query('BEGIN')
     await client.query('SELECT id FROM companies WHERE id = $1 FOR UPDATE', [companyId])
@@ -66,6 +68,7 @@ export async function prepareGroupProjectStop(companyId: string, userId: string,
     if (!group || !group.members.includes(userId)) fail('NOT_FOUND', 404, 'Group not found.')
     if (group.kind !== 'group') fail('NOT_GROUP', 400, 'Only group chats have project bindings.')
     if (group.project_id) {
+      previousProjectId = group.project_id
       await client.query('UPDATE projects SET file_switching = TRUE WHERE id = $1', [group.project_id])
       await client.query('UPDATE project_file_leases SET revoked_at = COALESCE(revoked_at, NOW()) WHERE conversation_id = $1', [conversationId])
       const leases = await client.query<{ count: number }>('SELECT COUNT(*)::int AS count FROM project_file_leases WHERE conversation_id = $1 AND stopped_at IS NULL', [conversationId])
@@ -73,6 +76,10 @@ export async function prepareGroupProjectStop(companyId: string, userId: string,
     }
     await client.query('COMMIT')
   } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+  // Project switches, archives and group dissolution all pass through this
+  // committed stop boundary. Cancel durable workflow commands here as well as
+  // revoking file leases, so a pending inbox message cannot restart old work.
+  if (previousProjectId) await cancelProjectWorkflowExecutions(companyId, previousProjectId)
   if (pending) fail('TASKS_STOPPING', 409, `${pending} project task(s) are stopping. Retry after they exit; the current project has not changed.`)
 }
 

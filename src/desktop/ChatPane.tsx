@@ -12,6 +12,7 @@ import { Avatar, AvatarStack } from '@/components/Avatar'
 import { MembersPopover } from '@/components/MembersPopover'
 import { GroupInviteButton } from '@/components/GroupInviteButton'
 import { ProjectFilesButton } from '@/components/ProjectFilesButton'
+import { ProjectWorkflowButton } from '@/components/ProjectWorkflowButton'
 import { PreviewText } from '@/components/PreviewText'
 import { RichInput, type RichInputHandle } from '@/components/RichInput'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
@@ -309,6 +310,7 @@ function ChatHeader({
       <div className="flex gap-1 text-ink-500 shrink-0">
         {c.kind === 'group' && <GroupInviteButton conversationId={c.id} conversationName={c.title} />}
         {c.kind === 'group' && <ProjectFilesButton conversationId={c.id} />}
+        {c.kind === 'group' && <ProjectWorkflowButton conversationId={c.id} />}
         <button
           onClick={onToggleSearch}
           title={t('chat.search')}

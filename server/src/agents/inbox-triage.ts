@@ -1,12 +1,13 @@
-import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
 import { env } from '../env.js'
-import { getTrackedLlmClient } from './llm-ledger.js'
-import { inprocClient } from './runtime/inproc-client.js'
-import { buildTriageRequest, parseTriage, finalizeTriage, isRateLimited, type InboxTriageVerdict, type ClaimsByConvo } from './triage-core.js'
-import { recordTriage } from './observability.js'
+import { findExplicitAgentExecutionForInbox } from '../project-workflow/agent-service.js'
 import { usageFromOpenAI } from './cost.js'
+import { getTrackedLlmClient } from './llm-ledger.js'
+import { recordTriage } from './observability.js'
+import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
+import { inprocClient } from './runtime/inproc-client.js'
+import { buildTriageRequest, type ClaimsByConvo, finalizeTriage, type InboxTriageVerdict, isRateLimited, parseTriage } from './triage-core.js'
 
-export type { ResponseMode, InboxTriageVerdict } from './triage-core.js'
+export type { InboxTriageVerdict, ResponseMode } from './triage-core.js'
 export { buildTriageRequest } from './triage-core.js'
 
 /** Gather the active worklog claims for every conversation with an unread,
@@ -38,6 +39,21 @@ export async function classifyInboxTriage(args: {
   inbox: InboxRow[]
   context: ContextRow[]
 }): Promise<InboxTriageVerdict> {
+  const explicit = await findExplicitAgentExecutionForInbox(
+    args.agentId,
+    args.inbox.map(message => message.id),
+  )
+  if (explicit) {
+    return {
+      actionable: true,
+      reason: `A human explicitly commanded execution of ${explicit.issueKey}.`,
+      promptNote:
+        `This is an explicit human execution command for ${explicit.issueKey} (${explicit.title}). ` +
+        `Handle that item now, use the controlled workflow tools, and do not treat it as an assignment-only notification.`,
+      responseMode: 'me',
+      source: 'explicit-command',
+    }
+  }
   const [claimsByConvo, humanActiveInCompany] = await Promise.all([
     gatherClaimsByConvo(args.inbox),
     // Supervision signal for the loop cap: a human actively reading the company

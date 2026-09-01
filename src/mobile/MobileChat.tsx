@@ -6,6 +6,7 @@ import { MobileMessageTapback, type TapbackAction } from './MobileMessageTapback
 import { useApp } from '@/stores/app'
 import { GroupInviteButton } from '@/components/GroupInviteButton'
 import { ProjectFilesButton } from '@/components/ProjectFilesButton'
+import { ProjectWorkflowButton } from '@/components/ProjectWorkflowButton'
 import { DissolveGroupDialog } from '@/components/DissolveGroupDialog'
 import { useAuth, useMe, useCanManageWorkspace } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
@@ -1214,6 +1215,7 @@ export function MobileChatInfo() {
           </div>
           <div><GroupInviteButton conversationId={c.id} conversationName={c.title} /></div>
           <div><ProjectFilesButton conversationId={c.id} /></div>
+          <div><ProjectWorkflowButton conversationId={c.id} /></div>
           {editingTitle ? (
             <input
               autoFocus

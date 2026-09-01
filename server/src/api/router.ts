@@ -33,6 +33,7 @@ import {
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
 import { projectFilesRouter } from './project-files-router.js'
+import { createProjectWorkflowRouter } from './project-workflow-router.js'
 import { archiveProject, attachGroupProject, prepareGroupProjectStop, validateNewProjectBinding } from '../project-files/bindings.js'
 import { ProjectFileError } from '../project-files/model.js'
 import { projectAttachment } from '../project-files/references.js'
@@ -42,6 +43,7 @@ import {
   createProjectGitRepository, deleteProjectGitRepository, getProjectGitCredential,
   listProjectGitRepositories, saveProjectGitCredential, syncProjectGitRepository, updateProjectGitRepository,
 } from '../project-git/service.js'
+import { cancelProjectWorkflowExecutions, reconcileProjectWorkflowAssignees } from '../project-workflow/service.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -1427,6 +1429,7 @@ api.delete('/companies/:id/members/:memberId', safe(async (req, res) => {
     client.release()
   }
   await publish(CH_WORKSPACE_MEMBERS, { type: 'workspace.member_removed', companyId, userId: memberId })
+  await reconcileProjectWorkflowAssignees(companyId, undefined, memberId)
   await audit({ kind: 'workspace_member_remove', userId: me, companyId, detail: { memberId } })
   res.json({ ok: true })
 }))
@@ -2103,6 +2106,7 @@ api.post('/projects/:id/archive', async (req, res) => {
   const { id } = req.params
   const archive = req.body?.archive !== false
   await archiveProject(tenant, me, String(id), archive)
+  if (archive) await cancelProjectWorkflowExecutions(tenant, String(id))
   res.json({ ok: true, status: archive ? 'archived' : 'active' })
 })
 
@@ -2165,6 +2169,7 @@ api.post('/conversations/:id/project', async (req, res) => {
   if (projectId === undefined) { res.status(400).json({ error: 'projectId required (string or null to detach)' }); return }
   try {
     const result = await attachGroupProject(tenant, me, String(id), projectId)
+    await reconcileProjectWorkflowAssignees(tenant, String(id))
     await publish(CH_CONVO_UPDATED, { type: 'conversation.updated', companyId: tenant, conversationId: String(id), patch: { projectId } }).catch(() => {})
     res.json(result)
   } catch (error) {
@@ -2875,6 +2880,7 @@ api.put('/agents/:id', async (req, res) => {
   )
   const { invalidatePersonaCache } = await import('../agents/personas.js')
   invalidatePersonaCache(id)
+  await reconcileProjectWorkflowAssignees(tenant, undefined, id)
   res.json({ ok: true })
 })
 
@@ -3499,6 +3505,7 @@ api.post('/conversations/:id/leave', async (req, res) => {
     `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
     [id, JSON.stringify(next), tenant],
   )
+  await reconcileProjectWorkflowAssignees(tenant, id, me)
   res.json({ ok: true, members: next })
 })
 
@@ -3533,6 +3540,7 @@ api.delete('/conversations/:id/members/:memberId', async (req, res) => {
     `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
     [id, JSON.stringify(next), tenant],
   )
+  await reconcileProjectWorkflowAssignees(tenant, id, target)
   res.json({ ok: true, members: next })
 })
 
@@ -6659,6 +6667,7 @@ api.post('/push/unregister', async (req, res) => {
 // tenant/role gates as the rest of this file; it never trusts company ids from
 // request bodies or URLs.
 api.use('/shipping', createShippingRouter({ pool, requireCompany, requireCompanyRole }))
+api.use('/project-workflows', createProjectWorkflowRouter({ requireCompany }))
 
 // Global error handler — must come after all routes. HttpError → status code.
 api.use(errorHandler)

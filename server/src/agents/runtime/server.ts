@@ -15,21 +15,22 @@
  * `/api` because the cookie-auth middleware on /api would reject these
  * (and we don't want pods sharing the human session cookie path).
  */
-import { Router, type Request, type Response, type NextFunction } from 'express'
+import { type NextFunction, type Request, type Response, Router } from 'express'
+import { ProjectFileError } from '../../project-files/model.js'
+import { requireProjectHost } from '../../project-files/runtime-host.js'
+import { createProjectLease, currentAgentProject, filesEnabled, stopProjectLease } from '../../project-files/service.js'
+import { findExplicitAgentExecutionForInbox, markAgentExecutionRunFinished, markAgentExecutionRunStarted } from '../../project-workflow/agent-service.js'
+import { AGENDA_CLASSIFIER_ERROR, claimStallNudge, classifyAgendaActionable, gatherAgentAgenda, renderAgendaBrief } from '../agenda.js'
 import { runCli } from '../cli.js'
 import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
+import { recordTriage, type TriageSource, touchAgentRun } from '../observability.js'
 import { buildTeamRosterText, getPersona } from '../personas.js'
-import { gatherAgentAgenda, classifyAgendaActionable, renderAgendaBrief, claimStallNudge, AGENDA_CLASSIFIER_ERROR } from '../agenda.js'
 import { consumeAgentTurnToken } from '../scheduler.js'
-import { touchAgentRun, recordTriage, type TriageSource } from '../observability.js'
 import { buildRuntimeArgv } from './cli-argv.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
-import { verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
+import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
-import { ProjectFileError } from '../../project-files/model.js'
-import { createProjectLease, currentAgentProject, filesEnabled, stopProjectLease } from '../../project-files/service.js'
-import { requireProjectHost } from '../../project-files/runtime-host.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -178,6 +179,19 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, req, res) => {
   const focus = typeof req.query.conversationId === 'string' ? req.query.conversationId : null
   const inbox = focus ? allInbox.filter(row => row.conversation_id === focus) : allInbox
   const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
+  const explicit = await findExplicitAgentExecutionForInbox(c.sub, inbox.map(message => message.id), focus)
+  if (explicit) {
+    res.json({ verdict: {
+      actionable: true,
+      reason: `A human explicitly commanded execution of ${explicit.issueKey}.`,
+      promptNote:
+        `This is an explicit human execution command for ${explicit.issueKey} (${explicit.title}). ` +
+        `Handle that item now, use the controlled workflow tools, and do not treat it as an assignment-only notification.`,
+      responseMode: 'me',
+      source: 'explicit-command',
+    } })
+    return
+  }
   // Content-blind cost floor (NOT a loop decision). The daemon self-polls every
   // 20s, bypassing the scheduler's fan-out rate limit, so a runaway could spin
   // the local model unbounded. Bound it by the agent's activation budget — same
@@ -213,6 +227,19 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, req, res) => {
   // strict so BYOA runs the EXACT same gate prompt as Cloud. Cost is still bounded by
   // the per-minute activation rate floor above, not by an aggressive prompt.
   res.json(buildTriageRequest({ agentId: c.sub, persona, inbox, context, claimsByConvo, humanActiveInCompany }))
+}))
+
+// During a LOCAL triage outage the BYOA daemon normally backs off before it
+// asks for another triage payload. Explicit workflow commands are different:
+// they are already authorized, durable human actions and must not wait behind
+// the small-brain cooldown. This cheap probe lets the daemon break only that
+// cooldown; ordinary chat still follows the existing backoff and cost gates.
+runtimeRouter.get('/inbox-triage/explicit', withAgent(async (c, req, res) => {
+  const allInbox = await inprocClient.loadInbox(c.sub)
+  const focus = typeof req.query.conversationId === 'string' ? req.query.conversationId : null
+  const inbox = focus ? allInbox.filter(row => row.conversation_id === focus) : allInbox
+  const command = await findExplicitAgentExecutionForInbox(c.sub, inbox.map(message => message.id), focus)
+  res.json({ explicit: Boolean(command) })
 }))
 
 // BOARD-AWARENESS for BYOA: the daemon has no DB, so the server gathers this
@@ -371,6 +398,10 @@ runtimeRouter.post('/runs', withAgent(async (c, req, res) => {
     inboxCount: body?.inboxCount,
     fingerprint: body?.fingerprint,
   })
+  if (c.companyId) {
+    await markAgentExecutionRunStarted(c.sub, c.companyId, runId,
+      Array.isArray(body?.inputMessageIds) ? body!.inputMessageIds.filter((id): id is string => typeof id === 'string') : [])
+  }
   res.json({ runId })
 }))
 
@@ -522,7 +553,7 @@ runtimeRouter.post('/runs/:runId/heartbeat', withAgent(async (_c, req, res) => {
   res.json({ ok: true })
 }))
 
-runtimeRouter.post('/runs/:runId/finish', withAgent(async (_c, req, res) => {
+runtimeRouter.post('/runs/:runId/finish', withAgent(async (c, req, res) => {
   const runId = String(req.params.runId)
   const body = req.body as {
     status?: 'running' | 'completed' | 'failed' | 'skipped'
@@ -544,6 +575,7 @@ runtimeRouter.post('/runs/:runId/finish', withAgent(async (_c, req, res) => {
     model: body.model,
     usage: body.usage,
   })
+  await markAgentExecutionRunFinished(c.sub, runId, body.status)
   res.json({ ok: true })
 }))
 

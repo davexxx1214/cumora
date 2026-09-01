@@ -94,7 +94,7 @@ export function setDevModeEnabled(enabled: boolean): void {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly data?: Record<string, unknown>) {
     super(message)
     this.name = 'ApiError'
   }
@@ -120,16 +120,18 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     // JSON body like `{error: "..."}` on failure. Falls back to a body text
     // snippet if it isn't JSON, then to status only as last resort.
     let detail: string | null = null
+    let errorData: Record<string, unknown> | undefined
     try {
       const text = await res.text()
       if (text) {
         try {
-          const j = JSON.parse(text) as { error?: string; message?: string }
+          const j = JSON.parse(text) as { error?: string; message?: string } & Record<string, unknown>
+          errorData = j
           detail = j.error ?? j.message ?? text.slice(0, 200)
         } catch { detail = text.slice(0, 200) }
       }
     } catch { /* ignore */ }
-    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
+    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status, errorData)
   }
   return res.json() as Promise<T>
 }
@@ -204,6 +206,121 @@ export interface ApiProject {
   createdAt: string
   archivedAt: string | null
   conversationCount: number
+}
+
+export type ProjectWorkItemType = 'user_story' | 'defect' | 'subtask'
+export type ProjectWorkItemStatus = 'todo' | 'in_progress' | 'blocked' | 'in_review' | 'done' | 'canceled'
+export type ProjectWorkItemPriority = 'low' | 'medium' | 'high' | 'critical'
+
+export interface ApiProjectWorkflow {
+  id: string
+  projectId: string
+  companyId: string
+  issuePrefix: string
+  nextNumber: number
+  status: 'active' | 'closed'
+  version: number
+  createdBy: string
+  createdAt: string
+  updatedAt: string
+  closedAt: string | null
+}
+
+export interface ApiProjectWorkflowContext {
+  project: { id: string; name: string; status: string }
+  conversationId: string
+  role: string
+  canManage: boolean
+  workflow: ApiProjectWorkflow | null
+}
+
+export interface ApiProjectWorkItem {
+  id: string
+  workflowId: string
+  projectId: string
+  issueNumber: number
+  issueKey: string
+  type: ProjectWorkItemType
+  parentId: string | null
+  title: string
+  description: string
+  status: ProjectWorkItemStatus
+  priority: ProjectWorkItemPriority
+  assigneeId: string | null
+  assigneeKind: 'human' | 'agent' | null
+  reporterId: string
+  labels: string[]
+  dueAt: string | null
+  rank: number
+  version: number
+  userValue: string | null
+  acceptanceCriteria: string | null
+  storyPoints: number | null
+  severity: ProjectWorkItemPriority | null
+  reproductionSteps: string | null
+  expectedResult: string | null
+  actualResult: string | null
+  environment: string | null
+  resolution: 'fixed' | 'duplicate' | 'cannot_reproduce' | 'wont_fix' | null
+  archivedAt: string | null
+  createdAt: string
+  updatedAt: string
+  subtaskDone: number
+  subtaskTotal: number
+}
+
+export interface ApiProjectWorkflowComment {
+  id: string
+  authorId: string
+  authorKind: 'human' | 'agent'
+  body: string
+  mentions: string[]
+  createdAt: string
+  updatedAt: string
+  deletedAt: string | null
+}
+
+export interface ApiProjectWorkflowActivity {
+  id: string
+  itemId: string | null
+  actorId: string
+  actorKind: 'human' | 'agent' | 'system'
+  actorName: string
+  eventType: string
+  changes: Record<string, unknown>
+  source: 'web' | 'agent' | 'system'
+  reason: string | null
+  createdAt: string
+}
+
+export interface ApiProjectWorkflowNotification {
+  id: string
+  kind: 'assigned' | 'reassigned' | 'blocked' | 'mentioned' | 'agent_execute'
+  itemId: string | null
+  issueKey: string | null
+  title: string | null
+  actorId: string
+  readAt: string | null
+  createdAt: string
+}
+
+export interface ApiProjectWorkItemFileLink {
+  id: string
+  entryId: string
+  versionId: string
+  name: string
+  linkedBy: string
+  createdAt: string
+}
+
+export interface ApiProjectWorkItemCommitLink {
+  id: string
+  repositoryId: string
+  repositoryName: string
+  commitHash: string
+  summary: string | null
+  linkedBy: string
+  createdAt: string
 }
 
 export interface ApiProjectGitRepository {
@@ -933,6 +1050,96 @@ export const api = {
     http<{ ok: boolean; projectId: string | null }>(`/conversations/${encodeURIComponent(conversationId)}/project`, {
       method: 'POST', body: JSON.stringify({ projectId }),
     }),
+  projectWorkflowCapabilities: () => http<{ enabled: boolean }>('/project-workflows/capabilities'),
+  getProjectWorkflow: (conversationId: string) =>
+    http<ApiProjectWorkflowContext>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}`),
+  createProjectWorkflow: (conversationId: string, issuePrefix?: string) =>
+    http<ApiProjectWorkflow>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}`, {
+      method: 'POST', body: JSON.stringify({ issuePrefix }),
+    }),
+  setProjectWorkflowClosed: (conversationId: string, closed: boolean) =>
+    http<{ ok: boolean; status: 'active' | 'closed' }>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}`, {
+      method: 'PATCH', body: JSON.stringify({ closed }),
+    }),
+  listProjectWorkItems: (conversationId: string, filters?: Partial<{
+    type: ProjectWorkItemType[]; status: ProjectWorkItemStatus[]; priority: ProjectWorkItemPriority[]
+    assigneeId: string; label: string; search: string; archived: boolean; parentId: string | null
+    limit: number; offset: number
+  }>) => {
+    const params = new URLSearchParams()
+    if (filters?.type?.length) params.set('type', filters.type.join(','))
+    if (filters?.status?.length) params.set('status', filters.status.join(','))
+    if (filters?.priority?.length) params.set('priority', filters.priority.join(','))
+    if (filters?.assigneeId) params.set('assigneeId', filters.assigneeId)
+    if (filters?.label) params.set('label', filters.label)
+    if (filters?.search) params.set('search', filters.search)
+    if (filters?.archived) params.set('archived', '1')
+    if (filters && 'parentId' in filters) params.set('parentId', filters.parentId ?? 'root')
+    if (filters?.limit) params.set('limit', String(filters.limit))
+    if (filters?.offset) params.set('offset', String(filters.offset))
+    const query = params.toString()
+    return http<{ workflow: ApiProjectWorkflow; projectId: string; conversationId: string; items: ApiProjectWorkItem[]; limit: number; offset: number }>(
+      `/project-workflows/conversations/${encodeURIComponent(conversationId)}/items${query ? `?${query}` : ''}`,
+    )
+  },
+  getProjectWorkItem: (conversationId: string, itemId: string) =>
+    http<ApiProjectWorkItem>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}`),
+  createProjectWorkItem: (conversationId: string, input: Partial<ApiProjectWorkItem> & { type: ProjectWorkItemType; title: string }) =>
+    http<ApiProjectWorkItem>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items`, {
+      method: 'POST', body: JSON.stringify(input),
+    }),
+  updateProjectWorkItem: (conversationId: string, itemId: string, input: Record<string, unknown> & { expectedVersion: number }) =>
+    http<ApiProjectWorkItem>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}`, {
+      method: 'PATCH', body: JSON.stringify(input),
+    }),
+  archiveProjectWorkItem: (conversationId: string, itemId: string, expectedVersion: number, archived = true) =>
+    http<ApiProjectWorkItem>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/archive`, {
+      method: 'POST', body: JSON.stringify({ expectedVersion, archived }),
+    }),
+  deleteProjectWorkItem: (conversationId: string, itemId: string, reason: string) =>
+    http<{ ok: boolean }>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}`, {
+      method: 'DELETE', body: JSON.stringify({ reason }),
+    }),
+  listProjectWorkItemComments: (conversationId: string, itemId: string) =>
+    http<ApiProjectWorkflowComment[]>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/comments`),
+  addProjectWorkItemComment: (conversationId: string, itemId: string, body: string) =>
+    http<ApiProjectWorkflowComment>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/comments`, {
+      method: 'POST', body: JSON.stringify({ body }),
+    }),
+  deleteProjectWorkItemComment: (conversationId: string, itemId: string, commentId: string) =>
+    http<{ ok: boolean }>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/comments/${encodeURIComponent(commentId)}`, {
+      method: 'DELETE',
+    }),
+  listProjectWorkItemActivity: (conversationId: string, itemId: string) =>
+    http<ApiProjectWorkflowActivity[]>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/activity`),
+  listProjectWorkItemLinks: (conversationId: string, itemId: string) =>
+    http<{ files: ApiProjectWorkItemFileLink[]; commits: ApiProjectWorkItemCommitLink[] }>(
+      `/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/links`,
+    ),
+  addProjectWorkItemFileLink: (conversationId: string, itemId: string, input: { entryId: string; versionId: string; name?: string }) =>
+    http<ApiProjectWorkItemFileLink>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/file-links`, {
+      method: 'POST', body: JSON.stringify(input),
+    }),
+  addProjectWorkItemCommitLink: (conversationId: string, itemId: string, input: { repositoryId: string; commitHash: string; summary?: string }) =>
+    http<ApiProjectWorkItemCommitLink>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/commit-links`, {
+      method: 'POST', body: JSON.stringify(input),
+    }),
+  deleteProjectWorkItemFileLink: (conversationId: string, itemId: string, linkId: string) =>
+    http<{ ok: boolean }>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/file-links/${encodeURIComponent(linkId)}`, { method: 'DELETE' }),
+  deleteProjectWorkItemCommitLink: (conversationId: string, itemId: string, linkId: string) =>
+    http<{ ok: boolean }>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/commit-links/${encodeURIComponent(linkId)}`, { method: 'DELETE' }),
+  listProjectWorkflowNotifications: (conversationId: string, unread = true) =>
+    http<ApiProjectWorkflowNotification[]>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/notifications?unread=${unread ? '1' : '0'}`),
+  markProjectWorkflowNotificationsRead: (conversationId: string, ids?: string[]) =>
+    http<{ ok: boolean }>(`/project-workflows/conversations/${encodeURIComponent(conversationId)}/notifications/read`, {
+      method: 'POST', body: JSON.stringify({ ids }),
+    }),
+  executeProjectWorkItem: (conversationId: string, itemId: string, instruction: string, idempotencyKey = crypto.randomUUID()) =>
+    http<{ id: string; status: string; createdAt: string; agentId: string }>(
+      `/project-workflows/conversations/${encodeURIComponent(conversationId)}/items/${encodeURIComponent(itemId)}/execute`, {
+        method: 'POST', body: JSON.stringify({ instruction, idempotencyKey }),
+      },
+    ),
   createCompany: (name: string) =>
     http<{ id: string; name: string; slug: string; role: string }>('/companies', {
       method: 'POST', body: JSON.stringify({ name }),
@@ -1535,6 +1742,8 @@ export type WsEvent =
   | { type: 'group.pulled'; conversationId: string; pulledById: string }
   | { type: 'conversation.updated'; conversationId: string; patch: { topic?: string | null; title?: string; projectId?: string | null } }
   | { type: 'project.files_changed'; conversationId: string; projectId: string; bindingVersion: string }
+  | { type: 'project.workflow_changed'; conversationId: string; projectId: string; workflowId: string
+      kind: string; itemId?: string; actorId: string; notificationRecipientIds?: string[] }
   | { type: 'conversation.dissolved'; conversationId: string }
   | { type: 'convene'; sessionId: string; conversationId: string; kind: 'started' | 'transcript' | 'ended' | 'tile'; data?: unknown }
   | { type: 'board.changed'; kind:

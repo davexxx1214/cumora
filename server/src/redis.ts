@@ -38,6 +38,7 @@ export const CH_GROUP_PULLED = 'cumora:group.pulled'
 export const CH_CONVO_UPDATED = 'cumora:convo.updated'
 export const CH_CONVENE = 'cumora:convene'
 export const CH_BOARDS = 'cumora:boards'
+export const CH_PROJECT_WORKFLOW = 'cumora:project.workflow'
 export const CH_DOCS = 'cumora:docs'
 /* === Collaborative documents (CRDT) ===
  *
@@ -296,6 +297,8 @@ export interface BoardEvent extends TenantTagged {
   actorId?: string
 }
 
+export type ProjectWorkflowChangedEvent = import('./project-workflow/model.js').ProjectWorkflowChangedEvent
+
 /** Document metadata/listing changed. Content sync still uses the CRDT
  *  doc channels below; this event only tells clients to refresh the
  *  document index so newly-created agent docs appear immediately. */
@@ -424,7 +427,7 @@ export interface WorkspaceMemberRemovedEvent extends TenantTagged {
 export type BroadcastEvent = ProjectFilesChangedEvent | WorkspaceMemberRemovedEvent | MessageNewEvent | MessageDeltaEvent | TypingEvent
   | StatusEvent | AvatarEvent | ParticipantAddedEvent | ReactionsEvent
   | GroupPulledEvent | ConversationUpdatedEvent | ConversationDissolvedEvent | ConveneEvent
-  | BoardEvent | DocIndexEvent | DocUpdateEvent | DocAwarenessEvent | DocMentionEvent | CalendarReminderEvent
+  | BoardEvent | ProjectWorkflowChangedEvent | DocIndexEvent | DocUpdateEvent | DocAwarenessEvent | DocMentionEvent | CalendarReminderEvent
   | CalendarEventChangedEvent
   | PollUpdatedEvent
   | ComputerStatusEvent

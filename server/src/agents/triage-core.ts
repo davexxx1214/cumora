@@ -40,7 +40,7 @@ export interface InboxTriageVerdict {
    *  in-turn by reading the room — but it's kept as part of the gate's reasoning
    *  and the wire shape, identical across cloud and BYOA. */
   responseMode?: ResponseMode
-  source: 'empty-inbox' | 'system-only' | 'rate-limited' | 'loop-cap' | 'support-model' | 'support-model-local' | 'fail-open' | 'human-dm' | 'human-group' | 'dm-agent-engage' | 'calendar-due'
+  source: 'empty-inbox' | 'system-only' | 'rate-limited' | 'loop-cap' | 'support-model' | 'support-model-local' | 'fail-open' | 'human-dm' | 'human-group' | 'dm-agent-engage' | 'calendar-due' | 'explicit-command'
 }
 
 /** Parse a SYSTEM message's wire payload (the JSON envelope the server itself

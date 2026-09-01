@@ -333,6 +333,8 @@ export const env = {
   PROJECT_FILES_ROOT: process.env.CUMORA_PROJECT_FILES_ROOT ?? '',
   PROJECT_GIT_ENABLED: process.env.CUMORA_PROJECT_GIT_ENABLED === '1',
   PROJECT_GIT_ROOT: process.env.CUMORA_PROJECT_GIT_ROOT ?? '',
+  /** Project workflow tracking is independently gated for staged rollout. */
+  PROJECT_WORKFLOW_ENABLED: process.env.CUMORA_PROJECT_WORKFLOW_ENABLED === '1',
   /**
    * sub2api LLM quota gateway. When SUB2API_ADMIN_KEY is set, OAuth
    * signup provisions a per-user sub2api account + API key, and every
