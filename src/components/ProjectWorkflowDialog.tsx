@@ -238,6 +238,7 @@ export function ProjectWorkflowDialog({ conversation, onClose }: { conversation:
           </main>
           {selected && <WorkItemDetail key={`${selected.id}:${selected.version}`} item={selected} subtasks={children(selected.id)}
             conversation={conversation} members={members} canManage={context.canManage} closed={context.workflow.status === 'closed'} busy={busy}
+            refreshRevision={sequence.current}
             onClose={() => setSelectedId(null)} onAct={act} onCreatedSubtask={() => quickCreate(selected.id)} onOpenSubtask={setSelectedId}
             onUpdated={item => setItems(rows => rows.map(row => row.id === item.id ? item : row))} />}
         </div>
@@ -257,9 +258,10 @@ function WorkItemCard({ item, assignee, onOpen }: { item: ApiProjectWorkItem; as
   </button>
 }
 
-function WorkItemDetail({ item, subtasks, conversation, members, canManage, closed, busy, onClose, onAct, onCreatedSubtask, onOpenSubtask, onUpdated }: {
+function WorkItemDetail({ item, subtasks, conversation, members, canManage, closed, busy, refreshRevision, onClose, onAct, onCreatedSubtask, onOpenSubtask, onUpdated }: {
   item: ApiProjectWorkItem; subtasks: ApiProjectWorkItem[]; conversation: Conversation
   members: Array<{ id: string; name: string; kind: 'human' | 'agent' }>; canManage: boolean; closed: boolean; busy: boolean
+  refreshRevision: number
   onClose: () => void; onAct: (work: () => Promise<void>, reloadAfter?: boolean) => Promise<void>
   onCreatedSubtask: () => Promise<void>; onOpenSubtask: (itemId: string) => void; onUpdated: (item: ApiProjectWorkItem) => void
 }) {
@@ -274,7 +276,7 @@ function WorkItemDetail({ item, subtasks, conversation, members, canManage, clos
   useEffect(() => {
     void Promise.all([api.listProjectWorkItemComments(conversation.id, item.id), api.listProjectWorkItemActivity(conversation.id, item.id)])
       .then(([nextComments, nextActivity]) => { setComments(nextComments); setActivity(nextActivity) }).catch(() => {})
-  }, [conversation.id, item.id, item.version])
+  }, [conversation.id, item.id, item.version, refreshRevision])
 
   const save = async () => {
     const payload: Record<string, unknown> & { expectedVersion: number } = {
