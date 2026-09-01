@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { hasExactMention, resolveAgentRecipientIds } from '../agents/message-routing.js'
+import { hasExactMention, inheritTargetedReplyAudience, resolveAgentRecipientIds } from '../agents/message-routing.js'
 
 test('exact mentions respect token boundaries and casing', () => {
   assert.equal(hasExactMention('please check this @codex', 'codex'), true)
@@ -29,4 +29,16 @@ test('direct messages stay direct and partial ids do not narrow delivery', () =>
   assert.equal(resolveAgentRecipientIds({
     body: '@code hello', conversationKind: 'group', agentMemberIds: ['codex'],
   }), null)
+})
+
+test('a directed request does not become a second-hop Agent broadcast', () => {
+  assert.deepEqual(inheritTargetedReplyAudience({
+    resolvedAudience: null, incomingAudience: ['iris'], replyingAgentId: 'iris',
+  }), [])
+  assert.equal(inheritTargetedReplyAudience({
+    resolvedAudience: null, incomingAudience: ['iris'], replyingAgentId: 'bram',
+  }), null)
+  assert.deepEqual(inheritTargetedReplyAudience({
+    resolvedAudience: ['nova'], incomingAudience: ['iris'], replyingAgentId: 'iris',
+  }), ['nova'])
 })

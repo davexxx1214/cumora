@@ -21,7 +21,7 @@ import {
   parseMemoryPath,
 } from './memory-scope.js'
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
-import { resolveAgentRecipientIds } from './message-routing.js'
+import { hasExactMention, inheritTargetedReplyAudience, resolveAgentRecipientIds } from './message-routing.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -1951,11 +1951,24 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const consumedAsTextContent =
     parsed.flags['attach-text'] && !parsed.flags['attach-text-content']
   const finalBody = consumedAsTextContent ? '' : body
-  const agentRecipientIds = resolveAgentRecipientIds({
+  let agentRecipientIds = resolveAgentRecipientIds({
     body: finalBody,
     conversationKind: cv[0].kind,
     agentMemberIds: cv[0].agent_ids,
   })
+  if (cv[0].actor_is_agent && cv[0].kind === 'group' && agentRecipientIds === null && !hasExactMention(finalBody, 'all')) {
+    const { rows: latestIncoming } = await pool.query<{ agent_recipient_ids: string[] | null }>(
+      `SELECT agent_recipient_ids FROM messages
+        WHERE conversation_id=$1 AND author_id<>$2 AND kind='text'
+        ORDER BY sequence DESC LIMIT 1`,
+      [convoId, me],
+    )
+    agentRecipientIds = inheritTargetedReplyAudience({
+      resolvedAudience: agentRecipientIds,
+      incomingAudience: latestIncoming[0]?.agent_recipient_ids ?? null,
+      replyingAgentId: me,
+    })
+  }
 
   // Atomically claim next sequence + check verbatim-dup + INSERT, all in
   // ONE transaction. The conversation_counters UPSERT takes a row-level

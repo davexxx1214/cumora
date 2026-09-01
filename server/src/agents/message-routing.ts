@@ -1,9 +1,9 @@
 /**
  * Durable routing policy for chat messages addressed to named agents.
  *
- * `null` means the normal room broadcast. A non-empty array means only
- * those agent ids receive the message in their inbox. The visible chat
- * history is unchanged: every conversation member can still read it.
+ * `null` means the normal room broadcast. An array is an explicit Agent
+ * audience: a non-empty array names the recipients and an empty array wakes
+ * no Agents. The visible chat history is unchanged for human members.
  */
 
 function escapeRegex(value: string): string {
@@ -36,3 +36,20 @@ export function resolveAgentRecipientIds(args: {
   return mentioned.length > 0 ? [...new Set(mentioned)] : null
 }
 
+/**
+ * A reply to a message that was explicitly routed to one Agent stays quiet
+ * for its peers unless the replying Agent names a new audience. This stops a
+ * directed human request from turning into a second-hop room broadcast when
+ * the selected Agent posts its result.
+ *
+ * Callers retain `@all` broadcast semantics by skipping this inheritance for
+ * bodies that contain an exact `@all` mention.
+ */
+export function inheritTargetedReplyAudience(args: {
+  resolvedAudience: string[] | null
+  incomingAudience: readonly string[] | null
+  replyingAgentId: string
+}): string[] | null {
+  if (args.resolvedAudience !== null) return args.resolvedAudience
+  return args.incomingAudience?.includes(args.replyingAgentId) ? [] : null
+}

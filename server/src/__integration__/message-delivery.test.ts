@@ -4,6 +4,7 @@ import { createServer, type Server } from 'node:http'
 import {
   buildApiTestApp, ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll,
 } from './_helpers.js'
+import { runCli } from '../agents/cli.js'
 import { pool } from '../db/pool.js'
 
 const USER_ID = 'u-delivery-test'
@@ -128,4 +129,13 @@ test('[integration] HTTP message send persists the named agent delivery audience
     [CONVERSATION_ID],
   )
   assert.deepEqual(rows[0]?.agent_recipient_ids, [codexId])
+
+  const reply = await runCli(['--as', codexId, 'reply', CONVERSATION_ID, 'Targeted work completed'])
+  assert.equal(reply.ok, true, reply.text)
+  const routedReply = await pool.query<{ author_id: string; agent_recipient_ids: string[] | null }>(
+    `SELECT author_id,agent_recipient_ids FROM messages WHERE conversation_id=$1 ORDER BY sequence DESC LIMIT 1`,
+    [CONVERSATION_ID],
+  )
+  assert.equal(routedReply.rows[0]?.author_id, codexId)
+  assert.deepEqual(routedReply.rows[0]?.agent_recipient_ids, [])
 })
