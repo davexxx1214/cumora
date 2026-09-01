@@ -7,13 +7,15 @@ import assert from 'node:assert/strict'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
-import { afterEach, test } from 'node:test'
+import { after, afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { getAdapter, resolveSpawn, type EngineHopReport, type EngineRunResult } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
 const ORIGINAL_PATHEXT = process.env.PATHEXT
+const ORIGINAL_ALLOW_UNSANDBOXED = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
 const tempDirs: string[] = []
 // Sessions spawn a child process. Track them so a FAILING assertion still tears
 // the child down — otherwise it outlives the test and the runner never exits.
@@ -28,6 +30,11 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
+after(() => {
+  if (ORIGINAL_ALLOW_UNSANDBOXED === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = ORIGINAL_ALLOW_UNSANDBOXED
+})
+
 test('local engine failure returns stderr tail for observability', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-engine-'))
   tempDirs.push(root)
@@ -35,21 +42,22 @@ test('local engine failure returns stderr tail for observability', async () => {
   const home = join(root, 'home')
   await mkdir(binDir)
   await mkdir(home)
-  const fakeClaude = join(binDir, 'claude')
+  const fakeClaude = join(binDir, IS_WIN ? 'claude.cmd' : 'claude')
   await writeFile(
     fakeClaude,
-    '#!/bin/sh\n' +
-    'echo "Claude Code error: usage limit reached, no tokens left" >&2\n' +
-    'exit 1\n',
+    IS_WIN
+      ? '@echo off\r\necho Claude Code error: usage limit reached, no tokens left 1>&2\r\nexit /b 1\r\n'
+      : '#!/bin/sh\necho "Claude Code error: usage limit reached, no tokens left" >&2\nexit 1\n',
     'utf8',
   )
-  await chmod(fakeClaude, 0o755)
+  if (!IS_WIN) await chmod(fakeClaude, 0o755)
+  process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
 
   const logs: string[] = []
   const result = await getAdapter('claude').run({
     home,
     prompt: 'wake',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}` },
     model: null,
     fastModel: null,
     onLog: (line) => logs.push(line),
@@ -68,20 +76,21 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   const home = join(root, 'home')
   await mkdir(binDir)
   await mkdir(home)
-  const fakeClaude = join(binDir, 'claude')
+  const fakeClaude = join(binDir, IS_WIN ? 'claude.cmd' : 'claude')
   await writeFile(
     fakeClaude,
-    '#!/bin/sh\n' +
-    'echo "Claude Code error: subscription expired" >&2\n' +
-    'exit 1\n',
+    IS_WIN
+      ? '@echo off\r\necho Claude Code error: subscription expired 1>&2\r\nexit /b 1\r\n'
+      : '#!/bin/sh\necho "Claude Code error: subscription expired" >&2\nexit 1\n',
     'utf8',
   )
-  await chmod(fakeClaude, 0o755)
+  if (!IS_WIN) await chmod(fakeClaude, 0o755)
+  process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
 
   const logs: string[] = []
   const session = getAdapter('claude').startSession?.({
     home,
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}` },
     model: null,
     fastModel: null,
     onLog: (line) => logs.push(line),
@@ -101,23 +110,23 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   assert.match(logs[1] ?? '', /\[session\] engine process died .*exit 1/)
   })
 
-test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', async () => {
+test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-engine-grok-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
   const home = join(root, 'home')
   await mkdir(binDir)
   await mkdir(home)
-  const fakeGrok = join(binDir, 'grok')
+  const fakeGrok = join(binDir, IS_WIN ? 'grok.cmd' : 'grok')
   await writeFile(
     fakeGrok,
-    '#!/bin/sh\n' +
-    'echo \'{"type":"system","subtype":"init","session_id":"sess-grok-1","model":"grok-4.6"}\'\n' +
-    'echo \'{"type":"result","subtype":"success","session_id":"sess-grok-1","usage":{"input_tokens":3,"output_tokens":1},"result":"OK"}\'\n' +
-    'exit 0\n',
+    IS_WIN
+      ? '@echo off\r\necho {"type":"system","subtype":"init","session_id":"sess-grok-1","model":"grok-4.6"}\r\necho {"type":"result","subtype":"success","session_id":"sess-grok-1","usage":{"input_tokens":3,"output_tokens":1},"result":"OK"}\r\nexit /b 0\r\n'
+      : '#!/bin/sh\necho \'{"type":"system","subtype":"init","session_id":"sess-grok-1","model":"grok-4.6"}\'\necho \'{"type":"result","subtype":"success","session_id":"sess-grok-1","usage":{"input_tokens":3,"output_tokens":1},"result":"OK"}\'\nexit 0\n',
     'utf8',
   )
-  await chmod(fakeGrok, 0o755)
+  if (!IS_WIN) await chmod(fakeGrok, 0o755)
+  process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
 
   const adapter = getAdapter('grok')
   await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer', systemPrompt: null })
@@ -127,7 +136,7 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
   const result = await adapter.run({
     home,
     prompt: 'wake',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH ?? ''}` },
     model: null,
     fastModel: null,
     onLog: () => { /* unused */ },
@@ -222,8 +231,8 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(run.exitCode, 0)
   const runCapture = JSON.parse(logs.at(-1) ?? '{}') as { argv?: string[]; stdin?: string }
   assert.deepEqual(runCapture.argv, [
-    'exec', '--model', 'test-model',
-    '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-',
+    'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
+    '--model', 'test-model', '-',
   ])
   assert.equal(runCapture.stdin, longPrompt)
 

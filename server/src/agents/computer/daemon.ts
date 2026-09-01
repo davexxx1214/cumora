@@ -29,11 +29,13 @@ const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { controlledTasksEnabled, freshProjectHome, prepareTaskAuth, sandboxConfig, withTaskSandbox } from './task-sandbox.js'
 import { localProjectServer, projectHostRequest, projectTaskPrompt, recoverProjectStops, selectProjectTaskRows, trackProjectTask, type ProjectTaskContext, type ProjectTaskLease } from './project-task.js'
-import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
+import { allowUnsandboxedByoa, detectEngines, evaluateRunnableEngines, getAdapter, ENGINE_IDS, EXTERNAL_TASK_SANDBOX_ENV, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
+import { engineProcessPath, RuntimeCliBroker, type RuntimeCliBrokerResult, writeShim as writeSecureShim } from './runtime-cli-broker.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
+import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import {
   composeMemoryDigest,
   conversationHeader,
@@ -682,9 +684,13 @@ function helpText(): string {
 }
 
 async function requireLocalEngine(): Promise<EngineId[]> {
-  const engines = await detectEngines()
-  if (engines.length === 0) throw new Error(missingEngineMessage())
-  return engines
+  const detected = await detectEngines()
+  const evaluated = await evaluateRunnableEngines(detected)
+  if (evaluated.blocked.length > 0) {
+    console.warn(`[computer] secure engine(s) disabled: ${evaluated.blocked.map(({ id, reason }) => `${id} (${reason})`).join('; ')}`)
+  }
+  if (evaluated.runnable.length === 0) throw new Error(missingEngineMessage())
+  return evaluated.runnable
 }
 
 // ─── config ─────────────────────────────────────────────────────────────
@@ -990,6 +996,8 @@ class AgentRunner {
   private projectFilesMode = false
   private home: string
   private binDir: string
+  private trustedCliDir: string
+  private ipcDir: string
   private sessionFile: string
   private busy = false
   private pendingRerun = false
@@ -1038,6 +1046,7 @@ class AgentRunner {
   private lastGroupSteerAt = 0
   private pollTimer: ReturnType<typeof setInterval> | undefined
   private readonly adapter
+  private cliBroker: RuntimeCliBroker | null = null
   /** Buffered ledger reporter — collects per-hop usage from the engine and
    *  POSTs to /runtime/llm-calls so the universal llm_calls ledger sees BYOA
    *  trajectory. Created lazily on first use. */
@@ -1054,6 +1063,8 @@ class AgentRunner {
   ) {
     this.home = join(AGENTS_ROOT, agent.id)
     this.binDir = join(this.home, 'bin')
+    this.trustedCliDir = join(CONFIG_DIR, '.runtime-cli-tools', agent.id)
+    this.ipcDir = join(CONFIG_DIR, '.runtime-cli-ipc', agent.id)
     this.sessionFile = join(SESSIONS_DIR, `${agent.id}.session`)
     this.adapter = getAdapter(engine)
   }
@@ -1183,7 +1194,17 @@ class AgentRunner {
     this.projectFilesMode = capabilities?.enabled === true
     if (this.projectFilesMode && !controlledTasksEnabled()) throw new Error('This server requires controlled Linux project tasks. Configure the local project task runner before starting this computer.')
     await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
-    await writeShim(this.binDir)
+    // The legacy HTTP shim is exposed only inside our OS-isolated project task,
+    // or when the operator explicitly opts into compatibility mode.
+    if (this.projectFilesMode || allowUnsandboxedByoa()) await writeShim(this.binDir)
+    else await rm(join(this.binDir, '.runtime-token'), { force: true }).catch(() => {})
+    await writeSecureShim(this.trustedCliDir)
+    this.cliBroker = new RuntimeCliBroker(
+      this.ipcDir,
+      join(CONFIG_DIR, '.runtime-cli-broker', this.agent.id),
+      (argv, signal) => this.invokeRuntimeCli(argv, signal),
+    )
+    await this.cliBroker.start()
     if (!this.projectFilesMode) await this.loadSessionId()
     else { await sandboxConfig(this.home, localProjectServer()); await recoverProjectStops(this.agent.id, token) }
     void this.streamLoop()
@@ -1205,6 +1226,8 @@ class AgentRunner {
     this.beginStop()
     this.engineSession?.stop()
     this.engineSession = null
+    this.cliBroker?.stop()
+    this.cliBroker = null
     // Kill a one-shot engine child too. sync() tears a runner down on any
     // config change (engine/model/persona) or unassign while the daemon keeps
     // running, which is exactly where an orphan does damage: it would still be
@@ -1230,18 +1253,51 @@ class AgentRunner {
       && this.agent.fastModel === agent.fastModel
   }
 
-  private async ensureToken(): Promise<string> {
+  private async ensureToken(signal?: AbortSignal): Promise<string> {
     if (this.token && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) return this.token
     const minted = await api<{ token: string; expiresInSeconds: number }>(
       this.cfg.serverUrl, `/api/agents/${this.agent.id}/runtime-token`,
-      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: '{}' },
+      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: '{}', signal },
     )
     this.token = minted.token
     this.tokenExpiresAt = Date.now() + minted.expiresInSeconds * 1000
     // Persist to the file the cumora shim reads, so a long-lived (persistent) engine
     // process always picks up the REFRESHED token rather than its stale spawn-time env.
-    try { await writeFile(join(this.binDir, '.runtime-token'), this.token, { mode: 0o600 }) } catch { /* shim falls back to the env token */ }
+    if (allowUnsandboxedByoa()) {
+      try { await writeFile(join(this.binDir, '.runtime-token'), this.token, { mode: 0o600 }) } catch { /* shim falls back to the env token */ }
+    }
     return this.token
+  }
+
+  /** Execute a model-requested Cumora CLI command while the runtime JWT remains
+   * daemon-owned. The sandbox sees argv and the response, never the credential. */
+  private async invokeRuntimeCli(argv: string[], lifecycleSignal: AbortSignal): Promise<RuntimeCliBrokerResult> {
+    const requestAbort = new AbortController()
+    const timeout = setTimeout(() => requestAbort.abort(), HTTP_TIMEOUT_MS)
+    const onLifecycleAbort = () => requestAbort.abort()
+    if (lifecycleSignal.aborted) requestAbort.abort()
+    else lifecycleSignal.addEventListener('abort', onLifecycleAbort, { once: true })
+    try {
+      const token = await this.ensureToken(requestAbort.signal)
+      if (requestAbort.signal.aborted) return { exitCode: 70, error: 'runtime IPC request cancelled' }
+      const response = await fetch(`${this.cfg.serverUrl}/runtime/cli`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ argv }),
+        signal: requestAbort.signal,
+      })
+      if (!response.ok) {
+        const body = await response.text().catch(() => '')
+        return { exitCode: 70, error: `HTTP ${response.status} ${body.slice(0, 200)}`.trim() }
+      }
+      const data = await response.json() as { text?: unknown; exitCode?: unknown }
+      return { text: typeof data.text === 'string' ? data.text : '', exitCode: typeof data.exitCode === 'number' ? data.exitCode : 0 }
+    } catch (error) {
+      return { exitCode: 70, error: error instanceof Error ? error.message : String(error) }
+    } finally {
+      clearTimeout(timeout)
+      lifecycleSignal.removeEventListener('abort', onLifecycleAbort)
+    }
   }
 
   /** Env handed to the engine subprocess: the `cumora` shim on PATH, wired to
@@ -1257,14 +1313,22 @@ class AgentRunner {
   }
 
   private engineEnv(): NodeJS.ProcessEnv {
+    if (this.projectFilesMode) {
+      return {
+        ...process.env,
+        PATH: prependAgentBinToPath(this.binDir),
+        CUMORA_AGENT_RUNTIME_URL: `${this.cfg.serverUrl}/runtime`,
+        CUMORA_AGENT_RUNTIME_TOKEN: this.token,
+        CUMORA_AGENT_RUNTIME_TOKEN_FILE: join(this.binDir, '.runtime-token'),
+        CUMORA_AGENT_ID: this.agent.id,
+        [EXTERNAL_TASK_SANDBOX_ENV]: '1',
+      }
+    }
     return {
       ...process.env,
-      PATH: prependAgentBinToPath(this.binDir),
-      CUMORA_AGENT_RUNTIME_URL: `${this.cfg.serverUrl}/runtime`,
-      CUMORA_AGENT_RUNTIME_TOKEN: this.token,
-      // A long-lived engine reads the FRESH token from this file (the env token
-      // above goes stale on refresh); the shim prefers the file, falls back to env.
-      CUMORA_AGENT_RUNTIME_TOKEN_FILE: join(this.binDir, '.runtime-token'),
+      PATH: engineProcessPath(this.binDir),
+      CUMORA_AGENT_IPC_DIR: this.ipcDir,
+      CUMORA_AGENT_MCP_SHIM: join(this.trustedCliDir, 'cumora-mcp'),
       CUMORA_AGENT_ID: this.agent.id,
     }
   }
@@ -1676,6 +1740,12 @@ class AgentRunner {
    *  agenda turns; the per-turn deltas (chatDelta / agendaDelta) carry only the
    *  dynamic bits. No game-specific rules — the engine coordinates in-turn via the
    *  shared glance-yield protocol, exactly like the cloud pod-agent. */
+  private promptSurface(): ActionSurface {
+    // Project tasks use the legacy command syntax inside Cumora's stronger OS
+    // boundary; ordinary secure BYOA turns use the fixed MCP bridge.
+    return actionSurfaceFor(allowUnsandboxedByoa() || this.projectFilesMode)
+  }
+
   private standingPrompt(): string {
     // RESTORED to the 5/28T22:17Z baseline SHAPE: one minimal prompt of essential
     // mechanics, with GLANCE_YIELD_RULES and a few core sections — NOT a wall of
@@ -1686,7 +1756,7 @@ class AgentRunner {
     // surface via `cumora <cmd> --help` when it needs it.
     return (
       `You are a Cumora teammate — a first-class member of this team with your own voice. ` +
-      `You act on Cumora through the \`cumora\` CLI on your PATH.\n\n` +
+      actionSurfaceText(this.promptSurface()) +
       `Read the relevant thread and respond appropriately, in your own voice — like a real teammate. ` +
       `If a human addressed the whole team, you and every peer likely woke at the same instant, so ` +
       `coordinate via the protocol below — in short: post the real next item from what's ACTUALLY been posted, ` +
@@ -1694,10 +1764,8 @@ class AgentRunner {
       // The shared glance-and-yield protocol — verbatim via the const so BYOA
       // coordinates identically to the cloud pod-agent.
       GLANCE_YIELD_RULES + `\n\n` +
-      `Posting a message: For ANY message with backticks, code, $, quotes, or multiple lines, ` +
-      `write it to a file (e.g. \`notes/reply.md\`) and post with \`cumora reply <conversationId> --file notes/reply.md\` — ` +
-      `the shell mangles inline \`backtick\` / \`$(...)\` content. For short plain text, ` +
-      `\`cumora reply <conversationId> 'text'\` (SINGLE quotes) is fine. When you're answering a ` +
+      postingMechanicsText(this.promptSurface()) +
+      `When you're answering a ` +
       `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
       `To address a teammate, @<their-id> (the short id in \`cumora messages\` / \`cumora participants\`), ` +
       `NOT their display name.\n\n` +
@@ -1714,7 +1782,7 @@ class AgentRunner {
       `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
       `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
       `"still need X?") and schedule your own check-back: ` +
-      `\`cumora calendar create '<chase>' --at <iso> --assignee ${this.agent.id} --prompt '<what future-you does>'\`. ` +
+      calendarExampleText(this.promptSurface(), this.agent.id) +
       `Stop only when the work is truly done or it's someone else's move.\n\n` +
       `Privacy: stay inside your home directory. Never read or expose files outside it — this machine ` +
       `holds the operator's private files.`
@@ -2465,6 +2533,13 @@ function installTimestampedLogging(): void {
 
 async function doRun(serverOverride?: string): Promise<void> {
   installTimestampedLogging()
+  if (allowUnsandboxedByoa()) {
+    console.warn('[computer] SECURITY WARNING: CUMORA_BYOA_ALLOW_UNSANDBOXED=1 — local model engines may read host files, inherit credentials, and use the network')
+  } else {
+    for (const name of ['CUMORA_CLAUDE_ARGS', 'CUMORA_CODEX_ARGS', 'CUMORA_GROK_ARGS', 'CUMORA_CURSOR_ARGS', 'CUMORA_TRIAGE_ARGS']) {
+      if (process.env[name]) console.warn(`[computer] ignoring ${name}: custom engine argv requires CUMORA_BYOA_ALLOW_UNSANDBOXED=1`)
+    }
+  }
   // Global safety net: a long-running daemon hosting every one of the user's
   // agents must NOT die because one async path threw — a transient 502 from a
   // server pod rolling, a network blip, a malformed event. Node ≥15 turns an

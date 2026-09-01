@@ -24,9 +24,10 @@ import { spawnTaskProcess as spawn } from './task-sandbox.js'
 import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, delimiter as PATH_DELIMITER } from 'node:path'
+import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
+import { isCliVersionAtLeast, probeLocalEngineVersion } from './cli-version.js'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -93,10 +94,109 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
+type CodexSpawn = ReturnType<typeof resolveSpawn> & { argsPrefix: string[] }
+
+/** Preserve structured Codex `-c key=<toml>` arguments on Windows. npm's
+ * codex.cmd forwards through cmd.exe, which strips the nested quotes. Invoke
+ * the package entry point with Node directly when the standard layout exists. */
+function resolveCodexSpawn(): CodexSpawn {
+  const fallback = resolveSpawn('codex')
+  if (!IS_WIN || !fallback.shell) return { ...fallback, argsPrefix: [] }
+  const shim = fallback.command.startsWith('"') && fallback.command.endsWith('"')
+    ? fallback.command.slice(1, -1)
+    : fallback.command
+  if (!/\.cmd$/i.test(shim)) return { ...fallback, argsPrefix: [] }
+  const shimDir = dirname(shim)
+  const script = join(shimDir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+  if (!existsSync(script)) return { ...fallback, argsPrefix: [] }
+  const candidates = [
+    join(shimDir, 'node.exe'),
+    ...(process.env.PATH ?? '').split(PATH_DELIMITER).filter(Boolean).map((dir) => join(dir, 'node.exe')),
+  ]
+  const node = candidates.find((candidate) => existsSync(candidate))
+    ?? (/^node(?:\.exe)?$/i.test(basename(process.execPath)) ? process.execPath : null)
+  return node
+    ? { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
+    : { ...fallback, argsPrefix: [] }
+}
+
 export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor'
 
 /** The pairable engine ids, in the daemon's default detection order. */
 export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor']
+
+export const SANDBOXED_ENGINE_IDS: readonly EngineId[] = ['claude', 'codex']
+export const ALLOW_UNSANDBOXED_BYOA_ENV = 'CUMORA_BYOA_ALLOW_UNSANDBOXED'
+export const EXTERNAL_TASK_SANDBOX_ENV = 'CUMORA_PROJECT_TASK_SANDBOX'
+export const SECURE_ENGINE_MIN_VERSIONS: Readonly<Partial<Record<EngineId, string>>> = {
+  claude: '2.1.248',
+  codex: '0.138.0',
+}
+
+export function allowUnsandboxedByoa(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[ALLOW_UNSANDBOXED_BYOA_ENV] === '1'
+}
+
+function externallySandboxed(env: NodeJS.ProcessEnv): boolean {
+  return env[EXTERNAL_TASK_SANDBOX_ENV] === '1'
+}
+
+export function runnableEngineIds(
+  installed: readonly EngineId[],
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): EngineId[] {
+  if (allowUnsandboxedByoa(env)) return [...installed]
+  const safe = new Set(SANDBOXED_ENGINE_IDS)
+  return installed.filter((id) => safe.has(id) && !(platform === 'win32' && id === 'claude'))
+}
+
+export interface RunnableEngineEvaluation {
+  runnable: EngineId[]
+  blocked: Array<{ id: EngineId; reason: string }>
+}
+
+export function secureEngineCapabilityReason(
+  id: EngineId,
+  version: string | null,
+  platform: NodeJS.Platform,
+  linuxSandboxDeps: { bwrap: boolean; socat: boolean } = { bwrap: true, socat: true },
+): string | null {
+  const minimum = SECURE_ENGINE_MIN_VERSIONS[id]
+  if (!minimum || !isCliVersionAtLeast(version, minimum)) {
+    return version
+      ? `version ${version} is older than the secure minimum ${minimum ?? 'unknown'}`
+      : `could not verify the installed version (secure minimum ${minimum ?? 'unknown'})`
+  }
+  if (id === 'claude' && platform === 'linux' && (!linuxSandboxDeps.bwrap || !linuxSandboxDeps.socat)) {
+    const missing = [!linuxSandboxDeps.bwrap && 'bubblewrap (bwrap)', !linuxSandboxDeps.socat && 'socat'].filter(Boolean).join(', ')
+    return `missing sandbox dependency: ${missing}`
+  }
+  return null
+}
+
+export async function evaluateRunnableEngines(
+  installed: readonly EngineId[],
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Promise<RunnableEngineEvaluation> {
+  const candidates = runnableEngineIds(installed, env, platform)
+  if (allowUnsandboxedByoa(env)) return { runnable: candidates, blocked: [] }
+  const linuxSandboxDeps = platform === 'linux'
+    ? { bwrap: await binOnPath('bwrap'), socat: await binOnPath('socat') }
+    : { bwrap: true, socat: true }
+  const runnable: EngineId[] = []
+  const blocked: RunnableEngineEvaluation['blocked'] = installed
+    .filter((id) => !candidates.includes(id))
+    .map((id) => ({ id, reason: 'no verified fail-closed sandbox for this engine' }))
+  for (const id of candidates) {
+    const version = await probeLocalEngineVersion(id, ADAPTERS[id].bin)
+    const reason = secureEngineCapabilityReason(id, version, platform, linuxSandboxDeps)
+    if (reason) blocked.push({ id, reason })
+    else runnable.push(id)
+  }
+  return { runnable, blocked }
+}
 
 export interface EnginePersona {
   id: string
@@ -619,6 +719,11 @@ function extraArgs(envVar: string): string[] {
   return raw ? raw.split(/\s+/).filter(Boolean) : []
 }
 
+/** Opaque argv overrides cannot be proven to preserve the host boundary. */
+function unsafeEngineArgs(envVar: string): string[] {
+  return allowUnsandboxedByoa() ? extraArgs(envVar) : []
+}
+
 const PERSONA_HEADER = (
   p: EnginePersona,
   opts: { personaFile?: string; skillsDir?: string } = {},
@@ -878,6 +983,71 @@ class ClaudeSession implements EngineSession {
   }
 }
 
+const TOOL_ENV_ALLOWLIST = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TMP', 'TEMP',
+  'LANG', 'LANGUAGE', 'TERM', 'COLORTERM', 'NO_COLOR',
+  'CUMORA_AGENT_IPC_DIR', 'CUMORA_AGENT_ID',
+  'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'WINDIR',
+])
+
+function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string {
+  const deniedEnv = Object.keys(env)
+    .filter((name) => !TOOL_ENV_ALLOWLIST.has(name.toUpperCase()) && !name.toUpperCase().startsWith('LC_'))
+    .sort()
+    .map((name) => ({ name, mode: 'deny' }))
+  const denyRead = process.platform === 'darwin'
+    ? ['~/', '/Users', '/Volumes']
+    : ['~/', '/home', '/root', '/mnt', '/media', '/run', '/proc', '/sys', '/srv', '/var/lib', '/var/log']
+  const pathDirs = (env.PATH ?? '').split(PATH_DELIMITER).filter(Boolean)
+  pathDirs.push(dirname(process.execPath))
+  return JSON.stringify({
+    permissions: {
+      defaultMode: 'dontAsk',
+      allow: ['Read(/**)', 'Edit(/**)', 'mcp__cumora__cli'],
+      deny: ['Read(/bin/**)', 'Edit(/bin/**)', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch'],
+    },
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      autoAllowBashIfSandboxed: true,
+      filesystem: { denyRead, allowRead: [...new Set([agentHome, ...pathDirs])] },
+      network: { allowedDomains: [], strictAllowlist: true },
+      credentials: { envVars: deniedEnv },
+    },
+  })
+}
+
+function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
+  const mcpShim = env.CUMORA_AGENT_MCP_SHIM
+  if (!mcpShim) throw new Error('secure Cumora MCP bridge is not configured')
+  return JSON.stringify({
+    mcpServers: {
+      cumora: {
+        command: process.execPath,
+        args: [mcpShim],
+        env: { CUMORA_AGENT_IPC_DIR: env.CUMORA_AGENT_IPC_DIR ?? '' },
+      },
+    },
+  })
+}
+
+export function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv): string[] {
+  return [
+    '--restricted',
+    '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Write,Edit,Glob,Grep,mcp__cumora__cli',
+    '--disallowedTools', 'Bash,PowerShell,WebFetch,WebSearch',
+    '--settings', claudeSecureSettings(agentHome, env),
+    '--mcp-config', claudeSecureMcpConfig(env),
+    '--strict-mcp-config',
+  ]
+}
+
+function useExternalTaskBoundary(env: NodeJS.ProcessEnv): boolean {
+  return !allowUnsandboxedByoa() && externallySandboxed(env)
+}
+
 class ClaudeAdapter implements EngineAdapter {
   readonly id = 'claude' as const
   readonly bin = 'claude'
@@ -891,7 +1061,7 @@ class ClaudeAdapter implements EngineAdapter {
     // --output-format json wraps the reply in a result envelope that ALSO carries
     // token usage (incl. cache_read/cache_creation) → we unwrap `.result` as the
     // text and pass `.usage` up for the triage cost ledger.
-    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    const flags = unsafeEngineArgs('CUMORA_TRIAGE_ARGS')
     const model = ['--model', args.model || 'haiku']
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const usingJson = flags.length === 0
@@ -901,7 +1071,9 @@ class ClaudeAdapter implements EngineAdapter {
     // before (unchanged).
     const base = flags.length
       ? [...flags, '-p']
-      : ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
+      : allowUnsandboxedByoa() || useExternalTaskBoundary(args.env)
+        ? ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
+        : ['-p', ...model, '--output-format', 'json', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const res = await spawnCapture(command, argv, {
       cwd: args.cwd,
@@ -930,7 +1102,9 @@ class ClaudeAdapter implements EngineAdapter {
     // and that tier is authed/has quota, with NO tools/MCP/persona.
     const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
+    const base = allowUnsandboxedByoa()
+      ? ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
+      : ['-p', ...model, '--output-format', 'text', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
       cwd: args.cwd,
@@ -945,7 +1119,7 @@ class ClaudeAdapter implements EngineAdapter {
     // Skipped when a CUMORA_CLAUDE_ARGS override is set — startSession() returns
     // null then, so the wake collapses to run() / one-shot exec, which probe()
     // already covers. The honest signal here is just "redundant".
-    if (extraArgs('CUMORA_CLAUDE_ARGS').length) {
+    if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) {
       return { ok: true, detail: '', skipped: true }
     }
     // The realistic break on the persistent-session path is `--append-system-prompt-file`
@@ -959,10 +1133,9 @@ class ClaudeAdapter implements EngineAdapter {
     try { await writeFile(promptFile, '', 'utf8') }
     catch (err) { return { ok: false, detail: `could not write standing-prompt probe file: ${err instanceof Error ? err.message : String(err)}` } }
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = [
-      '-p', '--output-format', 'text', '--append-system-prompt-file', promptFile,
-      '--dangerously-skip-permissions',
-    ]
+    const base = allowUnsandboxedByoa()
+      ? ['-p', '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
+      : ['-p', '--output-format', 'text', '--append-system-prompt-file', promptFile, '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     const r = await spawnCapture(command, argv, {
       cwd: args.cwd,
@@ -985,11 +1158,12 @@ class ClaudeAdapter implements EngineAdapter {
     // start()/restart (including the restart configMatches() triggers when
     // the operator edits the agent's persona in Cumora).
     await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona), 'utf8')
-    // settings.json lets bash (hence the cumora shim) run without prompts in
-    // this isolated home. Only written if absent so the user can customize.
-    const settings = join(home, '.claude', 'settings.json')
-    if (!(await exists(settings))) {
-      await writeFile(settings, JSON.stringify({ permissions: { allow: ['Bash'] } }, null, 2), 'utf8')
+    // Legacy settings exist only in explicitly unsandboxed compatibility mode.
+    if (allowUnsandboxedByoa()) {
+      const settings = join(home, '.claude', 'settings.json')
+      if (!(await exists(settings))) {
+        await writeFile(settings, JSON.stringify({ permissions: { allow: ['Bash'] } }, null, 2), 'utf8')
+      }
     }
   }
 
@@ -998,7 +1172,7 @@ class ClaudeAdapter implements EngineAdapter {
     // events the daemon can log. --dangerously-skip-permissions: the home is
     // isolated and user-owned, so non-interactive tool use is intended.
     // Big-brain model → --model; small-brain → ANTHROPIC_SMALL_FAST_MODEL env.
-    const flags = extraArgs('CUMORA_CLAUDE_ARGS')
+    const flags = unsafeEngineArgs('CUMORA_CLAUDE_ARGS')
     const model = args.model ? ['--model', args.model] : []
     // Continuous context across wakes: resume the agent's prior session so it
     // remembers the running task (its place in a counting relay, what it already
@@ -1009,7 +1183,9 @@ class ClaudeAdapter implements EngineAdapter {
     // unchanged (prompt in argv).
     const base = flags.length
       ? [...flags, ...resume, '-p']
-      : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
+      : allowUnsandboxedByoa() || useExternalTaskBoundary(args.env)
+        ? ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
+        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, args.env)]
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     // BYOA turns are short reactive cycles (read inbox, maybe reply). Extended
     // thinking just adds latency + cost here, and in a group @all it makes the
@@ -1019,6 +1195,9 @@ class ClaudeAdapter implements EngineAdapter {
     const env: NodeJS.ProcessEnv = {
       ...args.env,
       MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa() || useExternalTaskBoundary(args.env)
+        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+        : '1',
     }
     if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
@@ -1027,7 +1206,7 @@ class ClaudeAdapter implements EngineAdapter {
   startSession(args: EngineSessionArgs): EngineSession | null {
     // Respect a user's custom flag override (CUMORA_CLAUDE_ARGS) by NOT using the
     // persistent path — those flags are tuned for the one-shot run; fall back to run().
-    if (extraArgs('CUMORA_CLAUDE_ARGS').length) return null
+    if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length || useExternalTaskBoundary(args.env)) return null
     const model = args.model ? ['--model', args.model] : []
     // --resume only on the FIRST spawn / after a restart, to continue a prior
     // session; inside a live process the session continues on its own.
@@ -1042,11 +1221,14 @@ class ClaudeAdapter implements EngineAdapter {
       try { writeFileSync(file, args.standingPrompt, { mode: 0o600 }); sys = ['--append-system-prompt-file', file]; carriesStanding = true }
       catch { /* couldn't write → leave it; the daemon inlines the standing prompt instead */ }
     }
-    const argv = [
-      '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      ...resume, ...sys, ...model, '--dangerously-skip-permissions',
-    ]
-    const env: NodeJS.ProcessEnv = { ...args.env, MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0' }
+    const argv = allowUnsandboxedByoa()
+      ? ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...resume, ...sys, ...model, '--dangerously-skip-permissions']
+      : ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, args.env)]
+    const env: NodeJS.ProcessEnv = {
+      ...args.env,
+      MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa() ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB : '1',
+    }
     if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding)
   }
@@ -1071,6 +1253,82 @@ type CodexRpcMsg = {
   result?: { thread?: { id?: unknown }; turn?: { id?: unknown }; turnId?: unknown }
   error?: { message?: unknown }
   params?: Record<string, unknown>
+}
+
+const CODEX_SECURE_CONFIG_ARGS = [
+  '--strict-config',
+  '-c', 'default_permissions="cumora"',
+  '-c', 'permissions.cumora.network.enabled=false',
+  '-c', 'shell_environment_policy.inherit="none"',
+  '-c', 'shell_environment_policy.ignore_default_excludes=false',
+]
+
+function codexThreadSecurityParams(): Record<string, unknown> {
+  return allowUnsandboxedByoa()
+    ? { approvalPolicy: 'never', sandbox: 'danger-full-access' }
+    : { approvalPolicy: 'never', sandbox: 'workspace-write' }
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value)
+}
+
+function codexToolEnvironmentArgs(args: { home: string; env: NodeJS.ProcessEnv }): string[] {
+  const entries: string[] = []
+  const add = (name: string, value: string | undefined) => {
+    if (value !== undefined) entries.push(`${name}=${tomlString(value)}`)
+  }
+  add('PATH', args.env.PATH)
+  add('HOME', args.home)
+  add('USER', args.env.USER)
+  add('LOGNAME', args.env.LOGNAME)
+  add('SHELL', args.env.SHELL)
+  add('LANG', args.env.LANG)
+  add('TERM', args.env.TERM)
+  add('CUMORA_AGENT_IPC_DIR', args.env.CUMORA_AGENT_IPC_DIR)
+  add('CUMORA_AGENT_ID', args.env.CUMORA_AGENT_ID)
+  return ['-c', `shell_environment_policy.set={${entries.join(',')}}`]
+}
+
+const CODEX_CONFIG_REJECTED_RE = /Error loading config\.toml|unknown configuration field|expected struct \w+PermissionsToml/i
+let codexProfileRejected = false
+
+export function codexProfileIsRejected(): boolean { return codexProfileRejected }
+export function resetCodexProfileRejection(): void { codexProfileRejected = false }
+
+export function noteCodexConfigRejection(err: string | undefined, onLog?: (line: string) => void): boolean {
+  if (!err || codexProfileRejected || !CODEX_CONFIG_REJECTED_RE.test(err)) return false
+  codexProfileRejected = true
+  const hint = `[codex] the installed codex rejected the sandbox profile Cumora passes via -c. Every turn on this machine fails until this is resolved. Set ${ALLOW_UNSANDBOXED_BYOA_ENV}=1 on the daemon to use compatibility mode, or report the codex version. Codex said: ${err.slice(0, 300)}`
+  onLog?.(hint)
+  console.warn(hint)
+  return true
+}
+
+export function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
+  const workspaceAccess = readOnly ? 'read' : 'write'
+  const filesystem = `permissions.cumora.filesystem={":minimal"="read",":workspace_roots"={"."="${workspaceAccess}"}}`
+  const secureArgs = [
+    ...CODEX_SECURE_CONFIG_ARGS,
+    '-c', filesystem,
+    '-c', 'web_search="disabled"',
+    '-c', 'features.hooks=false',
+    '-c', 'features.apps=false',
+    '-c', 'features.remote_plugin=false',
+    '-c', 'features.multi_agent=false',
+    '-c', 'features.shell_snapshot=false',
+    // Inline table form is required under --strict-config. The dotted dynamic
+    // key is rejected by Codex 0.150/0.151 before it reads the prompt.
+    '-c', `projects={${tomlString(args.home)}={trust_level="untrusted"}}`,
+    ...codexToolEnvironmentArgs(args),
+  ]
+  if (!readOnly) {
+    const mcpShim = args.env.CUMORA_AGENT_MCP_SHIM
+    const ipcDir = args.env.CUMORA_AGENT_IPC_DIR
+    if (!mcpShim || !ipcDir) throw new Error('secure Cumora MCP bridge is not configured')
+    secureArgs.push('-c', `mcp_servers.cumora={command=${tomlString(process.execPath)},args=[${tomlString(mcpShim)}],env={CUMORA_AGENT_IPC_DIR=${tomlString(ipcDir)}},required=true,enabled_tools=["cli"],default_tools_approval_mode="approve"}`)
+  }
+  return [...secureArgs, '-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules']
 }
 
 /** A persistent Codex session over the app-server JSON-RPC protocol
@@ -1120,7 +1378,7 @@ class CodexSession implements EngineSession {
     this.carriesStandingPrompt = !!opts.standingPrompt
     // experimentalRawEvents → Codex emits payload-free `rawResponseItem/*` pings we
     // use as a liveness signal; we suppress them from the log below.
-    const params: Record<string, unknown> = { cwd: home, approvalPolicy: 'never', sandbox: 'danger-full-access', experimentalRawEvents: true }
+    const params: Record<string, unknown> = { cwd: home, ...codexThreadSecurityParams(), experimentalRawEvents: true }
     if (opts.standingPrompt) params.developerInstructions = opts.standingPrompt
     if (opts.model) params.model = opts.model
     this.baseThreadParams = params
@@ -1360,12 +1618,15 @@ class CodexAdapter implements EngineAdapter {
     // support tier — so that's the local cerebellum here. Cheap model, no big
     // brain, no cloud. Override with CUMORA_TRIAGE_MODEL if your codex auth has
     // a different small model.
-    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    const flags = allowUnsandboxedByoa() ? extraArgs('CUMORA_TRIAGE_ARGS') : []
     const model = ['--model', args.model || 'gpt-5.4-mini']
-    const { command, shell } = resolveSpawn(this.bin)
-    const argv = flags.length
+    const { command, shell, argsPrefix } = resolveCodexSpawn()
+    const codexArgs = flags.length
       ? ['exec', ...flags, '-']
-      : ['exec', ...model, '--skip-git-repo-check', '-']
+      : allowUnsandboxedByoa() || useExternalTaskBoundary(args.env)
+        ? ['exec', ...model, '--skip-git-repo-check', '-']
+        : [...codexSecureExecArgs({ home: args.cwd, env: args.env }, true), ...model, '--skip-git-repo-check', '-']
+    const argv = [...argsPrefix, ...codexArgs]
     return spawnCapture(command, argv, {
       cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
       stdinText: args.prompt,
@@ -1377,8 +1638,11 @@ class CodexAdapter implements EngineAdapter {
     // its default model. `exec` non-interactive, no bypass/sandbox flags needed
     // for a tool-free one-token reply.
     const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
-    const { command, shell } = resolveSpawn(this.bin)
-    const argv = ['exec', ...model, '--skip-git-repo-check', '-']
+    const { command, shell, argsPrefix } = resolveCodexSpawn()
+    const codexArgs = allowUnsandboxedByoa()
+      ? ['exec', ...model, '--skip-git-repo-check', '-']
+      : [...codexSecureExecArgs({ home: args.cwd, env: args.env }, true), ...model, '--skip-git-repo-check', '-']
+    const argv = [...argsPrefix, ...codexArgs]
     return spawnCapture(command, argv, {
       cwd: args.cwd, env: args.env, signal: args.signal, shell, stdinText: DOCTOR_PROMPT,
     })
@@ -1389,7 +1653,8 @@ class CodexAdapter implements EngineAdapter {
     // any of these is true, the wake path collapses to `codex exec ...` which
     // probe() already covers — running the JSON-RPC probe would just add a false
     // signal. Mark skipped and let doctor hide the line.
-    if (extraArgs('CUMORA_CODEX_ARGS').length
+    if (!allowUnsandboxedByoa()
+        || unsafeEngineArgs('CUMORA_CODEX_ARGS').length
         || process.env.CUMORA_CODEX_NO_APP_SERVER === '1'
         || IS_WIN) {
       return Promise.resolve({ ok: true, detail: '', skipped: true })
@@ -1404,7 +1669,7 @@ class CodexAdapter implements EngineAdapter {
     catch (err) {
       return Promise.resolve({ ok: false, detail: `git init failed for app-server cwd: ${err instanceof Error ? err.message : String(err)}` })
     }
-    const { command, shell } = resolveSpawn(this.bin)
+    const { command, shell, argsPrefix } = resolveCodexSpawn()
     return new Promise<EngineWakeProbeResult>((resolve) => {
       let settled = false
       const finish = (r: EngineWakeProbeResult) => {
@@ -1414,7 +1679,7 @@ class CodexAdapter implements EngineAdapter {
         try { child.kill('SIGTERM') } catch { /* ignore */ }
         resolve(r)
       }
-      const child = spawn(command, ['app-server', '--listen', 'stdio://'], {
+      const child = spawn(command, [...argsPrefix, 'app-server', '--listen', 'stdio://'], {
         cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
       })
       const onAbort = () => finish({ ok: false, detail: 'aborted (timeout)' })
@@ -1456,7 +1721,7 @@ class CodexAdapter implements EngineAdapter {
             // params shape CodexSession uses — so a field-name break shows up.
             writeRpc({ jsonrpc: '2.0', method: 'initialized', params: {} })
             writeRpc({ jsonrpc: '2.0', id: threadId, method: 'thread/start',
-              params: { cwd: args.cwd, approvalPolicy: 'never', sandbox: 'danger-full-access', experimentalRawEvents: true } })
+              params: { cwd: args.cwd, ...codexThreadSecurityParams(), experimentalRawEvents: true } })
             continue
           }
           if (initialized && !threadAcked && msg.id === threadId && msg.result) {
@@ -1487,33 +1752,35 @@ class CodexAdapter implements EngineAdapter {
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
-    // `codex exec` is the non-interactive mode. The agent runs on the user's
-    // own paired machine and needs full access to run the cumora shim (network),
-    // clone repos, and write files — the Codex equivalent of Claude's
-    // --dangerously-skip-permissions is --dangerously-bypass-approvals-and-sandbox.
-    // --skip-git-repo-check lets it run in the agent home (not a git repo).
-    // Override the whole flag set via CUMORA_CODEX_ARGS if your version differs.
-    const flags = extraArgs('CUMORA_CODEX_ARGS')
+    const flags = unsafeEngineArgs('CUMORA_CODEX_ARGS')
     const base = flags.length
-      ? flags
-      : ['--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
+      ? ['exec', ...flags]
+      : allowUnsandboxedByoa() || useExternalTaskBoundary(args.env)
+        ? ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
+        : [...codexSecureExecArgs(args), '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
-    const { command, shell } = resolveSpawn(this.bin)
-    return spawnEngine(command, ['exec', ...model, ...base, '-'], args, { shell, stdinText: args.prompt })
+    const { command, shell, argsPrefix } = resolveCodexSpawn()
+    return spawnEngine(command, [...argsPrefix, ...base, ...model, '-'], args, { shell, stdinText: args.prompt })
+      .then((result) => {
+        noteCodexConfigRejection(result.error, args.onLog)
+        return result
+      })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
     // Escape hatches → fall back to one-shot `codex exec` (run()): a custom-args
     // override, an explicit opt-out, or Windows (JSON-RPC over a .cmd shell is
     // fragile; exec is the safe path there).
-    if (extraArgs('CUMORA_CODEX_ARGS').length) return null
+    if (!allowUnsandboxedByoa()) return null
+    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return null
     if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return null
     if (IS_WIN) return null
     try { ensureGitRepoForCodex(args.home) }
     catch (err) { args.onLog(`[codex] could not init git repo for app-server (${err instanceof Error ? err.message : String(err)}) — falling back to one-shot exec`); return null }
     // Standing prompt rides the thread's developerInstructions (see CodexSession),
     // approval/sandbox are set per-thread, so no global bypass flags are needed.
-    return new CodexSession(this.bin, ['app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    const { command, argsPrefix } = resolveCodexSpawn()
+    return new CodexSession(command, [...argsPrefix, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
 }
 
