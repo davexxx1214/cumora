@@ -515,9 +515,9 @@ export async function updateWorkItem(companyId: string, userId: string, conversa
     const sets: string[] = []
     const values: unknown[] = []
     const changes: Record<string, { from: unknown; to: unknown }> = {}
-    const put = (column: string, field: keyof ProjectWorkItemRecord, next: unknown, cast = '') => {
+    const put = (column: string, field: keyof ProjectWorkItemRecord, next: unknown, cast = '', sqlValue = next) => {
       if (!different(current[field], next)) return
-      values.push(next); sets.push(`${column}=$${values.length}${cast}`)
+      values.push(sqlValue); sets.push(`${column}=$${values.length}${cast}`)
       changes[String(field)] = { from: current[field], to: next }
     }
     if (input.title !== undefined) {
@@ -530,7 +530,10 @@ export async function updateWorkItem(companyId: string, userId: string, conversa
       if (!oneOf(input.priority, WORK_ITEM_PRIORITIES)) workflowFail('INVALID_PRIORITY', 400, 'Invalid priority.')
       put('priority', 'priority', input.priority)
     }
-    if (input.labels !== undefined) put('labels', 'labels', cleanLabels(input.labels), '::jsonb')
+    if (input.labels !== undefined) {
+      const next = cleanLabels(input.labels)
+      put('labels', 'labels', next, '::jsonb', JSON.stringify(next))
+    }
     if (input.dueAt !== undefined) put('due_at', 'dueAt', cleanDate(input.dueAt))
     if (input.rank !== undefined) {
       if (typeof input.rank !== 'number' || !Number.isFinite(input.rank)) workflowFail('INVALID_RANK', 400, 'rank must be a finite number.')

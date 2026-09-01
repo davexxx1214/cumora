@@ -94,12 +94,14 @@ test('[integration] only admins enable a project workflow, but ordinary group me
   assert.equal(story.assigneeId, 'peer')
   const updated = await request('peer', `/conversations/g-flow/items/${story.id}`, 'PATCH', {
     expectedVersion: story.version, status: 'in_progress', priority: 'high', title: 'First story edited',
+    labels: ['acceptance', 'workflow'],
   })
   assert.equal(updated.status, 200, await updated.clone().text())
-  const body = await updated.json() as { version: number; status: string; title: string }
+  const body = await updated.json() as { version: number; status: string; title: string; labels: string[] }
   assert.equal(body.version, story.version + 1)
   assert.equal(body.status, 'in_progress')
   assert.equal(body.title, 'First story edited')
+  assert.deepEqual(body.labels, ['acceptance', 'workflow'])
   assert.equal((await request('outsider', '/conversations/g-flow')).status, 404)
 })
 

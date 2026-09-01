@@ -115,12 +115,18 @@ export function ProjectWorkflowDialog({ conversation, onClose }: { conversation:
   async function act(work: () => Promise<void>, reloadAfter = true) {
     if (busy) return
     setBusy(true); setError('')
+    let failure = ''
     try { await work() }
     catch (cause) {
-      if (cause instanceof ApiError && cause.status === 409) setError(t('projectWorkflow.conflict'))
-      else setError(cause instanceof Error ? cause.message : String(cause))
+      failure = cause instanceof ApiError && cause.status === 409
+        ? t('projectWorkflow.conflict')
+        : cause instanceof Error ? cause.message : String(cause)
     } finally {
-      if (isCurrent()) { setBusy(false); if (reloadAfter) await reload() }
+      if (isCurrent()) {
+        setBusy(false)
+        if (reloadAfter) await reload()
+        if (failure && isCurrent()) setError(failure)
+      }
     }
   }
 
