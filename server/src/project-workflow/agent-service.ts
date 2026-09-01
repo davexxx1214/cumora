@@ -140,19 +140,21 @@ async function findAgentItem(db: Queryable, agentId: string, itemRef: string, lo
   return rows[0]
 }
 
-async function requireActiveCommand(db: Queryable, item: AgentItemRow, agentId: string): Promise<string> {
+async function requireActiveCommand(db: Queryable, item: AgentItemRow, agentId: string, scope?: AgentWorkflowScope): Promise<string> {
   const { rows } = await db.query<{ id: string }>(
     `SELECT cmd.id FROM project_work_item_agent_commands cmd
        JOIN conversations c ON c.id=cmd.conversation_id AND c.project_id=cmd.project_id
       WHERE cmd.item_id=$1 AND cmd.agent_id=$2 AND cmd.project_id=$3
         AND cmd.conversation_id=$4 AND cmd.status IN ('pending','running')
+        AND ($5::text IS NULL OR cmd.run_id IS NULL OR cmd.run_id=$5)
         AND c.members @> to_jsonb(ARRAY[$2::text])
       ORDER BY cmd.created_at DESC LIMIT 1`,
-    [item.id, agentId, item.project_id, item.conversation_id],
+    [item.id, agentId, item.project_id, item.conversation_id, scope?.runId ?? null],
   )
   if (!rows[0]) workflowFail('EXECUTION_REQUIRED', 403, 'A human must explicitly command you to execute this item before you can change it.')
-  await db.query(`UPDATE project_work_item_agent_commands SET status='running',updated_at=NOW()
-    WHERE id=$1 AND status='pending'`, [rows[0].id])
+  await db.query(`UPDATE project_work_item_agent_commands
+    SET status='running',run_id=COALESCE(run_id,$2),updated_at=NOW()
+    WHERE id=$1 AND status IN ('pending','running')`, [rows[0].id, scope?.runId ?? null])
   return rows[0].id
 }
 
@@ -208,7 +210,7 @@ export async function addAgentWorkflowComment(agentId: string, itemRef: string, 
   try {
     await client.query('BEGIN')
     const item = await findAgentItem(client, agentId, itemRef, true, scope)
-    await requireActiveCommand(client, item, agentId)
+    await requireActiveCommand(client, item, agentId, scope)
     const id = `wic-${randomUUID()}`
     await client.query(`INSERT INTO project_work_item_comments(id,item_id,author_id,author_kind,body,mentions)
       VALUES($1,$2,$3,'agent',$4,'[]'::jsonb)`, [id, item.id, agentId, body])
@@ -229,7 +231,7 @@ export async function updateAgentWorkflowStatus(agentId: string, itemRef: string
   try {
     await client.query('BEGIN')
     const item = await findAgentItem(client, agentId, itemRef, true, scope)
-    await requireActiveCommand(client, item, agentId)
+    await requireActiveCommand(client, item, agentId, scope)
     if (item.status !== status) {
       await client.query(`UPDATE project_work_items SET status=$2,resolution=NULL,version=version+1,updated_at=NOW() WHERE id=$1`, [item.id, status])
       await addAgentEvent(client, item, agentId, 'item.status_changed', { status: { from: item.status, to: status } })
@@ -248,7 +250,7 @@ export async function linkAgentWorkflowCommit(agentId: string, itemRef: string, 
   try {
     await client.query('BEGIN')
     const item = await findAgentItem(client, agentId, itemRef, true, scope)
-    await requireActiveCommand(client, item, agentId)
+    await requireActiveCommand(client, item, agentId, scope)
     const repo = await client.query<{ name: string }>(
       'SELECT name FROM project_git_repositories WHERE id=$1 AND project_id=$2', [repositoryId.trim(), item.project_id])
     if (!repo.rows[0]) workflowFail('NOT_FOUND', 404, 'Git repository not found in this item project.')

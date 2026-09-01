@@ -180,7 +180,6 @@ test('[integration] controlled Agent tools require explicit execution and keep c
   const command = await executed.json() as { id: string; messageId: string }
   await pool.query(`INSERT INTO agent_runs(id,agent_id,company_id,trigger,status,stage,input_message_ids,inbox_count)
     VALUES('run-workflow','agent','co-flow','{}','running','created',$1::jsonb,1)`, [JSON.stringify([command.messageId])])
-  assert.equal(await markAgentExecutionRunStarted('agent', 'co-flow', 'run-workflow', [command.messageId]), 1)
   const bindingRow = await pool.query<{ file_binding_version: string }>('SELECT file_binding_version::text FROM projects WHERE id=$1', ['p-flow'])
   const lease = await createProjectLease({ agentId: 'agent', companyId: 'co-flow', conversationId: 'g-flow',
     runId: 'run-workflow', bindingVersion: `p-flow:${bindingRow.rows[0].file_binding_version}` })
@@ -188,6 +187,9 @@ test('[integration] controlled Agent tools require explicit execution and keep c
   assert.equal(shown.value.projectId, 'p-flow')
   const progressing = await runProjectCli(lease.token, ['workflow', 'status', item.issueKey, 'in_progress']) as { value: { status: string } }
   assert.equal(progressing.value.status, 'in_progress')
+  const claimed = await pool.query<{ status: string; run_id: string }>(
+    'SELECT status,run_id FROM project_work_item_agent_commands WHERE id=$1', [command.id])
+  assert.deepEqual(claimed.rows[0], { status: 'running', run_id: 'run-workflow' })
   await assert.rejects(() => runProjectCli(lease.token, ['workflow', 'status', item.issueKey, 'done']), /Humans complete/i)
   const commented = await runProjectCli(lease.token, ['workflow', 'comment', item.issueKey, 'Implementation is ready.']) as { value: { issueKey: string } }
   assert.equal(commented.value.issueKey, item.issueKey)
