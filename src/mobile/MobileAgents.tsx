@@ -1,3 +1,4 @@
+import { AgentExecutionSettings } from '@/components/AgentExecutionSettings'
 import { useMemo, useState } from 'react'
 import { Avatar } from '@/components/Avatar'
 import { useMe, useCanManageWorkspace } from '@/stores/auth'
@@ -131,6 +132,7 @@ export function MobileAgents() {
                   </div>
                 </div>
               </div>
+              <AgentExecutionSettings agent={p} />
               {p.bio && (
                 <div className="text-[12px] text-ink-700 leading-[1.5] font-display italic mb-2.5">"{p.bio}"</div>
               )}

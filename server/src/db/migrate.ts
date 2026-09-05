@@ -1534,6 +1534,10 @@ ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine      TEXT;  -- 'managed
 -- work. For BYOA agents these pass through to the engine as --model (big) and,
 -- for Claude, ANTHROPIC_SMALL_FAST_MODEL (small).
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS fast_model  TEXT;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS reasoning_effort TEXT;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS execution_speed TEXT;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS execution_settings_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS execution_report JSONB;
 
 -- Persistent per-company pairing token. Replaces the old short-lived Redis
 -- pairing code so a historical "add a computer" command (--pair <token>)

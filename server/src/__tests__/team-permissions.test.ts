@@ -5,9 +5,10 @@ import { createElement, type ComponentType } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer, type ViteDevServer } from 'vite'
 import { en } from '../../../src/locales/en.js'
-import type { Conversation } from '../../../src/types.js'
+import type { Conversation, Participant } from '../../../src/types.js'
 
 let vite: ViteDevServer
+let AgentExecutionSettings: ComponentType<{ agent: Participant }>
 let AgentsView: ComponentType
 let MobileAgents: ComponentType
 let AgentEditor: ComponentType<{ agent: null; onClose: () => void }>
@@ -35,6 +36,7 @@ before(async () => {
   })
   ;({ AgentsView } = await vite.ssrLoadModule('/src/desktop/AgentsView.tsx'))
   ;({ MobileAgents } = await vite.ssrLoadModule('/src/mobile/MobileAgents.tsx'))
+  ;({ AgentExecutionSettings } = await vite.ssrLoadModule('/src/components/AgentExecutionSettings.tsx'))
   ;({ AgentEditor } = await vite.ssrLoadModule('/src/components/AgentEditor.tsx'))
   ;({ DissolveGroupDialog } = await vite.ssrLoadModule('/src/components/DissolveGroupDialog.tsx'))
   ;({ MobileChatInfo } = await vite.ssrLoadModule('/src/mobile/MobileChat.tsx'))
@@ -144,4 +146,17 @@ test('dissolved groups clear selection and caches and cannot return through a st
     api.getConversations = originalList
     api.getMessages = originalMessages
   }
+})
+
+
+test('execution display distinguishes saved settings, confirmed values, unknown tier and stale reports', () => {
+  const agent: Participant = { id: 'settings-agent', kind: 'agent', name: 'Settings', initial: 'S', avatarBg: '#abcdef', status: 'avail', engine: 'codex', model: 'configured-model', reasoningEffort: 'high', speed: 'fast', executionSettingsVersion: 3,
+    executionReport: { model: 'actual-model', reasoningEffort: 'low', speed: null, source: 'codex-header', observedAt: '2026-09-05T10:00:00Z', settingsVersion: 3, requested: { model: 'override-model', reasoningEffort: 'high', speed: 'fast' } } }
+  const html = renderToStaticMarkup(createElement(AgentExecutionSettings, { agent }))
+  for (const text of ['configured-model', 'actual-model', 'override-model', 'high', 'low', en['agent.executionUnknown']]) assert.ok(html.includes(text), text)
+  const stale = renderToStaticMarkup(createElement(AgentExecutionSettings, { agent: { ...agent, executionSettingsVersion: 4 } }))
+  assert.ok(stale.includes(en['agent.executionPending']))
+  assert.ok(!stale.includes('actual-model'))
+  const unsupported = renderToStaticMarkup(createElement(AgentExecutionSettings, { agent: { ...agent, engine: 'grok', executionReport: null } }))
+  assert.ok(unsupported.includes(en['agent.executionUnsupported']))
 })

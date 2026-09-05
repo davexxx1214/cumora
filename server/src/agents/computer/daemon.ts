@@ -17,6 +17,7 @@
  *
  * Standalone: only Node builtins + the DB-free SSE parser + engine.ts.
  */
+import type { ExecutionOptions, ExecutionObservation } from '../../../../shared/agent-execution.js'
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile, readFile, chmod, rm, stat, copyFile, truncate } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -314,7 +315,8 @@ interface DaemonConfig {
   deviceToken: string
 }
 
-interface AgentInfo {
+interface AgentInfo extends ExecutionOptions {
+  executionSettingsVersion?: number
   id: string
   name: string
   role: string | null
@@ -1251,6 +1253,9 @@ class AgentRunner {
       && this.agent.systemPrompt === agent.systemPrompt
       && this.agent.model === agent.model
       && this.agent.fastModel === agent.fastModel
+      && this.agent.reasoningEffort === agent.reasoningEffort
+      && this.agent.speed === agent.speed
+      && this.agent.executionSettingsVersion === agent.executionSettingsVersion
   }
 
   private async ensureToken(signal?: AbortSignal): Promise<string> {
@@ -1312,6 +1317,25 @@ class AgentRunner {
     return resolveEngineFastModel(this.agent.fastModel, process.env.CUMORA_ENGINE_MODEL)
   }
 
+  private settingsReports: Promise<unknown> = Promise.resolve()
+
+  private executionOptions(): ExecutionOptions & { onSettings: (value: ExecutionObservation) => void } {
+    // These controls are currently implemented by Codex; do not pretend other
+    // CLIs accept a flag with the same semantics.
+    const options: ExecutionOptions = this.adapter.id === 'codex'
+      ? { reasoningEffort: this.agent.reasoningEffort ?? null, speed: this.agent.speed ?? null } : {}
+    return { ...options, onSettings: value => {
+      const report = { ...value, settingsVersion: this.agent.executionSettingsVersion ?? 0,
+        requested: { model: this.engineModel(), reasoningEffort: options.reasoningEffort ?? null, speed: options.speed ?? null } }
+      // Preserve stream order: the later, fuller startup report must win.
+      this.settingsReports = this.settingsReports.then(() => api(this.cfg.serverUrl,
+        `/api/agents/${encodeURIComponent(this.agent.id)}/execution-report`, {
+          method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: JSON.stringify(report),
+          signal: AbortSignal.timeout(10_000),
+        })).catch(() => { console.warn(`[computer] ${this.agent.id} execution settings report not accepted`) })
+    } }
+  }
+
   private engineEnv(): NodeJS.ProcessEnv {
     if (this.projectFilesMode) {
       return {
@@ -1347,7 +1371,7 @@ class AgentRunner {
       home: this.home,
       env: this.engineEnv(),
       model: this.engineModel(),
-      fastModel: this.engineFastModel(),
+      fastModel: this.engineFastModel(), ...this.executionOptions(),
       resumeSessionId: this.sessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
@@ -1393,7 +1417,7 @@ class AgentRunner {
         home, prompt: projectTaskPrompt({ conversationId, projectId: lease.projectId, digest }),
         env: { ...this.engineEnv(), CUMORA_AGENT_RUNTIME_URL: `${localProjectServer()}/project-fs`, CUMORA_AGENT_RUNTIME_TOKEN: lease.token,
           CUMORA_AGENT_RUNTIME_TOKEN_FILE: undefined, CUMORA_PROJECT_ID: lease.projectId, CUMORA_PROJECT_PATH: lease.path, CUMORA_CONVERSATION_ID: conversationId },
-        model: this.engineModel(), fastModel: this.engineFastModel(), resumeSessionId: null,
+        model: this.engineModel(), fastModel: this.engineFastModel(), ...this.executionOptions(), resumeSessionId: null,
         onLog: line => this.logEngineLine(line), onHopUsage: r => this.onEngineHop(r, 'agent-turn'), signal: this.teardown.signal,
       }))
     } finally {
@@ -1509,7 +1533,7 @@ class AgentRunner {
         prompt: `${payload.instructions}\n\n${payload.input}`,
         env: this.engineEnv(),
         // Engine picks its own cheap default; CUMORA_TRIAGE_MODEL overrides it.
-        model: process.env.CUMORA_TRIAGE_MODEL,
+        model: process.env.CUMORA_TRIAGE_MODEL?.trim() || this.engineFastModel(),
         signal: controller.signal,
       }))
     } catch (err) {
@@ -1596,6 +1620,8 @@ class AgentRunner {
    *  is only a fallback when the stream does not name one. */
   private triageModel(): string {
     if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
+    const configured = this.engineFastModel()
+    if (configured) return configured
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
@@ -1915,7 +1941,7 @@ class AgentRunner {
         ? await session.send(prompt)
         : await this.isolatedEngine(this.home, () => this.adapter.run({
           home: this.home, prompt, env: this.engineEnv(),
-          model: this.engineModel(), fastModel: this.engineFastModel(),
+          model: this.engineModel(), fastModel: this.engineFastModel(), ...this.executionOptions(),
           resumeSessionId, onLog: (line) => this.logEngineLine(line),
           // Same trajectory hook as the persistent-session path so the
           // one-shot fallback (or codex `exec` path) also lands hops in the
@@ -2326,7 +2352,7 @@ class AgentRunner {
               prompt,
               env: this.engineEnv(),
               model: this.engineModel(),
-              fastModel: this.engineFastModel(),
+              fastModel: this.engineFastModel(), ...this.executionOptions(),
               resumeSessionId,
               onLog: (line) => this.logEngineLine(line),
               onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),

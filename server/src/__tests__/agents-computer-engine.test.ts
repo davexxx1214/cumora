@@ -10,6 +10,8 @@ import { delimiter, join } from 'node:path'
 import { after, afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { getAdapter, resolveSpawn, type EngineHopReport, type EngineRunResult } from '../agents/computer/engine.js'
+import { codexExecutionArgs, codexHeaderObserver, codexSessionObservation } from '../agents/computer/execution-settings.js'
+import type { ExecutionObservation } from '../../../shared/agent-execution.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
@@ -201,6 +203,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   const capture = join(binDir, 'capture.js')
   await writeFile(
     capture,
+    "process.stderr.write('OpenAI Codex v0.150.1\\nmodel: native-confirmed-model\\nreasoning effort: high\\nuser\\n')\n" +
     "let stdin = ''\n" +
     "process.stdin.setEncoding('utf8')\n" +
     "process.stdin.on('data', (chunk) => { stdin += chunk })\n" +
@@ -219,20 +222,27 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   const adapter = getAdapter('codex')
   const longPrompt = `line one with spaces & shell characters\n${'x'.repeat(12_000)}`
   const logs: string[] = []
+  const observations: ExecutionObservation[] = []
   const run = await adapter.run({
     home,
     prompt: longPrompt,
     env: { ...process.env },
     model: 'test-model',
     fastModel: null,
+    reasoningEffort: 'high',
+    speed: 'fast',
+    onSettings: value => observations.push(value),
     onLog: (line) => logs.push(line),
     signal: new AbortController().signal,
   })
   assert.equal(run.exitCode, 0)
+  assert.equal(run.model, 'native-confirmed-model')
+  assert.equal(observations.at(-1)?.reasoningEffort, 'high')
+  assert.equal(observations.at(-1)?.speed, null)
   const runCapture = JSON.parse(logs.at(-1) ?? '{}') as { argv?: string[]; stdin?: string }
   assert.deepEqual(runCapture.argv, [
     'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
-    '--model', 'test-model', '-',
+    '--model', 'test-model', '-c', 'model_reasoning_effort=high', '-c', 'service_tier=fast', '-',
   ])
   assert.equal(runCapture.stdin, longPrompt)
 
@@ -618,4 +628,62 @@ test('a Grok ACP turn still settles when no model is announced', { skip: IS_WIN 
   assert.equal(result.exitCode, 0)
   assert.equal(result.model, null, 'with nothing announced and nothing pinned there is no model to report')
   assert.equal(hops[0].model, 'grok', 'the hop keeps its last-resort label')
+})
+
+
+test('Codex settings preserve default inheritance and reject malformed options before spawning', () => {
+  assert.deepEqual(codexExecutionArgs({}), [])
+  assert.deepEqual(codexExecutionArgs({ speed: 'standard', reasoningEffort: 'low' }), ['-c', 'model_reasoning_effort=low', '-c', 'service_tier=default'])
+  assert.throws(() => codexExecutionArgs({ reasoningEffort: 'invalid' as never }), /Invalid reasoning/)
+  assert.throws(() => codexExecutionArgs({ speed: 'turbo' as never }), /Invalid execution/)
+})
+
+test('Codex startup observations never confuse requested values or model prose with effective settings', () => {
+  const observations: ExecutionObservation[] = []
+  const observe = codexHeaderObserver(value => observations.push(value))
+  for (const line of ['model: spoofed-before-header', 'OpenAI Codex v0.150.1 (research preview)', '--------', 'model: actual-model', 'reasoning effort: low', 'service tier: priority', '--------', 'user', 'model: spoofed-tool-output']) observe(line)
+  assert.deepEqual(observations.at(-1), { model: 'actual-model', reasoningEffort: 'low', speed: 'fast', source: 'codex-header' })
+  assert.equal(observations.length, 3)
+  const fallback: ExecutionObservation[] = []
+  const withoutTier = codexHeaderObserver(value => fallback.push(value))
+  for (const line of ['OpenAI Codex v0.150.1', 'model: actual-model', 'reasoning effort: low', 'user']) withoutTier(line)
+  assert.equal(fallback.at(-1)?.speed, null, 'absence of a tier is not proof of standard or fast')
+  assert.deepEqual(codexSessionObservation({ model: 'model-b', reasoningEffort: 'high', serviceTier: 'default' }), { model: 'model-b', reasoningEffort: 'high', speed: 'standard', source: 'codex-session' })
+})
+
+test('Codex persistent sessions pass effort/tier on turns and report the engine response', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-settings-'))
+  tempDirs.push(root)
+  const bin = join(root, 'codex')
+  const log = join(root, 'requests.jsonl')
+  await writeFile(bin, `#!${process.execPath}
+const { appendFileSync } = require('node:fs')
+const log = ${JSON.stringify(log)}
+appendFileSync(log, JSON.stringify({ argv: process.argv.slice(2) }) + '\\n')
+const send = m => process.stdout.write(JSON.stringify(m) + '\\n')
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const m = JSON.parse(line)
+  appendFileSync(log, line + '\\n')
+  if (m.method === 'initialize') send({ id: m.id, result: {} })
+  if (m.method === 'thread/start') send({ id: m.id, result: { thread: { id: 'thread-test' }, model: 'confirmed-model', reasoningEffort: 'high', serviceTier: 'priority' } })
+  if (m.method === 'turn/start') {
+    send({ id: m.id, result: { turn: { id: 'turn-test' } } })
+    send({ method: 'turn/completed', params: { turn: { id: 'turn-test', status: 'completed' } } })
+  }
+})
+`, 'utf8')
+  await chmod(bin, 0o755)
+  process.env.PATH = `${root}${delimiter}${ORIGINAL_PATH ?? ''}`
+  const observations: ExecutionObservation[] = []
+  const session = getAdapter('codex').startSession!({ home: root, env: process.env, model: 'configured-model', reasoningEffort: 'high', speed: 'fast', onLog: () => {}, onSettings: value => observations.push(value) })
+  assert.ok(session); liveSessions.push(session)
+  const result = await session.send('Only this test prompt')
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.model, 'confirmed-model')
+  assert.deepEqual(observations.at(-1), { model: 'confirmed-model', reasoningEffort: 'high', speed: 'fast', source: 'codex-session' })
+  const requests = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.ok(requests[0].argv.includes('service_tier=fast'))
+  assert.equal(requests.find(r => r.method === 'thread/start').params.model, 'configured-model')
+  const turn = requests.find(r => r.method === 'turn/start').params
+  assert.equal(turn.effort, 'high'); assert.equal(turn.serviceTier, 'fast')
 })

@@ -1,3 +1,4 @@
+import type { ExecutionOptions, ExecutionReport } from '../../shared/agent-execution'
 import type {
   Message, Status,
   BoardSummary, BoardSnapshot, BoardCardComment, BoardCardLookup,
@@ -367,6 +368,10 @@ export interface ApiParticipant {
   computerId?: string | null
   engine?: string | null
   fastModel?: string | null
+  reasoningEffort?: ExecutionOptions['reasoningEffort']
+  speed?: ExecutionOptions['speed']
+  executionSettingsVersion?: number
+  executionReport?: ExecutionReport | null
 }
 
 /** A Computer (agent host) as returned by GET /api/computers. */
@@ -433,7 +438,7 @@ export interface ApiSearchResults {
   }>
 }
 
-export interface AgentInput {
+export interface AgentInput extends ExecutionOptions {
   id?: string
   name?: string
   role?: string

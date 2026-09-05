@@ -1,3 +1,4 @@
+import { AgentExecutionSettings } from '@/components/AgentExecutionSettings'
 import { useMemo, useState } from 'react'
 import { useApp } from '@/stores/app'
 import { useMe, useCanManageWorkspace } from '@/stores/auth'
@@ -117,6 +118,8 @@ function AgentCard({ p, canManage, onEdit, onDelete }: {
       <div className="text-[12.5px] text-ink-700 leading-[1.55] font-display italic font-normal mb-3.5 line-clamp-3">
         "{p.bio || p.systemPrompt || '—'}"
       </div>
+
+      <AgentExecutionSettings agent={p} />
 
       <div className="text-[9.5px] font-bold text-ink-300 tracking-wider uppercase mb-2">{t('agents.tools')}</div>
       <div className="flex flex-wrap gap-1 mb-4">

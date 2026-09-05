@@ -19,6 +19,8 @@
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
+import type { ExecutionOptions, ExecutionObservation } from '../../../../shared/agent-execution.js'
+import { codexExecutionArgs, codexHeaderObserver, codexSessionObservation } from './execution-settings.js'
 import { execFileSync, type ChildProcess } from 'node:child_process'
 import { spawnTaskProcess as spawn } from './task-sandbox.js'
 import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
@@ -205,7 +207,8 @@ export interface EnginePersona {
   systemPrompt: string | null
 }
 
-export interface EngineRunArgs {
+export interface EngineRunArgs extends ExecutionOptions {
+  onSettings?: (value: ExecutionObservation) => void
   /** Agent's isolated home dir; becomes the engine's cwd. */
   home: string
   /** The per-wake trigger prompt. */
@@ -351,7 +354,8 @@ export interface EngineHopReport {
 }
 
 /** Args to start a PERSISTENT engine session (spawned ONCE per agent). */
-export interface EngineSessionArgs {
+export interface EngineSessionArgs extends ExecutionOptions {
+  onSettings?: (value: ExecutionObservation) => void
   home: string
   env: NodeJS.ProcessEnv
   model?: string | null
@@ -550,8 +554,8 @@ function writeStdin(child: ChildProcess, text: string, opts: { end?: boolean } =
 function spawnEngine(
   bin: string,
   args: string[],
-  { home, env, onLog, signal, onHopUsage }: EngineRunArgs,
-  spawnOpts: { shell?: boolean; stdinText?: string } = {},
+  { home, env, onLog, signal, onHopUsage, onSettings }: EngineRunArgs,
+  spawnOpts: { shell?: boolean; stdinText?: string; codex?: boolean } = {},
 ): Promise<EngineRunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -570,6 +574,10 @@ function spawnEngine(
     // `cumora` shim on PATH.
     if (signal.aborted) onAbort()
 
+    const observeHeader = spawnOpts.codex ? codexHeaderObserver(value => {
+      if (value.model) model = value.model
+      onSettings?.(value)
+    }) : null
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
     let sessionId: string | null = null
@@ -602,6 +610,7 @@ function spawnEngine(
       for (const line of lines) {
         const cleaned = cleanLine(line)
         if (!cleaned) continue
+        if (stream === 'stderr') observeHeader?.(cleaned)
         pushTail(stream === 'stderr' ? stderrTail : stdoutTail, cleaned)
         // Sniff the engine's session id (to `--resume` next wake), the final
         // `result` event's usage (cache-aware cost), and the actual model id
@@ -614,7 +623,10 @@ function spawnEngine(
             if (obj.type === 'result' && obj.usage && typeof obj.usage === 'object') usage = obj.usage
             // assistant events carry message.model; some events carry top-level model.
             const m = typeof obj.message?.model === 'string' ? obj.message.model : (typeof obj.model === 'string' ? obj.model : null)
-            if (m) model = m
+            if (m) {
+              model = m
+              if (!spawnOpts.codex && (obj.type === 'assistant' || obj.type === 'system' || obj.type === 'result')) onSettings?.({ model: m, reasoningEffort: null, speed: null, source: 'engine-event' })
+            }
             // Per-hop trajectory mirror of ClaudeSession.onStdout. Same shape,
             // same purpose: one row per outbound model call so even the
             // one-shot path (no persistent session) lands in the universal
@@ -779,6 +791,7 @@ const PERSONA_HEADER = (
  *  `run()` pays each time. The daemon calls `send()` serially (one turn at a time). */
 class ClaudeSession implements EngineSession {
   private readonly child: ChildProcess
+  private readonly onSettings?: (value: ExecutionObservation) => void
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
   private outBuf = ''
@@ -803,6 +816,7 @@ class ClaudeSession implements EngineSession {
   readonly carriesStandingPrompt: boolean
 
   constructor(bin: string, args: string[], opts: EngineSessionArgs, carriesStandingPrompt: boolean) {
+    this.onSettings = opts.onSettings
     this.onLog = opts.onLog
     this.onHopUsage = opts.onHopUsage
     this.sid = opts.resumeSessionId ?? null
@@ -888,7 +902,10 @@ class ClaudeSession implements EngineSession {
       if (typeof ev.session_id === 'string' && ev.session_id) this.sid = ev.session_id
       // Capture the real model id (assistant events carry message.model) for pricing.
       const evModel = typeof ev.message?.model === 'string' ? ev.message.model : (typeof ev.model === 'string' ? ev.model : null)
-      if (evModel) this.curModel = evModel
+      if (evModel) {
+        this.curModel = evModel
+        this.onSettings?.({ model: evModel, reasoningEffort: null, speed: null, source: 'engine-event' })
+      }
       // Per-hop trajectory: every `{type:'assistant', message:{model, usage}}` is
       // ONE outbound model call this turn. Fire onHopUsage so the daemon can
       // ledger it (see EngineHopReport). The terminating `type:'result'` event
@@ -1250,7 +1267,7 @@ function ensureGitRepoForCodex(home: string): void {
 type CodexRpcMsg = {
   id?: number
   method?: string
-  result?: { thread?: { id?: unknown }; turn?: { id?: unknown }; turnId?: unknown }
+  result?: { thread?: { id?: unknown }; turn?: { id?: unknown }; turnId?: unknown; [key: string]: unknown }
   error?: { message?: unknown }
   params?: Record<string, unknown>
 }
@@ -1364,13 +1381,15 @@ class CodexSession implements EngineSession {
   private queuedPrompt: string | null = null
   private activeTurnId: string | null = null
   private steerGate = false
-  private readonly model: string | null
+  private model: string | null
+  private readonly settings: EngineSessionArgs
   readonly carriesStandingPrompt: boolean
   // Codex reports a RUNNING thread token total; per-turn usage is the delta.
   private cum = { input: 0, cached: 0, output: 0 }
   private turnStart = { input: 0, cached: 0, output: 0 }
 
   constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+    this.settings = opts
     this.onLog = opts.onLog
     this.onHopUsage = opts.onHopUsage
     this.threadId = opts.resumeSessionId ?? null
@@ -1381,6 +1400,7 @@ class CodexSession implements EngineSession {
     const params: Record<string, unknown> = { cwd: home, ...codexThreadSecurityParams(), experimentalRawEvents: true }
     if (opts.standingPrompt) params.developerInstructions = opts.standingPrompt
     if (opts.model) params.model = opts.model
+    if (opts.speed) params.serviceTier = opts.speed === 'fast' ? 'fast' : 'default'
     this.baseThreadParams = params
     this.threadWasResume = !!opts.resumeSessionId
     this.threadReq = opts.resumeSessionId
@@ -1434,7 +1454,7 @@ class CodexSession implements EngineSession {
   private startTurn(prompt: string): void {
     if (this.threadId) {
       this.turnStartedAt = Date.now()
-      this.req('turn/start', { threadId: this.threadId, input: [{ type: 'text', text: stripLoneSurrogates(prompt) }] })
+      this.req('turn/start', { threadId: this.threadId, ...(this.settings.reasoningEffort ? { effort: this.settings.reasoningEffort } : {}), ...(this.settings.speed ? { serviceTier: this.settings.speed === 'fast' ? 'fast' : 'default' } : {}), input: [{ type: 'text', text: stripLoneSurrogates(prompt) }] })
     }
   }
 
@@ -1481,6 +1501,11 @@ class CodexSession implements EngineSession {
       }
       this.failPending(String(msg.error.message || 'codex thread start failed'))
       return
+    }
+    if (msg.id === this.threadReqId && msg.result) {
+      const observation = codexSessionObservation(msg.result)
+      if (observation.model) this.model = observation.model
+      this.settings.onSettings?.(observation)
     }
     // thread ready: response to thread/start|resume, OR a thread/started notification.
     const threadId = msg.result?.thread?.id ?? (msg.method === 'thread/started' ? (msg.params?.thread as { id?: unknown } | undefined)?.id : undefined)
@@ -1760,7 +1785,7 @@ class CodexAdapter implements EngineAdapter {
         : [...codexSecureExecArgs(args), '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
     const { command, shell, argsPrefix } = resolveCodexSpawn()
-    return spawnEngine(command, [...argsPrefix, ...base, ...model, '-'], args, { shell, stdinText: args.prompt })
+    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...codexExecutionArgs(args), '-'], args, { shell, stdinText: args.prompt, codex: true })
       .then((result) => {
         noteCodexConfigRejection(result.error, args.onLog)
         return result
@@ -1780,7 +1805,7 @@ class CodexAdapter implements EngineAdapter {
     // Standing prompt rides the thread's developerInstructions (see CodexSession),
     // approval/sandbox are set per-thread, so no global bypass flags are needed.
     const { command, argsPrefix } = resolveCodexSpawn()
-    return new CodexSession(command, [...argsPrefix, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    return new CodexSession(command, [...argsPrefix, ...codexExecutionArgs(args), 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
 }
 
@@ -1812,6 +1837,7 @@ type AcpMsg = {
  *  and the daemon's next-wake coalescing carries the ping instead. */
 class GrokSession implements EngineSession {
   private readonly child: ChildProcess
+  private readonly onSettings?: (value: ExecutionObservation) => void
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
   private outBuf = ''
@@ -1837,6 +1863,7 @@ class GrokSession implements EngineSession {
   readonly carriesStandingPrompt: boolean
 
   constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+    this.onSettings = opts.onSettings
     this.onLog = opts.onLog
     this.onHopUsage = opts.onHopUsage
     this.sid = opts.resumeSessionId ?? null
@@ -1964,7 +1991,10 @@ class GrokSession implements EngineSession {
     // usually absent (see curModel).
     if (msg.method === '_x.ai/models/update') {
       const id = (msg.params as { currentModelId?: unknown } | undefined)?.currentModelId
-      if (typeof id === 'string' && id) this.curModel = id
+      if (typeof id === 'string' && id) {
+        this.curModel = id
+        this.onSettings?.({ model: id, reasoningEffort: null, speed: null, source: 'engine-event' })
+      }
       return
     }
     if (msg.method === 'session/update') {
@@ -2296,6 +2326,7 @@ class CursorTurnTracker {
   constructor(
     pin: string | null,
     private readonly onHopUsage?: (r: EngineHopReport) => void,
+    private readonly onSettings?: (r: ExecutionObservation) => void,
   ) {
     this.model = pin
   }
@@ -2306,7 +2337,10 @@ class CursorTurnTracker {
     if (ev.type === 'system' && ev.subtype === 'init') {
       // init's model is what Cursor actually opened the session on — it wins
       // over the pin (which is only what we asked for).
-      if (typeof ev.model === 'string' && ev.model) this.model = ev.model
+      if (typeof ev.model === 'string' && ev.model) {
+        this.model = ev.model
+        this.onSettings?.({ model: ev.model, reasoningEffort: null, speed: null, source: 'engine-event' })
+      }
       if (this.startedAt == null) this.startedAt = Date.now()
       return false
     }
@@ -2365,6 +2399,7 @@ function spawnCursorStream(
     shell: boolean
     stdinText?: string
     onHopUsage?: (r: EngineHopReport) => void
+    onSettings?: (r: ExecutionObservation) => void
     /** Model pin, used as the tracker's model until system/init names one. */
     pin?: string | null
     /** Fail a clean-exiting stream that never emitted its terminal `result`
@@ -2374,7 +2409,7 @@ function spawnCursorStream(
   },
 ): Promise<EngineRunResult & { text: string }> {
   return new Promise((resolve) => {
-    const tracker = new CursorTurnTracker(opts.pin ?? null, opts.onHopUsage)
+    const tracker = new CursorTurnTracker(opts.pin ?? null, opts.onHopUsage, opts.onSettings)
     const child = spawn(command, args, {
       cwd: opts.cwd, env: opts.env,
       stdio: [opts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
@@ -2457,6 +2492,7 @@ class CursorAdapter implements EngineAdapter {
     model?: string | null
     resumeSessionId?: string | null
     onHopUsage?: (r: EngineHopReport) => void
+    onSettings?: (r: ExecutionObservation) => void
   }): Promise<EngineRunResult & { text: string }> {
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const model = args.model ? ['--model', args.model] : []
@@ -2468,7 +2504,7 @@ class CursorAdapter implements EngineAdapter {
     return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
       cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
       stdinText: wantsStdinPrompt ? prompt : undefined,
-      onHopUsage: args.onHopUsage,
+      onHopUsage: args.onHopUsage, onSettings: args.onSettings,
       pin: args.model ?? null,
       requireResult: true,
     })
@@ -2555,7 +2591,7 @@ class CursorAdapter implements EngineAdapter {
     }
     return this.turn(args.prompt, {
       cwd: args.home, env: args.env, signal: args.signal, onLog: args.onLog,
-      model: args.model, resumeSessionId: args.resumeSessionId, onHopUsage: args.onHopUsage,
+      model: args.model, resumeSessionId: args.resumeSessionId, onHopUsage: args.onHopUsage, onSettings: args.onSettings,
     })
   }
 

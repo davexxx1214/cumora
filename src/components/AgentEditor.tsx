@@ -1,3 +1,5 @@
+import { REASONING_EFFORTS, type ReasoningEffort, type ExecutionSpeed } from '../../shared/agent-execution'
+import { AgentExecutionSettings } from './AgentExecutionSettings'
 import { useEffect, useState } from 'react'
 import { api, getPairingServerOrigin, type AgentInput } from '@/api/client'
 import { isNativePlatform } from '@/lib/native'
@@ -38,6 +40,8 @@ function EditableAgentEditor({ agent, onClose }: Props) {
   const [avatarBg, setAvatarBg] = useState(agent?.avatarBg ?? PALETTE[0])
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | ''>(agent?.reasoningEffort ?? '')
+  const [speed, setSpeed] = useState<ExecutionSpeed | ''>(agent?.speed ?? '')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [avatarUrl, setAvatarUrl] = useState<string | null>(agent?.avatarUrl ?? null)
@@ -59,7 +63,7 @@ function EditableAgentEditor({ agent, onClose }: Props) {
   const firstByoa = computers.find((c) => c.kind !== 'cloud')
   // Default for a NEW agent: paid → Cumora Cloud; free → first paired computer.
   const [computerId, setComputerId] = useState(agent?.computerId ?? (isFreeTier ? firstByoa?.id : cloud?.id) ?? '')
-  const [engine, setEngine] = useState<EngineId>((agent?.engine as EngineId) ?? 'managed')
+  const [engine, setEngine] = useState<EngineId>(agent?.engine ?? (computersById[computerId]?.kind === 'cloud' ? 'managed' : computersById[computerId]?.availableEngines[0] ?? 'managed'))
   const selectedComputer = computerId ? computersById[computerId] : undefined
   const isByoa = !!selectedComputer && selectedComputer.kind !== 'cloud'
   const selectedComputerOffline = isByoa && selectedComputer.status !== 'online'
@@ -116,7 +120,7 @@ function EditableAgentEditor({ agent, onClose }: Props) {
     setErr(null)
     setBusy(true)
     try {
-      const payload: AgentInput = { name, role, systemPrompt, bio, avatarBg, model: model.trim() || null, fastModel: fastModel.trim() || null }
+      const payload: AgentInput = { name, role, systemPrompt, bio, avatarBg, model: model.trim() || null, fastModel: fastModel.trim() || null, reasoningEffort: engine === 'codex' ? reasoningEffort || null : null, speed: engine === 'codex' ? speed || null : null }
       let agentId = agent?.id
       if (editing) {
         // Only send avatarUrl on change so we don't clobber it on no-op edits.
@@ -258,6 +262,24 @@ function EditableAgentEditor({ agent, onClose }: Props) {
               spellCheck={false}
             />
           </Field>
+
+          <Field label={t('agent.executionEffort')} hint={t('agent.executionEffortHint')}>
+            {isByoa && engine === 'codex' ? <Select
+              ariaLabel={t('agent.executionEffort')}
+              value={reasoningEffort}
+              onValueChange={v => setReasoningEffort(v as ReasoningEffort | '')}
+              options={[{ value: '', label: t('agent.executionInherit') }, ...REASONING_EFFORTS.map(value => ({ value, label: value }))]}
+            /> : <div className="text-sm text-ink-500">{t('agent.executionUnsupported')}</div>}
+          </Field>
+          <Field label={t('agent.executionSpeed')} hint={t('agent.executionSpeedHint')}>
+            {isByoa && engine === 'codex' ? <Select
+              ariaLabel={t('agent.executionSpeed')}
+              value={speed}
+              onValueChange={v => setSpeed(v as ExecutionSpeed | '')}
+              options={[{ value: '', label: t('agent.executionInherit') }, { value: 'standard', label: t('agent.speedStandard') }, { value: 'fast', label: t('agent.speedFast') }]}
+            /> : <div className="text-sm text-ink-500">{t('agent.executionUnsupported')}</div>}
+          </Field>
+          {agent && <AgentExecutionSettings agent={agent} />}
 
           {isByoa && (
             <Field

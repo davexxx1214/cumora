@@ -1,3 +1,5 @@
+import { parseExecutionReport, saveExecutionReport } from '../agents/computer/execution-report.js'
+import { isReasoningEffort, isExecutionSpeed, type ExecutionReport, type ReasoningEffort, type ExecutionSpeed } from '../../../shared/agent-execution.js'
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import type { PoolClient } from 'pg'
 import {
@@ -1413,6 +1415,15 @@ api.get('/computers/me/agents', safe(async (req, res) => {
   res.json(await listAgentsForComputer(computerId))
 }))
 
+// Stale or reassigned runners cannot confirm a newer configuration.
+api.post('/agents/:id/execution-report', safe(async (req, res) => {
+  const { computerId, companyId } = await requireDevice(req)
+  const report = parseExecutionReport(req.body)
+  if (!report) throw new HttpError(400, 'invalid execution report')
+  if (!await saveExecutionReport(String(req.params.id), companyId, computerId, report)) throw new HttpError(409, 'agent assignment or execution settings changed')
+  res.json({ ok: true })
+}))
+
 // Daemon liveness heartbeat — keeps the computer 'online' (an offline sweep
 // flips it once heartbeats go stale).
 api.post('/computers/heartbeat', safe(async (req, res) => {
@@ -2324,12 +2335,15 @@ api.get('/participants', async (req, res) => {
     email: string | null; companySlug: string | null
     departedAt: string | null
     computerId: string | null; engine: string | null; fastModel: string | null
+    reasoningEffort: ReasoningEffort | null; speed: ExecutionSpeed | null; executionSettingsVersion: number; executionReport: ExecutionReport | null
   }>(
     `SELECT p.id, p.kind, p.name, p.role, p.initial,
             p.avatar_bg AS "avatarBg", p.avatar_url AS "avatarUrl",
             p.status, p.status_updated_at AS "statusUpdatedAt",
             p.bio, p.tools, p.system_prompt AS "systemPrompt", p.model,
             p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel",
+            p.reasoning_effort AS "reasoningEffort", p.execution_speed AS speed,
+            p.execution_settings_version AS "executionSettingsVersion", p.execution_report AS "executionReport",
             -- Email resolution differs by kind:
             --  - agents carry their own minted address on participants.email
             --  - humans don't have one there; surface their real auth email
@@ -2775,7 +2789,7 @@ interface AgentBody {
   id?: unknown; name?: unknown; role?: unknown
   systemPrompt?: unknown; bio?: unknown
   initial?: unknown; avatarBg?: unknown; avatarUrl?: unknown
-  model?: unknown; fastModel?: unknown
+  model?: unknown; fastModel?: unknown; reasoningEffort?: unknown; speed?: unknown
   tools?: unknown
 }
 function readAgentBody(b: AgentBody): {
@@ -2788,6 +2802,8 @@ function readAgentBody(b: AgentBody): {
   model?: string | null
   /** small-brain model override; same semantics as `model` */
   fastModel?: string | null
+  reasoningEffort?: ReasoningEffort | null
+  speed?: ExecutionSpeed | null
   tools?: string[] | null
 } {
   const out: Record<string, unknown> = {}
@@ -2804,6 +2820,17 @@ function readAgentBody(b: AgentBody): {
   else if (typeof b.model === 'string')   out.model = b.model.trim() || null
   if (b.fastModel === null)               out.fastModel = null
   else if (typeof b.fastModel === 'string') out.fastModel = b.fastModel.trim() || null
+  for (const key of ['model', 'fastModel'] as const) {
+    if (b[key] !== undefined && b[key] !== null && (typeof b[key] !== 'string' || (b[key] as string).length > 160 || /[\r\n\0]/.test(b[key] as string))) throw new HttpError(400, `invalid ${key}`)
+  }
+  if (b.reasoningEffort !== undefined) {
+    if (b.reasoningEffort !== null && !isReasoningEffort(b.reasoningEffort)) throw new HttpError(400, 'invalid reasoning effort')
+    out.reasoningEffort = b.reasoningEffort
+  }
+  if (b.speed !== undefined) {
+    if (b.speed !== null && !isExecutionSpeed(b.speed)) throw new HttpError(400, 'invalid execution speed')
+    out.speed = b.speed
+  }
   if (Array.isArray(b.tools))             out.tools = b.tools.map((x) => String(x))
   return out as ReturnType<typeof readAgentBody>
 }
@@ -2872,10 +2899,10 @@ api.post('/agents', async (req, res) => {
   const avatarBg = data.avatarBg || defaultAvatarBg(agentId)
   try {
     await pool.query(
-      `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, status, bio, tools, system_prompt, model, fast_model, company_id)
-       VALUES ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb, $8, $9, $10, $11)`,
+      `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, status, bio, tools, system_prompt, model, fast_model, company_id, reasoning_effort, execution_speed)
+       VALUES ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb, $8, $9, $10, $11, $12, $13)`,
       [agentId, data.name, data.role ?? '', initial, avatarBg, data.bio ?? '',
-       JSON.stringify(data.tools ?? ['bash']), data.systemPrompt, data.model ?? null, data.fastModel ?? null, tenant],
+       JSON.stringify(data.tools ?? ['bash']), data.systemPrompt, data.model ?? null, data.fastModel ?? null, tenant, data.reasoningEffort ?? null, data.speed ?? null],
     )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
@@ -2984,6 +3011,14 @@ api.put('/agents/:id', async (req, res) => {
   if (data.avatarUrl !== undefined)    push('avatar_url', data.avatarUrl)   // null clears it
   if (data.model !== undefined)        push('model', data.model)             // null clears it (use default)
   if (data.fastModel !== undefined)    push('fast_model', data.fastModel)    // small-brain model; null clears
+  if (data.reasoningEffort !== undefined) push('reasoning_effort', data.reasoningEffort)
+  if (data.speed !== undefined) push('execution_speed', data.speed)
+  const executionChanges = sets.filter(set => /^(model|fast_model|reasoning_effort|execution_speed) = /.test(set)).map(set => set.replace(' = ', ' IS DISTINCT FROM '))
+  if (executionChanges.length) {
+    const changed = executionChanges.join(' OR ')
+    sets.push(`execution_settings_version = execution_settings_version + CASE WHEN ${changed} THEN 1 ELSE 0 END`,
+      `execution_report = CASE WHEN ${changed} THEN NULL ELSE execution_report END`)
+  }
   if (data.tools !== undefined)        push('tools', JSON.stringify(data.tools))
   if (sets.length === 0) { res.status(400).json({ error: 'nothing to update' }); return }
   params.push(id, tenant)

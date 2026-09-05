@@ -109,6 +109,7 @@ test('cursor seedHome writes AGENTS.md and common home directories', { skip: IS_
 
 test('cursor run parses a fresh stream, normalizes usage, and reports one hop', { skip: IS_WIN }, async () => {
   const f = await fixture()
+  const confirmed: string[] = []
   const hops: EngineHopReport[] = []
   const result = await getAdapter('cursor').run({
     home: f.home,
@@ -119,11 +120,13 @@ test('cursor run parses a fresh stream, normalizes usage, and reports one hop', 
     resumeSessionId: null,
     onLog: () => {},
     onHopUsage: (hop) => hops.push(hop),
+    onSettings: value => { if (value.model) confirmed.push(value.model) },
     signal: new AbortController().signal,
   })
   assert.equal(result.exitCode, 0, result.error)
   assert.equal(result.sessionId, 'cursor-session-new')
   assert.equal(result.model, 'cursor-test-model')
+  assert.deepEqual(confirmed, ['cursor-test-model'])
   assert.deepEqual(result.usage, {
     input_tokens: 100,
     output_tokens: 12,

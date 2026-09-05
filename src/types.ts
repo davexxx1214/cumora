@@ -1,3 +1,4 @@
+import type { ExecutionOptions, ExecutionReport } from '../shared/agent-execution'
 export type AgentRole = 'researcher' | 'designer' | 'engineer' | 'pm' | 'brand' | 'ops'
 export type ParticipantKind = 'agent' | 'human'
 export type Status = 'avail' | 'working' | 'thinking' | 'waiting' | 'resting'
@@ -48,6 +49,10 @@ export interface Participant {
   model?: string | null
   /** small-brain (fast/auxiliary) model override */
   fastModel?: string | null
+  reasoningEffort?: ExecutionOptions['reasoningEffort']
+  speed?: ExecutionOptions['speed']
+  executionSettingsVersion?: number
+  executionReport?: ExecutionReport | null
   /** id of the Computer this agent runs on (null/undefined = Cumora Cloud) */
   computerId?: string | null
   /** engine the agent's host runs it on ('managed' for cloud agents) */

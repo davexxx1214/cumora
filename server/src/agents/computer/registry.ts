@@ -14,6 +14,7 @@
  *   - per-agent runtime JWTs minted for a paired device (reuses
  *     runtime/jwt.ts — the same token a pod gets)
  */
+import type { ExecutionOptions } from '../../../../shared/agent-execution.js'
 import { randomUUID, randomBytes, createHash } from 'node:crypto'
 import { pool } from '../../db/pool.js'
 import { publish, CH_STATUS } from '../../redis.js'
@@ -361,10 +362,12 @@ export async function mintAgentRuntimeToken(args: {
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
  *  agent behavior on every user's machine unless we pin here. */
 export async function listAgentsForComputer(computerId: string): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; executionSettingsVersion: number } & ExecutionOptions>
 > {
-  const { rows } = await pool.query<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>(
-    `SELECT id, name, role, system_prompt AS "systemPrompt", engine, model, fast_model AS "fastModel" FROM participants
+  const { rows } = await pool.query<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; executionSettingsVersion: number } & ExecutionOptions>(
+    `SELECT id, name, role, system_prompt AS "systemPrompt", engine, model, fast_model AS "fastModel",
+      reasoning_effort AS "reasoningEffort", execution_speed AS speed,
+      execution_settings_version AS "executionSettingsVersion" FROM participants
       WHERE computer_id = $1 AND kind = 'agent' AND departed_at IS NULL
       ORDER BY name ASC`,
     [computerId],
@@ -465,7 +468,8 @@ export async function assignAgentToComputer(args: {
   }
 
   const { rowCount } = await pool.query(
-    `UPDATE participants SET computer_id = $1, engine = $2
+    `UPDATE participants SET computer_id = $1, engine = $2,
+        execution_report = NULL, execution_settings_version = execution_settings_version + 1
       WHERE id = $3 AND company_id = $4 AND kind = 'agent'`,
     [args.computerId, engine, args.agentId, args.companyId],
   )

@@ -171,7 +171,7 @@ def main():
                 info = tar.gettarinfo(str(path), arcname=relative)
                 info.size = len(content)
                 tar.addfile(info, io.BytesIO(content))
-        for relative in ['server/src', 'server/docker', 'src', 'workers', 'electron', 'agent-fuse', 'package.json',
+        for relative in ['server/src', 'server/docker', 'src', 'shared', 'workers', 'electron', 'agent-fuse', 'package.json',
                          'server/tsconfig.json', 'tsconfig.json', 'tsconfig.node.json', 'scripts/guard-big-brain.mjs', 'scripts/build-project-task.sh']:
             add_source(repo / relative, relative)
     remote_archive = f'/tmp/cumora-project-files-{uuid.uuid4()}.tar.gz'
